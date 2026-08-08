@@ -1,0 +1,117 @@
+{
+  "name": "krypt-scout",
+  "productName": "Krypt Scout",
+  "version": "0.3.1",
+  "description": "A free moneyline scouting terminal — model fair lines, market edges, value board, CLV tracking. Part of the Krypt free tools suite.",
+  "main": "dist-electron/main.js",
+  "author": {
+    "name": "Krypt",
+    "email": "hi@krypt.cc",
+    "url": "https://krypt.cc"
+  },
+  "homepage": "https://krypt.cc/tools",
+  "license": "MIT",
+  "private": true,
+  "scripts": {
+    "predev": "node scripts/setup-python.mjs",
+    "dev": "vite",
+    "build": "vite build",
+    "typecheck": "tsc -p tsconfig.node.json --noEmit && tsc -p tsconfig.json --noEmit",
+    "py:setup": "node scripts/setup-python.mjs",
+    "py:bundle": "node scripts/py-bundle.mjs",
+    "py:bundle:hardened": "node scripts/py-harden.mjs",
+    "dist": "npm run py:bundle && npm run build && electron-builder",
+    "dist:hardened": "npm run py:bundle:hardened && npm run build && electron-builder"
+  },
+  "dependencies": {
+    "discord-rpc": "^4.0.1",
+    "electron-updater": "^6.8.9"
+  },
+  "devDependencies": {
+    "@electron/fuses": "^2.1.3",
+    "@types/discord-rpc": "^4.0.9",
+    "@types/node": "^20.12.7",
+    "@types/react": "^18.2.74",
+    "@types/react-dom": "^18.2.24",
+    "@vitejs/plugin-react": "^4.2.1",
+    "autoprefixer": "^10.4.19",
+    "electron": "^30.0.1",
+    "electron-builder": "^24.13.3",
+    "lucide-react": "^0.368.0",
+    "png-to-ico": "^2.1.8",
+    "postcss": "^8.4.38",
+    "qrcode-generator": "^2.0.4",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "tailwindcss": "^3.4.3",
+    "typescript": "^5.4.5",
+    "vite": "^5.2.9",
+    "vite-plugin-electron": "^0.28.4",
+    "vite-plugin-electron-renderer": "^0.14.5"
+  },
+  "build": {
+    "appId": "cc.krypt.scout",
+    "productName": "Krypt Scout",
+    "afterPack": "build/afterPack.cjs",
+    "asar": true,
+    "files": [
+      "dist/**",
+      "dist-electron/**",
+      "resources/**"
+    ],
+    "extraResources": [
+      {
+        "from": "backend/dist-py",
+        "to": "python"
+      }
+    ],
+    "directories": {
+      "buildResources": "build",
+      "output": "release"
+    },
+    "win": {
+      "target": [
+        "nsis"
+      ],
+      "icon": "resources/krypt.ico",
+      "artifactName": "${productName}-Setup-${version}.${ext}"
+    },
+    "mac": {
+      "target": [
+        "dmg"
+      ],
+      "icon": "resources/krypt-glow.png",
+      "category": "public.app-category.finance",
+      "artifactName": "${name}-${version}-mac-${arch}.${ext}",
+      "darkModeSupport": true
+    },
+    "linux": {
+      "target": [
+        "AppImage",
+        "deb"
+      ],
+      "icon": "resources/krypt-glow.png",
+      "category": "Utility",
+      "maintainer": "Krypt <hi@krypt.cc>",
+      "artifactName": "${name}-${version}-linux-${arch}.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": false,
+      "createStartMenuShortcut": true,
+      "installerIcon": "resources/krypt.ico",
+      "uninstallerIcon": "resources/krypt.ico",
+      "uninstallDisplayName": "Krypt Scout",
+      "include": "build/installer.nsh",
+      "shortcutName": "Krypt Scout"
+    },
+    "publish": null
+  },
+  "publishTemplate": {
+    "//": "Activation: move into build.publish once the GitHub repo is public.",
+    "provider": "github",
+    "owner": "<github-user>",
+    "repo": "krypt-scout"
+  }
+}

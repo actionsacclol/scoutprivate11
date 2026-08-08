@@ -1,0 +1,51 @@
+# Reference repos (studied, not shipped)
+reference/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# Data & models (large artifacts, regenerate locally)
+data/raw/
+data/cache/
+*.sqlite
+*.db
+models/*.pkl
+models/*.joblib
+models/*.keras
+models/*.pt
+# Machine-local runtime state — NOT source. autobet.json is the live strategy
+# (stakes, stops, caps) for THIS install; the journal tracks a local harvest.
+# The engines' data/*_state.json replay caches stay tracked on purpose so a
+# fresh clone/CI doesn't have to backfill years of history.
+data/autobet.json
+data/bookfill_journal.json
+
+# Runtime logs
+logs/
+
+# Secrets
+.env
+
+# Node / Electron
+node_modules/
+dist/
+dist-electron/
+release/
+
+# PyInstaller backend bundle
+backend/dist-py/
+backend/build-py/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+# Never commit compiled twins of TS sources (Vite resolves .js first!)
+src/**/*.js
+shared/**/*.js

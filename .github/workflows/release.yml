@@ -1,0 +1,163 @@
+# Build the Krypt Scout installers for Windows, macOS and Linux.
+#
+# Every job builds NATIVELY on its own OS and architecture. That is not a
+# convenience — the app ships a PyInstaller bundle of the Python backend, and
+# PyInstaller cannot cross-compile. A macOS arm64 runner can only produce an
+# arm64 backend, so Intel Macs need their own (macos-15-intel) runner or the
+# app installs fine and then dies the moment the supervisor tries to spawn a
+# backend binary the CPU can't execute. (macos-13, the previous Intel label,
+# was retired by GitHub — jobs targeting it queue forever and never start.)
+#
+# Triggers:
+#   * push a tag  v*        -> build all platforms, attach to a DRAFT release
+#   * manual run (dispatch) -> build all platforms, attach to a per-run
+#                              PRERELEASE tagged build-<run_number>
+#
+# Installers go to Release assets, never actions/upload-artifact: the four
+# bundles are ~200 MB each and would exhaust the 500 MB Actions artifact quota
+# within two runs. Release assets are exempt from that quota and don't expire.
+#
+# The installers are UNSIGNED on every platform. See RELEASING.md.
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # One platform failing must not cancel the others — a partial release is
+      # far more useful than none, and it isolates which OS actually broke.
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            label: windows-x64
+          - os: macos-14
+            label: macos-arm64
+          - os: macos-15-intel
+            label: macos-x64
+          - os: ubuntu-latest
+            label: linux-x64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # 3.11 matches the documented floor (3.10+) and is what the backend is
+      # developed against. setup-python puts it on PATH, which is all the
+      # build scripts need — they provision backend/.venv themselves.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # AppImage packaging needs FUSE 2; ubuntu-latest images ship without it.
+      - name: Install Linux packaging deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libfuse2 libarchive-tools
+
+      # xgboost's macOS wheel links against OpenMP, which Apple's toolchain does
+      # not ship. Without libomp, `import xgboost` raises "Library not loaded:
+      # @rpath/libomp.dylib" — that kills the nba/nfl engines, so pytest and the
+      # frozen bundle's --selftest both fail before anything gets packaged.
+      # The .spec copies this dylib INTO the bundle so users don't need Homebrew.
+      - name: Install libomp (xgboost/OpenMP)
+        if: runner.os == 'macOS'
+        run: brew install libomp
+
+      # `npm install`, not `npm ci`: npm's optional platform-specific binaries
+      # (rollup/esbuild) are a recurring source of lockfile-vs-platform `ci`
+      # failures across a four-OS matrix. Reproducibility matters less here than
+      # a release pipeline that runs on every platform.
+      - name: Install Node deps
+        run: npm install
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      # Provisions backend/.venv (predev script) so the tests below and the
+      # PyInstaller bundle share one interpreter.
+      - name: Set up Python backend
+        run: npm run py:setup
+
+      - name: Backend tests
+        working-directory: backend
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            .venv/Scripts/python -m pytest tests/ -q
+          else
+            .venv/bin/python -m pytest tests/ -q
+          fi
+
+      # npm run dist:hardened = py:bundle:hardened (Nuitka-compile the modules
+      # in HARDEN_MODULES to native .pyd/.so, then PyInstaller + frozen-bundle
+      # selftest) -> vite build -> electron-builder for the host platform/arch.
+      # This MUST be dist:hardened, not dist — see HARDENING.md. Plain `dist`
+      # ships every "protected" module as decompilable .pyc, so the whole
+      # Layer-3 protection is absent from the installers users actually get.
+      # Nuitka downloads its own zig/clang backend on first run (cached after),
+      # so the runner needs outbound network for that step.
+      - name: Build installer
+        env:
+          # Build unsigned with no Apple Developer cert. NOTE: do NOT also set
+          # `identity: null` in package.json's build.mac — that disables signing
+          # ENTIRELY, including the ad-hoc signature electron-builder applies to
+          # arm64. Apple Silicon refuses to exec an unsigned Mach-O, so the app
+          # would build clean and then never launch. This env var alone gives
+          # the wanted result: no real identity, ad-hoc signature still applied.
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+        run: npm run dist:hardened
+
+      # Installers only — skip the unpacked app trees and blockmaps.
+      - name: Collect installers
+        shell: bash
+        run: |
+          mkdir -p out
+          find release -maxdepth 1 -type f \
+            \( -name '*.exe' -o -name '*.dmg' \
+               -o -name '*.AppImage' -o -name '*.deb' \) \
+            -exec cp {} out/ \;
+          ls -la out
+
+      # `gh` is preinstalled on all GitHub-hosted runners. --clobber makes a
+      # re-run idempotent instead of erroring on an existing asset. Each matrix
+      # job uploads only its own platform's files to the shared tag, and the
+      # create step is guarded so concurrent jobs don't race.
+      - name: Publish installers to the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            TAG="${GITHUB_REF_NAME}"
+            CREATE_ARGS=(--title "Krypt Scout ${TAG}" --draft
+                         --notes "Unsigned builds for Windows, macOS (Intel + Apple Silicon) and Linux. See RELEASING.md for install notes.")
+          else
+            TAG="build-${GITHUB_RUN_NUMBER}"
+            CREATE_ARGS=(--title "CI build ${GITHUB_RUN_NUMBER} (${GITHUB_SHA:0:7})" --prerelease
+                         --notes "Unsigned CI installers built from ${GITHUB_SHA}. Not a release.")
+          fi
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            # Another matrix job may win this race; ignore an "already exists".
+            gh release create "$TAG" "${CREATE_ARGS[@]}" || true
+          fi
+          gh release upload "$TAG" out/* --clobber
