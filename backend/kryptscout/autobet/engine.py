@@ -96,6 +96,39 @@ from kryptscout.store import db, tracker
 
 logger = logging.getLogger("kryptscout")
 
+# sha256 of the raw Ed25519 public key kryptscout.license verifies tokens with.
+#
+# Deliberately a second copy — api/main.py holds the same constant. Two compiled
+# modules asserting the same fact separately means a replacement license module
+# has to satisfy both call sites, not one, and neither of them takes the license
+# module's word for its own authenticity. Rotate the signing key and BOTH copies
+# change (test_license_gate.py fails if they drift).
+_LICENSE_PUBKEY_SHA256 = "2a15d4a1c0498bb563ad21fa92d60a11e9d8c92e8ad1a8df53287711c7293983"
+
+
+def _live_license_ok() -> bool:
+    """The gate for placing real orders.
+
+    Two conditions that fail for different reasons: the license module must be
+    the genuine one (it carries the real verifying key), and it must hold a
+    valid token. `is_licensed()` on its own was the whole gate, and the whole
+    crack was replacing the file that answers it — a stub returning True needs
+    no key, no token and no understanding of any of this.
+
+    Deliberately fails CLOSED on any error. This gate only ever blocks placing
+    new money; dry-run, the board, open positions and settlement all run
+    regardless, so a false negative here costs a user some bets they can place
+    by hand, never access to their own funds."""
+    try:
+        if license.public_key_fingerprint() != _LICENSE_PUBKEY_SHA256:
+            logger.warning("autobet: license module failed its integrity check")
+            return False
+        return license.is_licensed()
+    except Exception:  # noqa: BLE001 — a module that throws here is not the real one
+        logger.warning("autobet: license module could not be verified")
+        return False
+
+
 SETTINGS_FILE = DATA_DIR / "autobet.json"
 
 DEFAULT_SETTINGS: dict[str, Any] = {
@@ -979,7 +1012,12 @@ async def _sweep_locked(force: bool) -> dict:
     # FUNDS-SAFETY CARVE-OUT: this gates ONLY the placing of new live orders.
     # Dry-run sweeps, the board, MY BETS, and settlement are never gated, so a
     # lapsed license can never trap money or hide open Polymarket positions.
-    if not settings["dry_run"] and not license.is_licensed():
+    #
+    # Checked here independently of the API middleware, and through the token
+    # payload rather than the module's one-word summary of it — see
+    # _live_license_ok. Two gates that fail for different reasons are two things
+    # to find; `is_licensed()` in both places was one.
+    if not settings["dry_run"] and not _live_license_ok():
         logger.warning("autobet sweep skipped: no active Krypt Scout license (live mode)")
         summary["skipped"]["unlicensed"] = 1
         return summary

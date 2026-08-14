@@ -136,6 +136,21 @@ function restore() {
   }
 }
 
+// A `finally` block does NOT run on Ctrl-C — Node's default SIGINT handling
+// terminates the process without unwinding. Nuitka takes minutes, which is
+// exactly when a person reaches for Ctrl-C, and at that moment the source tree
+// is gutted: the .py files live in build-harden-backup/ and nothing is left to
+// put them back. Installing a handler is what makes the guarantee at the top of
+// this file true. Once ANY listener exists Node stops killing the process, so
+// the explicit exit is required or Ctrl-C would do nothing at all.
+for (const sig of ['SIGINT', 'SIGTERM']) {
+  process.on(sig, () => {
+    console.error(`\n!! ${sig} — restoring the source tree before exiting`);
+    restore();
+    process.exit(130);
+  });
+}
+
 function sanityImport() {
   // Confirm every compiled module still imports (as the package module) with
   // the .py gone — a fast fail BEFORE the multi-minute freeze.

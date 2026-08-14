@@ -23,8 +23,12 @@ don't have one yet. Each OS complains in its own dialect:
 |---|---|---|
 | Windows x64 | `Krypt Scout-Setup-<version>.exe` | SmartScreen says "Windows protected your PC" → **More info → Run anyway** |
 | macOS (Apple Silicon) | `krypt-scout-<version>-mac-arm64.dmg` | See the quarantine note below |
-| macOS (Intel) | `krypt-scout-<version>-mac-x64.dmg` | See the quarantine note below |
 | Linux x64 | `krypt-scout-<version>-linux-x64.AppImage` or `.deb` | `chmod +x` the AppImage |
+
+**Intel Macs are not supported.** There is no x64 build — the backend ships as
+a PyInstaller bundle, which can't cross-compile, so an Intel build needs its own
+Intel runner and those cost 10x on CI. The arm64 dmg will not run on an Intel
+Mac; don't try it.
 
 On macOS, Gatekeeper may refuse to open the app or call it "damaged". It isn't —
 that's the message macOS shows for an unsigned, un-notarized app that arrived

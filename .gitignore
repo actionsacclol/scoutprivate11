@@ -14,6 +14,12 @@ data/raw/
 data/cache/
 *.sqlite
 *.db
+# ...including the maintenance backups jobs/compact.py leaves behind. These are
+# full copies of a real store (bets, wallet-adjacent history) and are tens of
+# MB — `git add -A` must never sweep one into a public repo.
+*.sqlite.bak
+*.sqlite.*.bak
+*.db.bak
 models/*.pkl
 models/*.joblib
 models/*.keras

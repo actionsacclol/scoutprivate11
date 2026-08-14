@@ -1,5 +1,6 @@
 import { app, BrowserWindow, Notification } from 'electron';
 import { spawn, spawnSync, ChildProcessWithoutNullStreams } from 'node:child_process';
+import { randomBytes } from 'node:crypto';
 import { existsSync, mkdirSync } from 'node:fs';
 import net from 'node:net';
 import { join } from 'node:path';
@@ -67,6 +68,11 @@ class PythonBackend {
   private child: ChildProcessWithoutNullStreams | null = null;
   private status: BackendStatus = 'stopped';
   private port: number | null = null;
+  // Per-launch bearer token for the local API. Minted fresh for every child so
+  // a token that leaked from a previous run is dead the moment the backend
+  // restarts. Never logged, never written to disk — it lives in this process,
+  // the child's environment, and the renderer (over IPC).
+  private apiToken: string | null = null;
   private startedAt: string | null = null;
   private lastError: string | null = null;
   private pythonOk = false;
@@ -171,6 +177,23 @@ class PythonBackend {
       await new Promise((r) => setTimeout(r, 200));
     }
     return this.port;
+  }
+
+  /**
+   * The current child's API token, for callers that talk to the backend over
+   * HTTP (renderer via IPC, scheduler, discord picks). Null before the first
+   * spawn. Send it as the `X-Scout-Token` header — see api/main._api_token_gate.
+   */
+  token(): string | null {
+    return this.apiToken;
+  }
+
+  /** Port + token together, so a caller can't pair a fresh port with a token
+   *  from the previous child. Waits for the supervisor to pick a port. */
+  async connection(timeoutMs = 15_000): Promise<{ port: number; token: string | null } | null> {
+    const port = await this.waitForPort(timeoutMs);
+    if (port === null) return null;
+    return { port, token: this.apiToken };
   }
 
   /**
@@ -291,6 +314,10 @@ class PythonBackend {
         return;
       }
       this.port = port;
+      // Fresh token per child, minted before the spawn so it can go into the
+      // environment. 32 bytes of CSPRNG — not guessable by anything else that
+      // can see the port.
+      this.apiToken = randomBytes(32).toString('hex');
 
       const resolved = this.resolveBackendBin(port);
       if (!resolved) {
@@ -309,6 +336,7 @@ class PythonBackend {
             ...process.env,
             KRYPT_SCOUT_USERDATA: userData,
             KRYPT_APP_VERSION: app.getVersion(),
+            KRYPT_SCOUT_API_TOKEN: this.apiToken,
             PYTHONUNBUFFERED: '1',
             PYTHONIOENCODING: 'utf-8',
           },

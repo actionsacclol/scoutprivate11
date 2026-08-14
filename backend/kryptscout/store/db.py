@@ -114,6 +114,25 @@ CREATE TABLE IF NOT EXISTS odds_snapshots (
     UNIQUE (game_id, book, fetched_at)
 );
 
+-- A book's own declared OPEN and CLOSE for a game — the pair closing-line
+-- value is defined against. Not derivable from odds_snapshots: that table only
+-- holds prices we happened to be running for, and CLV needs both ends of the
+-- series. ESPN serves both long after a game settles, so this table backfills
+-- (jobs/lines.py) instead of having to accrue. One row per (game, book).
+CREATE TABLE IF NOT EXISTS line_endpoints (
+    game_id       TEXT NOT NULL,
+    sport         TEXT NOT NULL,
+    book          TEXT NOT NULL,
+    fetched_at    TEXT NOT NULL,
+    open_home_ml  INTEGER,
+    open_away_ml  INTEGER,
+    open_draw_ml  INTEGER,
+    close_home_ml INTEGER,
+    close_away_ml INTEGER,
+    close_draw_ml INTEGER,
+    PRIMARY KEY (game_id, book)
+);
+
 CREATE TABLE IF NOT EXISTS picks (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     game_id    TEXT NOT NULL,
@@ -432,6 +451,45 @@ def upsert_prediction(
 # snapshot inside this window refreshes the existing row in place instead of
 # appending. Mirrors upsert_prediction's hourly dedupe.
 SNAPSHOT_MIN_GAP_MINUTES = 15.0
+
+
+def upsert_line_endpoints(
+    conn: sqlite3.Connection,
+    game_id: str,
+    sport: str,
+    book: str,
+    fetched_at: datetime,
+    open_home_ml: Optional[int] = None,
+    open_away_ml: Optional[int] = None,
+    open_draw_ml: Optional[int] = None,
+    close_home_ml: Optional[int] = None,
+    close_away_ml: Optional[int] = None,
+    close_draw_ml: Optional[int] = None,
+) -> None:
+    """Record a book's open/close pair for a game, replacing any prior row.
+
+    Replace rather than ignore: a game re-fetched while still open carries a
+    provisional close that the real one should overwrite. The endpoints are a
+    property of the game, not a time series, so there is nothing to preserve.
+    """
+    conn.execute(
+        """
+        INSERT INTO line_endpoints
+            (game_id, sport, book, fetched_at, open_home_ml, open_away_ml,
+             open_draw_ml, close_home_ml, close_away_ml, close_draw_ml)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT (game_id, book) DO UPDATE SET
+            fetched_at    = excluded.fetched_at,
+            open_home_ml  = excluded.open_home_ml,
+            open_away_ml  = excluded.open_away_ml,
+            open_draw_ml  = excluded.open_draw_ml,
+            close_home_ml = excluded.close_home_ml,
+            close_away_ml = excluded.close_away_ml,
+            close_draw_ml = excluded.close_draw_ml
+        """,
+        (game_id, sport, book, iso(fetched_at), open_home_ml, open_away_ml,
+         open_draw_ml, close_home_ml, close_away_ml, close_draw_ml),
+    )
 
 
 def insert_snapshot(

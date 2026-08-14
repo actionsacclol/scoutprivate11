@@ -9,17 +9,18 @@ import type {
   WeatherInfo,
 } from './types'
 import { SPORTS } from './types'
-import { apiBase, invalidateApiBase } from './backendBase'
+import { apiFetch, invalidateApiBase } from './backendBase'
 
-// Every request resolves the backend base URL first: http://127.0.0.1:<port>
-// inside Electron (port picked by the supervisor), '' (relative, vite proxy)
-// in plain browser dev. See src/backendBase.ts.
+// Every request goes through apiFetch, which resolves the backend base URL
+// (http://127.0.0.1:<port> inside Electron, '' for the vite proxy in plain
+// browser dev) and attaches the per-launch X-Scout-Token. Never call bare
+// fetch() against the backend from here — it comes back 401.
+// See src/backendBase.ts.
 async function fetchJSON<T>(path: string, timeoutMs = 8000): Promise<T> {
-  const base = await apiBase()
   const ctl = new AbortController()
   const timer = setTimeout(() => ctl.abort(), timeoutMs)
   try {
-    const res = await fetch(base + path, { signal: ctl.signal })
+    const res = await apiFetch(path, { signal: ctl.signal })
     if (!res.ok) throw new Error(`${res.status} ${res.statusText}`)
     return (await res.json()) as T
   } finally {
@@ -623,11 +624,10 @@ export async function postMyBet(
   input: TrackBetInput,
 ): Promise<(MyBetRow & { duplicate?: boolean }) | null> {
   try {
-    const base = await apiBase()
     const ctl = new AbortController()
     const timer = setTimeout(() => ctl.abort(), 8000)
     try {
-      const res = await fetch(`${base}/api/mybets`, {
+      const res = await apiFetch('/api/mybets', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(input),
@@ -664,11 +664,10 @@ export async function postMyParlay(
   input: TrackParlayInput,
 ): Promise<(MyParlayRow & { duplicate?: boolean }) | null> {
   try {
-    const base = await apiBase()
     const ctl = new AbortController()
     const timer = setTimeout(() => ctl.abort(), 8000)
     try {
-      const res = await fetch(`${base}/api/mybets/parlay`, {
+      const res = await apiFetch('/api/mybets/parlay', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(input),
@@ -688,11 +687,10 @@ export async function postMyParlay(
  *  graded — graded slips are permanent record). */
 export async function deleteMyParlay(id: number): Promise<boolean> {
   try {
-    const base = await apiBase()
     const ctl = new AbortController()
     const timer = setTimeout(() => ctl.abort(), 8000)
     try {
-      const res = await fetch(`${base}/api/mybets/parlay/${encodeURIComponent(id)}`, {
+      const res = await apiFetch(`/api/mybets/parlay/${encodeURIComponent(id)}`, {
         method: 'DELETE',
         signal: ctl.signal,
       })
@@ -709,11 +707,10 @@ export async function deleteMyParlay(id: number): Promise<boolean> {
  *  graded — graded rows are permanent record). */
 export async function deleteMyBet(id: number): Promise<boolean> {
   try {
-    const base = await apiBase()
     const ctl = new AbortController()
     const timer = setTimeout(() => ctl.abort(), 8000)
     try {
-      const res = await fetch(`${base}/api/mybets/${encodeURIComponent(id)}`, {
+      const res = await apiFetch(`/api/mybets/${encodeURIComponent(id)}`, {
         method: 'DELETE',
         signal: ctl.signal,
       })
@@ -887,11 +884,10 @@ export async function fetchAutobetLog(limit = 25): Promise<AutobetAttempt[] | nu
 }
 
 async function postJSON<T>(path: string, body?: unknown, method = 'POST', timeoutMs = 30_000): Promise<T> {
-  const base = await apiBase()
   const ctl = new AbortController()
   const timer = setTimeout(() => ctl.abort(), timeoutMs)
   try {
-    const res = await fetch(base + path, {
+    const res = await apiFetch(path, {
       method,
       headers: body !== undefined ? { 'Content-Type': 'application/json' } : undefined,
       body: body !== undefined ? JSON.stringify(body) : undefined,
@@ -1117,11 +1113,10 @@ export async function refreshModel(
   forceRetrain: boolean,
 ): Promise<ModelRefreshResult | null> {
   try {
-    const base = await apiBase()
     const ctl = new AbortController()
     const timer = setTimeout(() => ctl.abort(), 180_000)
     try {
-      const res = await fetch(`${base}/api/models/${sport}/refresh`, {
+      const res = await apiFetch(`/api/models/${sport}/refresh`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ force_retrain: forceRetrain }),

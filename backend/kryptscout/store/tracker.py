@@ -814,6 +814,193 @@ def clv_by_tier(sport: Sport | None = None, since: date | None = None) -> dict:
     }
 
 
+_SIDE_COLUMNS = {"home": ("open_home_ml", "close_home_ml"),
+                 "away": ("open_away_ml", "close_away_ml"),
+                 "draw": ("open_draw_ml", "close_draw_ml")}
+
+
+def clv_vs_close(sport: Sport | None = None, since: date | None = None) -> dict:
+    """Did our picks beat the closing line? Scored off `line_endpoints`.
+
+    This is the measurement that separates an edge from a hot streak. It
+    reports three numbers, and the FIRST THING IT DOES is split same-book from
+    cross-venue picks, because conflating them produces a spectacular and
+    completely fake result.
+
+    Why that split is not optional: this app's value picks are priced at
+    Polymarket and Kalshi, while ESPN's close is DraftKings. Exchanges run at
+    near-zero vig and a sportsbook holds ~4-5%, so an exchange entry price
+    "beats" a DK closing price on essentially every bet ever made, win or
+    lose. Measured naively over the first backfill that produced +6.1% CLV at
+    a 12-of-12 beat rate, which is not an edge — it is the spread between two
+    venues, reported as skill.
+
+    * **price_clv_pct** (same book only) — entry vs that same book's close on
+      the same side, `(dec_entry / dec_close - 1) * 100`. Same book, same
+      side, so the vig cancels and what is left is pure price improvement.
+      This is the industry-standard beat-the-close number.
+
+    * **fair_ev_pct** (cross-venue) — the honest comparison when the entry
+      venue and the closing book differ: our entry price's implied
+      probability against the DEVIGGED closing probability,
+      `(p_close_fair / q_entry - 1) * 100`. Removing the closing book's vig is
+      what makes the two comparable. Reads as expected value per unit staked.
+      It still assumes the entry venue is genuinely low-vig, which holds for
+      Polymarket/Kalshi and would not for another sportsbook.
+
+    * **drift_prob_pts** — the devigged open-to-close move on our side, in
+      probability points. Available for every pick including MODEL tier (which
+      records no price), and it measures whether the market came toward us at
+      all. Weaker evidence: a pick made an hour before kickoff gets credited
+      with drift that happened before it existed.
+
+    Where `clv()` and `clv_by_tier()` reconstruct endpoints from whatever
+    `odds_snapshots` we happened to capture, this uses the book's own declared
+    open and close, which `jobs/lines.py` can backfill over settled history.
+    That is the difference between n=11 and a real sample.
+
+    Returns {"by_tier": {...}, "overall": {...}, "note": str}.
+    """
+    clauses, params = [], []
+    if sport is not None:
+        clauses.append("AND k.sport = ?")
+        params.append(sport.value)
+    if since is not None:
+        clauses.append("AND date(g.start_time) >= ?")
+        params.append(since.isoformat())
+    conn = db.connect()
+    try:
+        recs = db.rows(
+            conn,
+            f"""
+            SELECT k.tier, k.side, k.price, k.result, k.book AS entry_book, e.*
+            FROM picks k
+            JOIN games g ON g.game_id = k.game_id
+            JOIN line_endpoints e ON e.game_id = k.game_id
+            WHERE g.completed = 1 AND k.side IN ('home', 'away', 'draw')
+              {' '.join(clauses)}
+            """,
+            tuple(params),
+        )
+    finally:
+        conn.close()
+
+    buckets: dict[str, list[dict]] = defaultdict(list)
+    for rec in recs:
+        open_col, close_col = _SIDE_COLUMNS[rec["side"]]
+        open_ml, close_ml = rec[open_col], rec[close_col]
+        if close_ml is None:
+            continue
+        # Devigged drift needs the whole market at both ends; a two-way book
+        # missing one side can still price the pick, so guard per endpoint.
+        opens = [p for p in (rec["open_home_ml"], rec["open_away_ml"],
+                             rec["open_draw_ml"]) if p is not None]
+        closes = [p for p in (rec["close_home_ml"], rec["close_away_ml"],
+                              rec["close_draw_ml"]) if p is not None]
+        p_close_fair = None
+        if len(closes) >= 2:
+            try:
+                p_close_fair = remove_vig(*closes)[_side_index(rec, close_col)]
+            except (ValueError, ZeroDivisionError, IndexError):
+                p_close_fair = None
+        drift = None
+        if open_ml is not None and len(opens) >= 2 and p_close_fair is not None:
+            try:
+                p_open = remove_vig(*opens)[_side_index(rec, open_col)]
+                drift = (p_close_fair - p_open) * 100.0
+            except (ValueError, ZeroDivisionError, IndexError):
+                drift = None
+
+        price_clv = fair_ev = None
+        if rec["price"] is not None:
+            if rec["entry_book"] == rec["book"]:
+                # Same book both ends: vig cancels, this is real price improvement.
+                price_clv = (_decimal(rec["price"]) / _decimal(close_ml) - 1.0) * 100.0
+            elif p_close_fair is not None:
+                # Different venues: the closing book's vig has to come out or
+                # the exchange wins by construction. See the docstring.
+                q_entry = 1.0 / _decimal(rec["price"])
+                if q_entry > _EPS:
+                    fair_ev = (p_close_fair / q_entry - 1.0) * 100.0
+        buckets[rec["tier"]].append({
+            "price_clv": price_clv, "fair_ev": fair_ev, "drift": drift,
+            "result": rec["result"],
+            "cross_venue": rec["price"] is not None and rec["entry_book"] != rec["book"],
+        })
+
+    def _stats(values: list[float]) -> tuple[Optional[float], Optional[float], bool]:
+        """(mean, standard error, significant) — significance needs n >= 30."""
+        if not values:
+            return None, None, False
+        mean = _mean(values)
+        if len(values) < 2:
+            return mean, None, False
+        var = sum((v - mean) ** 2 for v in values) / (len(values) - 1)
+        se = (var ** 0.5) / (len(values) ** 0.5)
+        return mean, se, bool(len(values) >= 30 and se and abs(mean / se) >= 2.0)
+
+    def summarize(items: list[dict]) -> dict:
+        priced = [x["price_clv"] for x in items if x["price_clv"] is not None]
+        fair = [x["fair_ev"] for x in items if x["fair_ev"] is not None]
+        drifts = [x["drift"] for x in items if x["drift"] is not None]
+        decided = [x for x in items if x["result"] in ("W", "L")]
+        clv_mean, clv_se, clv_sig = _stats(priced)
+        fair_mean, fair_se, fair_sig = _stats(fair)
+        return {
+            "n": len(items),
+            "n_same_book": len(priced),
+            "n_cross_venue": len(fair),
+            "price_clv_pct": clv_mean,
+            "price_clv_se": clv_se,
+            "beat_close_rate": (
+                sum(1 for p in priced if p > 0) / len(priced) if priced else None
+            ),
+            "fair_ev_pct": fair_mean,
+            "fair_ev_se": fair_se,
+            "positive_ev_rate": (
+                sum(1 for f in fair if f > 0) / len(fair) if fair else None
+            ),
+            "drift_prob_pts": _mean(drifts) if drifts else None,
+            "win_rate": (
+                sum(1 for x in decided if x["result"] == "W") / len(decided)
+                if decided else None
+            ),
+            "significant": bool(clv_sig or fair_sig),
+        }
+
+    everything = [x for items in buckets.values() for x in items]
+    return {
+        "by_tier": {t: summarize(buckets.get(t, [])) for t in ("STRONG", "LEAN", "MODEL")},
+        "overall": summarize(everything),
+        "note": (
+            "price_clv_pct compares entry to the SAME book's close (vig "
+            "cancels). fair_ev_pct is for picks whose entry venue differs from "
+            "the closing book — exchange prices beat a sportsbook's close by "
+            "construction, so that column devigs the close first. Never read "
+            "the two as one number. Needs ~30+ per tier before 'significant' "
+            "can trip; run `python -m kryptscout.jobs.lines` for more games."
+        ),
+    }
+
+
+def _side_index(rec: dict, column: str) -> int:
+    """Position of the pick's side within the price list handed to remove_vig.
+
+    The list is built home, away, draw with Nones dropped, so the index is the
+    count of non-None entries before this side — not a fixed offset.
+    """
+    order = ["home", "away", "draw"]
+    prefix = column.split("_")[0]  # "open" | "close"
+    target = rec["side"]
+    idx = 0
+    for name in order:
+        if name == target:
+            return idx
+        if rec[f"{prefix}_{name}_ml"] is not None:
+            idx += 1
+    raise IndexError(target)
+
+
 # ------------------------------------------------------------------------ ROI
 
 _VALUE_TIERS = ("STRONG", "LEAN")

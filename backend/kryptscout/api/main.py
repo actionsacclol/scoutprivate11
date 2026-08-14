@@ -6,9 +6,11 @@ edges, uniformly across sports.
 from __future__ import annotations
 
 import asyncio
+import hmac
 import logging
 import math
 import os
+import sys
 from datetime import date, datetime, timedelta, timezone
 from typing import Literal
 
@@ -51,6 +53,15 @@ def _log_startup() -> None:
         "Krypt Scout backend starting — version=%s userdata=%s log=%s",
         version, config._BASE_DIR, logsetup.LOG_FILE,
     )
+    if not _API_TOKEN and getattr(sys, "frozen", False):
+        # A packaged backend is always launched by the Electron supervisor,
+        # which mints a token every time. Missing means either the env didn't
+        # propagate (a bug worth seeing in the log) or someone started this
+        # binary by hand — either way the local API is answering unauthenticated.
+        logger.warning(
+            "no KRYPT_SCOUT_API_TOKEN in the environment — the local API is "
+            "accepting unauthenticated requests"
+        )
 
 
 def _load_engines() -> None:
@@ -82,6 +93,53 @@ app = FastAPI(title="Krypt Scout", version="0.1.0", on_startup=[_log_startup, _l
 _LICENSE_OPEN_PREFIXES = ("/api/health", "/api/license")
 
 
+# sha256 of the raw Ed25519 public key that kryptscout.license verifies with.
+# Duplicated here deliberately — see _license_module_intact.
+# Rotating the signing key means updating this constant as well as
+# license._PUBLIC_KEY_B64, or every install 402s. There is a test that fails
+# loudly if the two drift (test_license_gate.py).
+_LICENSE_PUBKEY_SHA256 = "2a15d4a1c0498bb563ad21fa92d60a11e9d8c92e8ad1a8df53287711c7293983"
+
+
+def _license_module_intact() -> bool:
+    """Whether `kryptscout.license` is the real module rather than a stand-in.
+
+    The 2026-08-08 crack did not defeat a single check — it replaced the file
+    holding it. Python resolves `from kryptscout import license` by filename at
+    runtime out of a directory the user owns, so a twenty-line stub exporting
+    `is_licensed = lambda: True` satisfied every caller, compiled or not. No
+    machine code was patched and nothing had to be understood.
+
+    So the gate stops taking the module's word for it. This asks for things a
+    stub author has no reason to carry: the full internal surface, and the real
+    verifying key. Reproducing the key means shipping the genuine article, at
+    which point the stub is doing real signature checks and is no longer a stub.
+
+    It lives here, in a compiled module, and not in license.py — a module that
+    has been replaced cannot be asked to confirm it hasn't been.
+
+    This is a cost, not a wall. Someone who reads this function can satisfy it.
+    The point is that they now have to read it first."""
+    try:
+        for attr in ("_verify_token", "compute_hwid", "_public_key", "_read_store", "PRODUCT"):
+            if not hasattr(license_mod, attr):
+                return False
+        if license_mod.PRODUCT != "scout":
+            return False
+        return license_mod.public_key_fingerprint() == _LICENSE_PUBKEY_SHA256
+    except Exception:  # noqa: BLE001 — a module that throws here is not the real one
+        return False
+
+
+def _licensed_now() -> bool:
+    """The real gate: a valid token AND a genuine module to have checked it.
+
+    Two independent conditions rather than one boolean. `is_licensed()` alone
+    was the whole of it, which is why one replaced file was the whole of the
+    crack."""
+    return _license_module_intact() and license_mod.is_licensed()
+
+
 @app.middleware("http")
 async def _license_gate(request, call_next):
     from starlette.responses import JSONResponse
@@ -90,13 +148,53 @@ async def _license_gate(request, call_next):
         request.method == "OPTIONS"
         or not path.startswith("/api")
         or path.startswith(_LICENSE_OPEN_PREFIXES)
-        or license_mod.is_licensed()
+        or _licensed_now()
     ):
         return await call_next(request)
     return JSONResponse(
         {"detail": "License required", "licenseRequired": True},
         status_code=402,
     )
+
+
+# Local API token. Electron mints a fresh random token on every backend launch
+# and hands it to this process through the environment; the renderer reads it
+# over IPC and sends it as X-Scout-Token on every request. That closes the
+# "anything on this box can curl 127.0.0.1:<port>" hole — another local
+# process, a browser tab, or a hand-rolled client can no longer drive the
+# backend just by finding the port.
+#
+# What this does NOT do: stop someone who controls the machine. They can read
+# the token out of the process environment, or just spawn the backend binary
+# themselves with a token of their own choosing. This raises the floor; it is
+# not a boundary against the machine's owner. See HARDENING.md.
+#
+# Unset (pytest, a hand-run `python -m uvicorn`, plain `vite` dev) means auth
+# is off, so the dev loop and the test suite need no ceremony.
+_API_TOKEN = os.environ.get("KRYPT_SCOUT_API_TOKEN") or ""
+
+# Health stays open: it is the supervisor's liveness probe, it carries no data,
+# and it must keep answering even if token plumbing breaks.
+_AUTH_OPEN_PREFIXES = ("/api/health",)
+
+
+# Registered AFTER _license_gate, which in Starlette means it wraps it — an
+# unauthenticated request is rejected before the license check ever runs.
+@app.middleware("http")
+async def _api_token_gate(request, call_next):
+    from starlette.responses import JSONResponse
+    path = request.url.path
+    if (
+        not _API_TOKEN
+        or request.method == "OPTIONS"
+        or not path.startswith("/api")
+        or path.startswith(_AUTH_OPEN_PREFIXES)
+    ):
+        return await call_next(request)
+    sent = request.headers.get("x-scout-token") or ""
+    if hmac.compare_digest(sent, _API_TOKEN):
+        return await call_next(request)
+    return JSONResponse({"detail": "Unauthorized"}, status_code=401)
 
 
 app.add_middleware(
@@ -237,10 +335,18 @@ async def performance(
 @app.get("/api/clv")
 async def clv(sport: Sport | None = None, since: date | None = None) -> dict:
     """Closing-line value of model picks — overall + by_sport (argmax side),
-    plus by_tier (STRONG/LEAN/MODEL, scored on each pick's own side)."""
+    by_tier (STRONG/LEAN/MODEL, scored on each pick's own side), and
+    vs_close (scored off the book's declared open/close, backfillable).
+
+    `by_tier` reconstructs endpoints from odds_snapshots, so it only covers
+    games this install happened to be polling early AND near kickoff.
+    `vs_close` reads line_endpoints, which jobs/lines.py can fill in after the
+    fact — same question, far more of the ledger answered.
+    """
     base = tracker.clv(sport=sport, since=since)
     tiers = tracker.clv_by_tier(sport=sport, since=since)
-    return _json_safe({**base, **tiers})
+    endpoints = tracker.clv_vs_close(sport=sport, since=since)
+    return _json_safe({**base, **tiers, "vs_close": endpoints})
 
 
 @app.get("/api/movement/{game_id}")

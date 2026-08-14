@@ -1,35 +1,70 @@
 # Releasing Krypt Scout
 
-Installers are built by `.github/workflows/release.yml` on four native runners —
-Windows x64, macOS arm64, macOS x64, Linux x64.
+Installers are built by `.github/workflows/release.yml` on three native runners
+— Windows x64, macOS arm64, Linux x64.
 
-**Why four runners and not one with a cross-compile flag:** the app ships the
+**Why native runners and not one with a cross-compile flag:** the app ships the
 Python backend as a PyInstaller bundle, and PyInstaller cannot cross-compile.
 Each OS/arch must freeze its own backend binary. Build an Intel `.dmg` on an
 Apple Silicon runner and it installs cleanly, then dies the first time the
-Electron supervisor tries to exec a backend the CPU can't run.
+Electron supervisor tries to exec a backend the CPU can't run. That is also
+why dropping the Intel runner means dropping Intel support outright rather
+than serving those users some other build.
 
 ## Cutting a release
 
+**The version in `package.json` is the trigger.** Bump it, commit, push:
+
 ```bash
-npm version patch      # or minor / major — writes package.json + a v* tag
-git push origin master --follow-tags
+npm version patch --no-git-tag-version   # or minor / major — package.json only
+git commit -am "v0.3.2" && git push
 ```
 
-The tag push builds all four targets and attaches them to a **draft** GitHub
-Release for that tag. Review the assets, then publish the release manually.
+On every push to `master` the cheap `plan` job reads `package.json`, and:
+
+- **tag `v<version>` already exists** → logs a notice and stops. The four-OS
+  matrix never starts, so ordinary pushes cost roughly no Actions minutes.
+  This is the normal case for day-to-day commits.
+- **tag doesn't exist** → tags the commit, creates the GitHub Release, and
+  builds all four installers straight onto it. No second push, no manual step.
+
+CI cannot tag itself into a loop: a tag pushed with `GITHUB_TOKEN` does not
+trigger workflows, which is why the *same* run does the building rather than
+waiting to be re-triggered.
+
+Pushing a `v*` tag by hand still works and is honoured as-is — useful for
+re-cutting a release from an older commit.
+
+Releases are currently created as **drafts** — review the assets, then hit
+publish. That is temporary: v0.3.1 built five clean artifacts but ran plain
+`dist`, and this pipeline runs `dist:hardened`, whose Nuitka `.so` path has
+never been built on macOS or Linux (HARDENING.md). Since `fail-fast` is off, a
+mac failure would otherwise publish a release carrying only Windows and Linux.
+**Once one hardened run is green on all four runners, drop `--draft` from the
+`gh release create` call in the `release` job** and releases go out untouched.
 
 To rehearse without releasing anything, run the workflow from the Actions tab
-(`workflow_dispatch`) — same build, artifacts only, no release touched.
+(`workflow_dispatch`) — same build, attached to a `build-<run>` **prerelease**,
+no real release touched.
+
+Keep `backend/version_info.txt` (Windows exe VERSIONINFO) in sync with the
+`package.json` version when you bump it.
 
 Artifacts:
 
 | Platform | File |
 |---|---|
 | Windows x64 | `Krypt Scout-Setup-<version>.exe` (NSIS) |
-| macOS Apple Silicon | `krypt-scout-<version>-mac-arm64.dmg` / `.zip` |
-| macOS Intel | `krypt-scout-<version>-mac-x64.dmg` / `.zip` |
+| macOS Apple Silicon | `krypt-scout-<version>-mac-arm64.dmg` |
 | Linux x64 | `krypt-scout-<version>-linux-x64.AppImage` / `.deb` |
+
+**No Intel Mac build.** The `macos-15-intel` job was removed from the matrix:
+GitHub bills macOS at 10x, so on this private repo the two mac jobs were ~85%
+of a release's cost and `dist:hardened` makes them longer still. Dropping it
+cuts ~40% off every run. Intel users get no download rather than a broken one —
+arm64 and x64 are separate dmgs, so there is nothing for them to install by
+mistake. To restore, add the job back to the matrix in `release.yml` (the
+comment at the top of the file has the exact block).
 
 ## Two macOS traps (both hit on the first run — don't reintroduce them)
 
@@ -119,9 +154,10 @@ Escape hatches, in order:
 DevTools stay compiled out of packaged builds — diagnosis goes through the
 log export, not an inspector.
 
-Before blaming the renderer, confirm the user grabbed the right dmg: an
-arm64 dmg on an Intel Mac won't launch at all, and macOS 10.15 is the floor
-for the Electron in use.
+Before blaming the renderer, confirm the machine is Apple Silicon at all: the
+arm64 dmg won't launch on an Intel Mac, and since the Intel build was dropped
+there is no dmg that will. `uname -m` returning `x86_64` ends that support
+thread. macOS 10.15 is the floor for the Electron in use.
 
 ## Auto-update stays dormant
 
@@ -135,7 +171,10 @@ made public, set `build.publish` to the `publishTemplate` block already in
 ## What CI verifies before it packages anything
 
 Each runner, in order: `npm run typecheck` → the full backend pytest suite →
-`npm run dist`. `dist` runs `py:bundle`, which freezes the backend and then
+`npm run dist:hardened` (Nuitka-compiles the `HARDEN_MODULES` list before
+freezing — see HARDENING.md; plain `dist` would ship those modules as
+decompilable `.pyc`). `dist:hardened` runs `py:bundle:hardened`, which
+freezes the backend and then
 executes the frozen binary's `--selftest` (imports the trading deps and signs a
 Polymarket order offline). A non-zero selftest aborts the build, so a bundle
 that dropped a lazy-imported dependency can never reach a release.
@@ -148,4 +187,6 @@ The Windows bundle is the only one with production mileage. The backend spec
 and the keychain packages are collected best-effort per platform, but the first
 green macOS/Linux run in CI is also the first time those bundles have ever been
 built. Smoke-test each artifact — launch it, confirm the backend reaches
-`running` on the dashboard, and load one board — before publishing the draft.
+`running` on the dashboard, and load one board. Because releases now publish
+themselves, do that smoke test on the `workflow_dispatch` prerelease *before*
+bumping the version, not after the real release is already public.

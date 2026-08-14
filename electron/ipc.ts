@@ -132,6 +132,9 @@ export function registerIpc(): void {
   // ── backend lifecycle ────────────────────────────────────────────
   ipcMain.handle('backend:info', () => pythonBackend.info());
   ipcMain.handle('backend:port', () => pythonBackend.waitForPort());
+  // Port + per-launch API token in one call, so the renderer always sends the
+  // token that belongs to the port it is about to hit (see src/backendBase.ts).
+  ipcMain.handle('backend:connection', () => pythonBackend.connection());
   ipcMain.handle('backend:restart', () => pythonBackend.restart());
   ipcMain.handle('backend:logs', (_e, limit?: number) => {
     const n = Math.max(1, Math.min(limit ?? 500, LOG_MAX));

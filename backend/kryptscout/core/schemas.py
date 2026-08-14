@@ -57,6 +57,39 @@ class MoneylineOdds(BaseModel):
     under_price: Optional[int] = None
 
 
+class LineEndpoints(BaseModel):
+    """A book's OPENING and CLOSING moneyline for one game.
+
+    Distinct from MoneylineOdds on purpose: a snapshot is "the price at time
+    t", and two of those are only the endpoints of a series if we happened to
+    poll at the right moments. These are the book's own declared open and
+    close, which is what closing-line value is actually defined against.
+
+    Why this exists: CLV is the only measurement that can tell a real edge
+    from a hot streak, and computing it from our own `odds_snapshots` requires
+    the app to have been running — polling that game, on that book, both early
+    and near kickoff. It usually wasn't. ESPN publishes both endpoints per
+    event and keeps serving them long after the game finishes, so this turns
+    CLV from "start collecting and wait months" into a backfill.
+    """
+
+    book: str
+    fetched_at: datetime
+    open_home_ml: Optional[int] = None
+    open_away_ml: Optional[int] = None
+    open_draw_ml: Optional[int] = None
+    close_home_ml: Optional[int] = None
+    close_away_ml: Optional[int] = None
+    close_draw_ml: Optional[int] = None
+
+    def complete(self) -> bool:
+        """Both endpoints present on both sides — the minimum for a CLV row."""
+        return None not in (
+            self.open_home_ml, self.open_away_ml,
+            self.close_home_ml, self.close_away_ml,
+        )
+
+
 def _aware(moment: datetime) -> datetime:
     """Naive datetimes are UTC by convention everywhere in this codebase."""
     return moment if moment.tzinfo else moment.replace(tzinfo=timezone.utc)

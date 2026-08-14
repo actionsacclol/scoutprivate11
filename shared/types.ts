@@ -184,6 +184,9 @@ export interface ScoutApi {
     info(): Promise<BackendInfo>;
     /** Resolves once the supervisor has picked a port (null on timeout). */
     port(): Promise<number | null>;
+    /** Port + the per-launch API token to send as X-Scout-Token. Null on
+     *  timeout; `token` is null only on backends started without one. */
+    connection(): Promise<{ port: number; token: string | null } | null>;
     restart(): Promise<void>;
     onStatus(cb: (info: BackendInfo) => void): () => void;
     logs(limit?: number): Promise<LogEntry[]>;

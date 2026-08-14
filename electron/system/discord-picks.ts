@@ -458,7 +458,11 @@ class DiscordPicks {
       const ctl = new AbortController();
       const timer = setTimeout(() => ctl.abort(), PICKS_TIMEOUT_MS);
       try {
-        const res = await fetch(url, { signal: ctl.signal });
+        const token = pythonBackend.token();
+        const res = await fetch(url, {
+          headers: token ? { 'X-Scout-Token': token } : undefined,
+          signal: ctl.signal,
+        });
         if (res.status === 404) {
           return { error: 'picks endpoint not available (404) — this backend build does not ship /api/picks yet' };
         }

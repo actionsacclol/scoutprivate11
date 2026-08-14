@@ -400,7 +400,12 @@ class JobScheduler {
     const ctl = new AbortController();
     const timer = setTimeout(() => ctl.abort(), timeoutMs);
     try {
-      const res = await fetch(url, { method: 'POST', signal: ctl.signal });
+      const token = pythonBackend.token();
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: token ? { 'X-Scout-Token': token } : undefined,
+        signal: ctl.signal,
+      });
       const body = await res.text().catch(() => '');
       if (res.status === 404) {
         record(false, undefined, 'jobs endpoint not available (404) — this backend build does not ship /api/jobs yet');

@@ -114,12 +114,41 @@ export default function App() {
   // Poll the local license status (backend-side is_licensed); a null response
   // (backend not up yet) leaves us on the 'checking' splash rather than
   // flashing the app. Revocation is enforced by the heartbeat below.
+  //
+  // An EXPIRED stored token is NOT a verdict. The license server reissues on
+  // heartbeat regardless of expiry (hornbot verifyToken ignores exp by design),
+  // so a user coming back after a few days offline is still licensed — they
+  // just haven't asked yet. Walling them on the local check alone would shove
+  // LicenseGate in their face for the length of one round-trip, which reads as
+  // "my license broke". So a stale token buys one renewal attempt before we
+  // decide anything. This matters now that the token TTL is 48h rather than a
+  // week (hornbot src/lib/scout-license.ts) — "away for a weekend" hits it.
+  const renewAttempted = useRef(false)
   const checkLicense = useCallback(async () => {
     const s = await fetchLicense()
-    if (s) {
-      setLicenseStatus(s)
-      setLicenseState(s.licensed ? 'licensed' : 'unlicensed')
+    if (!s) return // backend not up yet — hold the splash
+    setLicenseStatus(s)
+    if (s.licensed) {
+      renewAttempted.current = false // re-arm, so a later expiry also gets one
+      setLicenseState('licensed')
+      return
     }
+    if (s.reason === 'expired_or_invalid' && !renewAttempted.current) {
+      const renewed = await heartbeatLicense()
+      if (renewed) {
+        // The server answered — its word is final, and we don't re-ask on
+        // every 20s poll from here.
+        renewAttempted.current = true
+        setLicenseStatus(renewed)
+        setLicenseState(renewed.licensed ? 'licensed' : 'unlicensed')
+        return
+      }
+      // Unreachable: leave the latch off so the next poll retries, and fall
+      // through to the local verdict, which is the truthful one when we can't
+      // reach anyone. 'no_license' skips all of this — nothing to renew, so
+      // first-run activation still shows the gate immediately.
+    }
+    setLicenseState('unlicensed')
   }, [])
 
   useEffect(() => {

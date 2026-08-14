@@ -21,7 +21,7 @@ from datetime import datetime, timezone
 
 import httpx
 
-from kryptscout.core.schemas import Game, MoneylineOdds, Sport
+from kryptscout.core.schemas import Game, LineEndpoints, MoneylineOdds, Sport
 from kryptscout.datasources.espn import LEAGUE_PATHS
 from kryptscout.odds.providers import OddsProvider
 
@@ -98,6 +98,60 @@ def _price(value) -> int | None:
         return int(round(float(value))) or None
     except (TypeError, ValueError):
         return None
+
+
+def _endpoint_price(side: dict, endpoint: str) -> int | None:
+    """American price from homeTeamOdds/awayTeamOdds `open`/`close`.
+
+    These nest one level deeper than the flat `moneyLine` the board reads:
+
+        homeTeamOdds.open.moneyLine = {"american": "-118", "decimal": 1.84, ...}
+
+    `american` is a STRING with an explicit sign ("+100"), and ESPN writes a
+    true pick'em as "EVEN" rather than a number.
+    """
+    node = ((side.get(endpoint) or {}).get("moneyLine") or {})
+    raw = node.get("american")
+    if isinstance(raw, str):
+        text = raw.strip().upper()
+        if text in ("EVEN", "EV", "PK"):
+            return 100
+        try:
+            return int(text.replace("+", "")) or None
+        except ValueError:
+            return None
+    return _price(raw if raw is not None else node.get("value"))
+
+
+def parse_line_endpoints(items: list[dict], fetched_at: datetime) -> list[LineEndpoints]:
+    """One LineEndpoints per provider item that declares an open AND a close.
+
+    ESPN keeps serving this document long after a game finishes, so this is
+    the backfillable route to closing-line value — see LineEndpoints. Items
+    with only one endpoint (a game still in progress publishes `open` and
+    `current` but no `close`) are dropped: half a pair measures nothing.
+    """
+    out: list[LineEndpoints] = []
+    for item in items:
+        name = (item.get("provider") or {}).get("name", "")
+        if not name or is_in_play_provider(name):
+            continue
+        home = item.get("homeTeamOdds") or {}
+        away = item.get("awayTeamOdds") or {}
+        draw = item.get("drawOdds") or {}
+        row = LineEndpoints(
+            book=book_key(name),
+            fetched_at=fetched_at,
+            open_home_ml=_endpoint_price(home, "open"),
+            open_away_ml=_endpoint_price(away, "open"),
+            open_draw_ml=_endpoint_price(draw, "open"),
+            close_home_ml=_endpoint_price(home, "close"),
+            close_away_ml=_endpoint_price(away, "close"),
+            close_draw_ml=_endpoint_price(draw, "close"),
+        )
+        if row.complete():
+            out.append(row)
+    return out
 
 
 def parse_odds_items(items: list[dict], fetched_at: datetime) -> list[MoneylineOdds]:
@@ -214,3 +268,43 @@ class EspnOddsProvider(OddsProvider):
 
 def build_provider() -> EspnOddsProvider:
     return EspnOddsProvider()
+
+
+async def fetch_line_endpoints(
+    games: list[Game], concurrency: int = MAX_CONCURRENCY
+) -> dict[str, list[LineEndpoints]]:
+    """{game.id: [LineEndpoints, ...]} — open+close per book, for CLV.
+
+    Deliberately NOT wired into the provider registry. Providers feed the live
+    board on a 60s poll; this reads settled history in a backfill and must not
+    add latency or failure modes to the board. Games ESPN can't price are
+    simply absent from the result.
+    """
+    sem = asyncio.Semaphore(concurrency)
+    out: dict[str, list[LineEndpoints]] = {}
+
+    async def one(client: httpx.AsyncClient, game: Game) -> None:
+        event_id = event_id_for(game)
+        path = league_path_for(game)
+        if not event_id or not path:
+            return
+        url = f"{CORE}/{path}/events/{event_id}/competitions/{event_id}/odds"
+        async with sem:
+            try:
+                resp = await client.get(url)
+            except httpx.HTTPError as exc:
+                logger.warning("espn endpoints fetch failed for %s: %s", game.id, exc)
+                return
+        if resp.status_code != 200:
+            if resp.status_code != 404:
+                logger.warning("espn endpoints %s: HTTP %s", game.id, resp.status_code)
+            return
+        rows = parse_line_endpoints(
+            resp.json().get("items", []), datetime.now(timezone.utc)
+        )
+        if rows:
+            out[game.id] = rows
+
+    async with httpx.AsyncClient(timeout=TIMEOUT, follow_redirects=True) as client:
+        await asyncio.gather(*(one(client, g) for g in games))
+    return out

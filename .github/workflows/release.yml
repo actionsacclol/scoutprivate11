@@ -3,15 +3,33 @@
 # Every job builds NATIVELY on its own OS and architecture. That is not a
 # convenience — the app ships a PyInstaller bundle of the Python backend, and
 # PyInstaller cannot cross-compile. A macOS arm64 runner can only produce an
-# arm64 backend, so Intel Macs need their own (macos-15-intel) runner or the
-# app installs fine and then dies the moment the supervisor tries to spawn a
-# backend binary the CPU can't execute. (macos-13, the previous Intel label,
-# was retired by GitHub — jobs targeting it queue forever and never start.)
+# arm64 backend; an Intel Mac needs a build from an Intel runner or the app
+# installs fine and then dies the moment the supervisor tries to spawn a
+# backend binary the CPU can't execute.
+#
+# INTEL MAC IS DELIBERATELY NOT BUILT. GitHub bills macOS runners at 10x and
+# Windows at 2x, so on a private repo the two mac jobs were ~85% of the cost of
+# a release and Nuitka (dist:hardened) makes them longer still. Dropping the
+# Intel job cuts roughly 40% off every run, which is the difference between
+# ~2 releases a month and ~4 on the same allowance. The cost is that Intel Mac
+# users have no build at all — NOT a broken one, since arm64 and x64 dmgs are
+# separate downloads and an Intel machine simply won't be offered one. Restore
+# it by adding `- os: macos-15-intel / label: macos-x64` back to the matrix
+# (macos-13, the older Intel label, was retired — jobs targeting it queue
+# forever and never start).
 #
 # Triggers:
-#   * push a tag  v*        -> build all platforms, attach to a DRAFT release
+#   * push to master        -> if package.json's version has no v<version> tag
+#                              yet, tag the commit and cut a real release from
+#                              it. If the tag already exists, the `plan` job
+#                              exits in seconds and NOTHING else runs — pushes
+#                              that don't bump the version cost ~no minutes.
+#   * push a tag  v*        -> build all platforms, attach to that release
 #   * manual run (dispatch) -> build all platforms, attach to a per-run
 #                              PRERELEASE tagged build-<run_number>
+#
+# The version bump in package.json is the release trigger. Bump it, commit,
+# push — the tag, the release and the four installers happen on their own.
 #
 # Installers go to Release assets, never actions/upload-artifact: the four
 # bundles are ~200 MB each and would exhaust the 500 MB Actions artifact quota
@@ -22,6 +40,8 @@ name: release
 
 on:
   push:
+    branches:
+      - master
     tags:
       - 'v*'
   workflow_dispatch:
@@ -29,13 +49,118 @@ on:
 permissions:
   contents: write
 
-concurrency:
-  group: release-${{ github.ref }}
-  cancel-in-progress: true
-
 jobs:
+  # Decides whether there is anything to release and under which tag, so the
+  # expensive four-OS matrix below never starts on an ordinary push. Also the
+  # only place that writes a tag.
+  plan:
+    name: plan
+    runs-on: ubuntu-latest
+    # Concurrency is scoped to THIS job on purpose. A workflow-level group with
+    # cancel-in-progress would let the next push to master — a README fix, say,
+    # landing a minute after a version bump — cancel the release build that bump
+    # started, leaving a published release with two of its four installers.
+    # Superseding a cheap plan is free; superseding a 40-minute build is not.
+    concurrency:
+      group: release-plan-${{ github.ref }}
+      cancel-in-progress: true
+    outputs:
+      build: ${{ steps.decide.outputs.build }}
+      tag: ${{ steps.decide.outputs.tag }}
+      title: ${{ steps.decide.outputs.title }}
+      notes: ${{ steps.decide.outputs.notes }}
+      prerelease: ${{ steps.decide.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: decide
+        shell: bash
+        run: |
+          set -euo pipefail
+          NOTES_TAG="Unsigned builds for Windows, macOS (Apple Silicon) and Linux. Intel Macs are not supported — see RELEASING.md for install notes."
+
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            # Someone pushed a tag by hand — honour it as-is.
+            TAG="${GITHUB_REF_NAME}"
+            echo "build=true"                       >> "$GITHUB_OUTPUT"
+            echo "tag=${TAG}"                       >> "$GITHUB_OUTPUT"
+            echo "title=Krypt Scout ${TAG}"         >> "$GITHUB_OUTPUT"
+            echo "notes=${NOTES_TAG}"               >> "$GITHUB_OUTPUT"
+            echo "prerelease=false"                 >> "$GITHUB_OUTPUT"
+
+          elif [[ "${GITHUB_EVENT_NAME}" == "push" ]]; then
+            VERSION="$(node -p "require('./package.json').version")"
+            TAG="v${VERSION}"
+            # The tag is the ledger of what has already shipped: if it exists,
+            # this push carried no version bump and there is nothing to build.
+            if git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null 2>&1; then
+              echo "::notice::${TAG} already exists — no version bump on this push, skipping the build."
+              echo "build=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            # Lightweight tag: needs no committer identity, and pushing it with
+            # GITHUB_TOKEN deliberately does NOT re-trigger this workflow (GitHub
+            # suppresses that to avoid loops) — this same run does the building.
+            git tag "${TAG}"
+            git push origin "refs/tags/${TAG}"
+            echo "::notice::Tagged ${GITHUB_SHA} as ${TAG}."
+            echo "build=true"                       >> "$GITHUB_OUTPUT"
+            echo "tag=${TAG}"                       >> "$GITHUB_OUTPUT"
+            echo "title=Krypt Scout ${TAG}"         >> "$GITHUB_OUTPUT"
+            echo "notes=${NOTES_TAG}"               >> "$GITHUB_OUTPUT"
+            echo "prerelease=false"                 >> "$GITHUB_OUTPUT"
+
+          else
+            TAG="build-${GITHUB_RUN_NUMBER}"
+            echo "build=true"                       >> "$GITHUB_OUTPUT"
+            echo "tag=${TAG}"                       >> "$GITHUB_OUTPUT"
+            echo "title=CI build ${GITHUB_RUN_NUMBER} (${GITHUB_SHA:0:7})" >> "$GITHUB_OUTPUT"
+            echo "notes=Unsigned CI installers built from ${GITHUB_SHA}. Not a release." >> "$GITHUB_OUTPUT"
+            echo "prerelease=true"                  >> "$GITHUB_OUTPUT"
+          fi
+
+  # Created once, before the matrix, so four concurrent uploaders can't race
+  # each other into duplicate releases.
+  release:
+    name: create release
+    needs: plan
+    if: needs.plan.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create or reuse the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.plan.outputs.tag }}
+          TITLE: ${{ needs.plan.outputs.title }}
+          NOTES: ${{ needs.plan.outputs.notes }}
+          PRERELEASE: ${{ needs.plan.outputs.prerelease }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "::notice::Release $TAG already exists — reusing it (re-run)."
+            exit 0
+          fi
+          if [[ "$PRERELEASE" == "true" ]]; then
+            gh release create "$TAG" --target "$GITHUB_SHA" \
+              --title "$TITLE" --notes "$NOTES" --prerelease
+          else
+            # --draft until the HARDENED build has proven itself on all four
+            # runners. v0.3.1 built five clean artifacts, but it ran plain
+            # `dist`; this pipeline runs `dist:hardened`, and per HARDENING.md
+            # the Nuitka .so path has never been built on macOS or Linux. With
+            # fail-fast off, a mac failure would otherwise PUBLISH a release
+            # carrying only the Windows and Linux installers.
+            # Once one hardened run is green on all four, drop --draft and
+            # releases go out untouched again.
+            gh release create "$TAG" --target "$GITHUB_SHA" \
+              --title "$TITLE" --notes "$NOTES" --draft
+          fi
+
   build:
     name: ${{ matrix.label }}
+    needs: [plan, release]
     runs-on: ${{ matrix.os }}
     strategy:
       # One platform failing must not cancel the others — a partial release is
@@ -47,13 +172,15 @@ jobs:
             label: windows-x64
           - os: macos-14
             label: macos-arm64
-          - os: macos-15-intel
-            label: macos-x64
           - os: ubuntu-latest
             label: linux-x64
 
     steps:
+      # The tag was pushed by `plan` in this same run; build exactly it, so a
+      # re-run or a later master commit can never mix sources into one release.
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.plan.outputs.tag }}
 
       - uses: actions/setup-node@v4
         with:
@@ -137,27 +264,12 @@ jobs:
             -exec cp {} out/ \;
           ls -la out
 
-      # `gh` is preinstalled on all GitHub-hosted runners. --clobber makes a
-      # re-run idempotent instead of erroring on an existing asset. Each matrix
-      # job uploads only its own platform's files to the shared tag, and the
-      # create step is guarded so concurrent jobs don't race.
+      # `gh` is preinstalled on all GitHub-hosted runners. The release already
+      # exists (the `release` job made it); --clobber makes a re-run idempotent
+      # instead of erroring on an asset that is already attached.
       - name: Publish installers to the release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.plan.outputs.tag }}
         shell: bash
-        run: |
-          set -euo pipefail
-          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
-            TAG="${GITHUB_REF_NAME}"
-            CREATE_ARGS=(--title "Krypt Scout ${TAG}" --draft
-                         --notes "Unsigned builds for Windows, macOS (Intel + Apple Silicon) and Linux. See RELEASING.md for install notes.")
-          else
-            TAG="build-${GITHUB_RUN_NUMBER}"
-            CREATE_ARGS=(--title "CI build ${GITHUB_RUN_NUMBER} (${GITHUB_SHA:0:7})" --prerelease
-                         --notes "Unsigned CI installers built from ${GITHUB_SHA}. Not a release.")
-          fi
-          if ! gh release view "$TAG" >/dev/null 2>&1; then
-            # Another matrix job may win this race; ignore an "already exists".
-            gh release create "$TAG" "${CREATE_ARGS[@]}" || true
-          fi
-          gh release upload "$TAG" out/* --clobber
+        run: gh release upload "$TAG" out/* --clobber

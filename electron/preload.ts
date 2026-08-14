@@ -25,6 +25,8 @@ const api: ScoutApi = {
   backend: {
     info: (): Promise<BackendInfo> => ipcRenderer.invoke('backend:info'),
     port: (): Promise<number | null> => ipcRenderer.invoke('backend:port'),
+    connection: (): Promise<{ port: number; token: string | null } | null> =>
+      ipcRenderer.invoke('backend:connection'),
     restart: () => ipcRenderer.invoke('backend:restart'),
     onStatus: (cb) => sub<BackendInfo>('backend:info', cb),
     logs: (limit?: number): Promise<LogEntry[]> => ipcRenderer.invoke('backend:logs', limit),

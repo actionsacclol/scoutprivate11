@@ -2,6 +2,65 @@
 
 ## Unreleased
 
+- **Closing-line value is now backfillable** (MEASUREMENT): ESPN's odds
+  document already carried each book's declared `open` and `close`, and the
+  parser was reading only the flat current `moneyLine` and discarding both.
+  New `line_endpoints` table, `espn_odds.parse_line_endpoints` /
+  `fetch_line_endpoints`, `jobs/lines.py` to backfill, and
+  `tracker.clv_vs_close()` (also merged into `GET /api/clv` as `vs_close`).
+  This matters because CLV was previously computable only from
+  `odds_snapshots` — which needs this install to have been polling that game,
+  on that book, both early and near kickoff. It usually wasn't: **11 of 283
+  recorded picks were scoreable**. Every non-tennis pick on a settled game now
+  is (19/19), and ESPN still serves the document for month-old games, so the
+  history backfills instead of having to accrue. Tennis has no per-match ESPN
+  odds document and stays unscoreable this way.
+- **Cross-venue CLV confound found and closed** (MEASUREMENT): the first run of
+  the above reported **+6.1% CLV on STRONG at a 12-of-12 beat rate**, t≈4.6.
+  It was fake. Value picks are priced at Polymarket/Kalshi while ESPN's close
+  is DraftKings, and a near-zero-vig exchange beats a sportsbook's vigged close
+  on essentially every bet ever placed, win or lose — the number was the spread
+  between two venues, reported as skill. `clv_vs_close` now splits same-book
+  picks (`price_clv_pct`, vig cancels) from cross-venue ones (`fair_ev_pct`,
+  measured against the *devigged* close) and never averages the two. Corrected
+  figure on the same picks: **+1.5% ± 1.3%** — not significant, but no longer
+  nonsense. `test_line_endpoints.py` pins the split.
+
+- **Releases cut themselves from the version bump** (CI): pushing to `master`
+  now tags and releases when `package.json`'s version has no `v<version>` tag
+  yet — no `npm version`, no `--follow-tags`, no manual publish. A cheap `plan`
+  job makes that call in seconds and stops there on ordinary pushes, so the
+  four-OS matrix (and the Actions minutes it eats) only runs on an actual
+  version bump. The tag is pushed with `GITHUB_TOKEN`, which deliberately does
+  not re-trigger workflows, so the *same* run does the building rather than
+  waiting for a trigger that never comes. Releases are created published rather
+  than draft, the release object is created once before the matrix (four
+  concurrent uploaders can no longer race into duplicates), and each build job
+  checks out the tag rather than the branch tip. Hand-pushed `v*` tags still
+  work; `workflow_dispatch` still produces a `build-<run>` prerelease.
+- **Intel Mac build dropped** (CI): GitHub bills macOS runners at 10x, so on a
+  private repo the two mac jobs were ~85% of a release's cost and
+  `dist:hardened` (Nuitka) makes them longer still. Removing `macos-15-intel`
+  cuts ~40% off every run. Intel users get no download rather than a broken
+  one — arm64 and x64 are separate dmgs, so there is nothing to install by
+  mistake. README/RELEASING updated to say so plainly. Restore by re-adding the
+  matrix entry; the comment at the top of `release.yml` has the block.
+- **First hardened release lands as a draft**: v0.3.1 built five clean
+  artifacts but ran plain `dist`. This pipeline runs `dist:hardened`, whose
+  Nuitka `.so` path has never been built on macOS or Linux, and with
+  `fail-fast: false` a mac failure would otherwise publish a release carrying
+  only Windows and Linux. Drop `--draft` once one hardened run is green.
+- **`backend/version_info.txt` can't drift from `package.json`** again: the
+  shipped exe claimed 0.3.1 while the app was 0.3.2, and now that the version
+  *is* the release trigger, a stale one ships mislabelled. Synced, and pinned by
+  `test_version_sync.py`.
+- **`.gitignore` covers sqlite backups** (`*.sqlite.bak`, `*.sqlite.*.bak`).
+  `jobs/compact.py` leaves a full 59 MB copy of the live store next to it — real
+  bet history, one `git add -A` from a public repo.
+- **`py-harden.mjs` restores the source tree on Ctrl-C**: the `finally` block it
+  relied on doesn't run on SIGINT, so interrupting the multi-minute Nuitka
+  compile left every hardened `.py` sitting in `build-harden-backup/`.
+
 - **macOS builds fixed** (PACKAGING): the first CI run produced no usable
   Apple Silicon build. Two independent causes, both now closed.
   `build.mac.identity: null` disabled code signing *entirely* — including the
