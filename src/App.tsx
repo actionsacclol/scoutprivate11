@@ -4,6 +4,7 @@ import type { BoardMap, Sport } from './types'
 import { SPORTS } from './types'
 import { checkHealth, fetchAllBoards, fetchBoard, fetchLicense, heartbeatLicense, type LicenseStatus } from './api'
 import LicenseGate from './components/LicenseGate'
+import StartupSplash from './components/StartupSplash'
 import { DEMO_BOARDS } from './demo'
 import TitleBar from './components/TitleBar'
 import Sidebar, { type PageId } from './components/Sidebar'
@@ -197,12 +198,10 @@ export default function App() {
           }}
         />
       ) : licenseState === 'checking' ? (
-        <div className="flex min-h-0 flex-1 items-center justify-center bg-krypt-radial">
-          <div className="text-center">
-            <div className="mx-auto mb-3 h-6 w-6 animate-spin rounded-full border-2 border-scout-red border-t-transparent" />
-            <p className="text-sm text-krypt-muted">Starting Krypt Scout…</p>
-          </div>
-        </div>
+        // Holds until the backend answers /api/license. It reports the
+        // supervisor's state and offers restart/export once that stops looking
+        // like a slow cold start — see StartupSplash.
+        <StartupSplash backend={backend} />
       ) : (
         <>
       <Onboarding />

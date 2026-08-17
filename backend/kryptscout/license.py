@@ -32,6 +32,8 @@ import json
 import logging
 import os
 import platform
+import re
+import subprocess
 import sys
 import time
 from datetime import datetime, timezone
@@ -75,35 +77,111 @@ def _server() -> str:
 # ------------------------------------------------------------------ HWID
 
 
-def _machine_id() -> str:
-    """A stable per-machine string. Windows MachineGuid survives reboots and
-    most hardware/OS upgrades, changing only on a Windows reinstall — a good
-    balance (strict enough to stop copying, loose enough not to lock out real
-    users on a GPU/disk swap). Falls back to the MAC-derived node + hostname."""
-    if sys.platform == "win32":
+def _windows_machine_guid() -> Optional[str]:
+    """Windows MachineGuid — survives reboots and most hardware/OS upgrades,
+    changing only on a Windows reinstall. Strict enough to stop copying, loose
+    enough not to lock anyone out over a GPU or disk swap."""
+    if sys.platform != "win32":
+        return None
+    try:
+        import winreg
+        key = winreg.OpenKey(
+            winreg.HKEY_LOCAL_MACHINE,
+            r"SOFTWARE\Microsoft\Cryptography",
+            0, winreg.KEY_READ | winreg.KEY_WOW64_64KEY,
+        )
         try:
-            import winreg
-            key = winreg.OpenKey(
-                winreg.HKEY_LOCAL_MACHINE,
-                r"SOFTWARE\Microsoft\Cryptography",
-                0, winreg.KEY_READ | winreg.KEY_WOW64_64KEY,
-            )
-            try:
-                val, _ = winreg.QueryValueEx(key, "MachineGuid")
-            finally:
-                winreg.CloseKey(key)
+            val, _ = winreg.QueryValueEx(key, "MachineGuid")
+        finally:
+            winreg.CloseKey(key)
+        return str(val) or None
+    except Exception:  # noqa: BLE001 — caller falls through to the portable id
+        return None
+
+
+def _darwin_platform_uuid() -> Optional[str]:
+    """macOS IOPlatformUUID — the stable analogue of Windows MachineGuid.
+
+    macOS had no equivalent here, so it fell all the way through to the portable
+    id below, and that id DRIFTS on a Mac: `platform.node()` is the hostname,
+    which macOS rewrites on its own when a DHCP name collides (`Mini` becomes
+    `Mini-2`), and `uuid.getnode()` invents a random node whenever it cannot
+    read a MAC. Either one moves and the hwid moves with it — at which point a
+    paying customer's signed token stops matching their machine and the app
+    walls them behind the activation screen, then spends another seat when they
+    re-activate. IOPlatformUUID moves for nobody short of a logic-board swap."""
+    if sys.platform != "darwin":
+        return None
+    try:
+        out = subprocess.run(
+            ["/usr/sbin/ioreg", "-rd1", "-c", "IOPlatformExpertDevice"],
+            capture_output=True, text=True, timeout=5, check=False,
+        ).stdout or ""
+    except (OSError, subprocess.SubprocessError):
+        return None
+    m = re.search(r'"IOPlatformUUID"\s*=\s*"([^"]+)"', out)
+    return m.group(1) if m else None
+
+
+def _linux_machine_id() -> Optional[str]:
+    """systemd/dbus machine-id: written once at install, stable thereafter.
+    Same reasoning as the macOS case — the portable fallback drifts."""
+    if sys.platform.startswith("win") or sys.platform == "darwin":
+        return None
+    for path in ("/etc/machine-id", "/var/lib/dbus/machine-id"):
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                val = fh.read().strip()
             if val:
-                return str(val)
-        except Exception:  # noqa: BLE001 — fall through to the portable id
-            pass
+                return val
+        except OSError:
+            continue
+    return None
+
+
+def _portable_machine_id() -> str:
+    """Last-resort id for a machine with no stable platform id. Known to drift
+    (see _darwin_platform_uuid) — kept only so nobody is left with no id at all,
+    and because installs activated before the stable ids existed are bound to
+    it. Never preferred when a stable id is available."""
     import uuid
     return f"{uuid.getnode()}-{platform.node()}"
 
 
+def _machine_ids() -> list[str]:
+    """Every id this machine can legitimately claim, most stable first.
+
+    More than one because of MIGRATION: an install activated under the old
+    scheme holds a server-signed token bound to the hash of the portable id, and
+    the client cannot re-sign it. Accepting any id on this list means those
+    users keep working while new activations bind to the stable id at the front.
+
+    This does NOT loosen anti-sharing: every entry is still read from THIS
+    machine, so a copied license.json lands on a machine whose ids don't include
+    the token's."""
+    ids = [
+        i for i in (_windows_machine_guid(), _darwin_platform_uuid(), _linux_machine_id())
+        if i
+    ]
+    ids.append(_portable_machine_id())
+    # Dedup, preserving order.
+    return list(dict.fromkeys(ids))
+
+
+def _hash_machine_id(raw: str) -> str:
+    return hashlib.sha256(f"{_HWID_SALT}|{raw}".encode("utf-8")).hexdigest()
+
+
 def compute_hwid() -> str:
-    """Salted sha256 of the machine id (64 lowercase hex chars). The raw id
-    never leaves the machine; only this hash is stored/transmitted."""
-    return hashlib.sha256(f"{_HWID_SALT}|{_machine_id()}".encode("utf-8")).hexdigest()
+    """Salted sha256 of the machine id (64 lowercase hex chars) — the one this
+    machine PREFERS, which is what a new activation binds to. The raw id never
+    leaves the machine; only this hash is stored/transmitted."""
+    return _hash_machine_id(_machine_ids()[0])
+
+
+def _hwid_candidates() -> list[str]:
+    """Hashed ids a token may be bound to for this machine to accept it."""
+    return [_hash_machine_id(i) for i in _machine_ids()]
 
 
 # ------------------------------------------------------------ environment signal
@@ -248,7 +326,11 @@ def _verify_token(token: str, *, hwid: Optional[str] = None) -> Optional[dict]:
     if isinstance(iat, (int, float)) and time.time() < iat - 3600:
         return None
 
-    if payload.get("hwid") != (hwid if hwid is not None else compute_hwid()):
+    # An explicit hwid (activate() checking the token it just received) must
+    # match exactly. Otherwise any id this machine can claim will do — see
+    # _machine_ids for why there is more than one.
+    expected = [hwid] if hwid is not None else _hwid_candidates()
+    if payload.get("hwid") not in expected:
         return None
     return payload
 
