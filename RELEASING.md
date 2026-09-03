@@ -98,6 +98,19 @@ exercises an API that changed will fail CI. When deleting a test file, leave
 an empty stub with a comment for one release, or delete it by hand on the
 other side.
 
+## The bundle selftest and a fresh venv
+
+CI builds from a **fresh** `pip install -r requirements.txt`, so it resolves
+newer libraries than a local venv that has been sitting for weeks. The first
+run from a new account (2026-09-03) failed the frozen-bundle selftest on every
+runner because eth-keyfile 0.10 pulled in py_ecc, which reads its own package
+metadata at import time and the spec did not carry it. The spec now copies
+metadata recursively from the two signing roots, but the lesson generalises:
+**before cutting a release, run `npm run py:bundle` locally on a venv that
+matches what CI will resolve** (`pip install --dry-run --ignore-installed
+--report r.json -r requirements.txt` shows the versions without touching the
+venv). A selftest failure in CI costs a full macOS run to discover.
+
 ## Two macOS traps (both hit on the first run — don't reintroduce them)
 
 **1. Never set `identity: null` in `build.mac`.** It disables code signing

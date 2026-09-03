@@ -91,15 +91,34 @@ if sys.platform == 'darwin':
               'Run `brew install libomp` before bundling.')
 
 # ── Polymarket signing: eth_account + its full transitive graph ───────────
-# eth_account/eth_utils read their own version via importlib.metadata at import
-# time, so the .dist-info MUST ride along (copy_metadata) or the import raises
+# The ethereum libraries read their own version via importlib.metadata at
+# import time (`__version__ = version("py_ecc")` and friends), so every
+# .dist-info in the chain MUST ride along or the import raises
 # PackageNotFoundError — which surfaces as the generic "eth-account is
-# required" error. Collect the whole dependency chain's submodules too; several
-# are pulled in by string/dynamic import that PyInstaller can't follow.
+# required" error. Copy metadata RECURSIVELY from the two roots rather than
+# naming packages: the chain changes under us. 2026-09-03: a fresh CI venv
+# resolved eth-keyfile 0.10, which newly imports py_ecc, whose __init__ reads
+# its own metadata — three named copy_metadata lines shipped a bundle that
+# failed the selftest on every runner ("No package metadata was found for
+# py_ecc") while the older local venv passed. Collect the whole dependency
+# chain's submodules too; several are pulled in by string/dynamic import that
+# PyInstaller can't follow.
 datas += collect_data_files('eth_account')
-datas += copy_metadata('eth_account')
-datas += copy_metadata('eth_utils')
-datas += copy_metadata('eth_keys')
+datas += copy_metadata('eth_account', recursive=True)
+datas += copy_metadata('py_clob_client_v2', recursive=True)
+
+
+def _collect_if_installed(name):
+    """collect_submodules for a package that may or may not be in the venv
+    (transitive deps that appear/disappear between library versions)."""
+    import importlib.util
+    return collect_submodules(name) if importlib.util.find_spec(name) else []
+
+
+hiddenimports += _collect_if_installed('py_ecc')
+hiddenimports += _collect_if_installed('eth_keyfile')
+hiddenimports += _collect_if_installed('eth_typing')
+hiddenimports += _collect_if_installed('ckzg')
 hiddenimports += collect_submodules('cryptography')
 hiddenimports += collect_submodules('httpx')
 hiddenimports += collect_submodules('eth_account')

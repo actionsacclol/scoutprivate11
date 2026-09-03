@@ -1,7 +1,7 @@
 {
   "name": "krypt-scout",
   "productName": "Krypt Scout",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "description": "A free moneyline scouting terminal — model fair lines, market edges, value board, CLV tracking. Part of the Krypt free tools suite.",
   "main": "dist-electron/main.js",
   "author": {

@@ -80,6 +80,17 @@
   only come from line shopping beating the vig-free market — never from the
   model. No auto-parlay generator ships; the numbers say it would be a loss
   generator with a rubber stamp.
+- **Frozen backend collects the whole ethereum metadata chain** (FIX): the
+  first CI run on a fresh venv failed the bundle selftest on every runner with
+  "No package metadata was found for py_ecc". A fresh `pip install` resolves
+  eth-keyfile 0.10, which newly imports py_ecc, whose `__init__` reads its own
+  version through importlib.metadata; the spec copied metadata for three named
+  packages only. It now copies metadata recursively from `eth_account` and
+  `py_clob_client_v2` and collects py_ecc / eth_keyfile / eth_typing / ckzg
+  submodules when present, so the chain can change under us again without
+  the bundle noticing. Verified with the local venv upgraded to exactly what CI
+  resolved (eth-account 0.14, eth-keys 0.8, eth-keyfile 0.10, py-ecc 8):
+  selftest green, 656 tests green.
 - **Build survives copy-paste deploys** (CHANGE): both tsconfigs typecheck
   from the real entry points (`src/main.tsx`, `electron/main.ts`,
   `electron/preload.ts`, `vite.config.ts`) instead of whole directories. The
