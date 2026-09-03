@@ -82,9 +82,10 @@ def test_record_settle_performance_roundtrip():
     start = NOW - timedelta(days=1)
     g1 = _game("nba-1001", start, home="Boston Celtics", away="Miami Heat")
     g2 = _game("nba-1002", start, home="Denver Nuggets", away="Utah Jazz")
+    before = start - timedelta(hours=1)  # predictions must be pre-game to be stored
     cards = [
-        GameCard(game=g1, prediction=_prediction(g1, 0.7)),
-        GameCard(game=g2, prediction=_prediction(g2, 0.4)),
+        GameCard(game=g1, prediction=_prediction(g1, 0.7, generated_at=before)),
+        GameCard(game=g2, prediction=_prediction(g2, 0.4, generated_at=before)),
     ]
     counts = tracker.record_cards(cards)
     assert counts == {"games": 2, "predictions": 2, "snapshots": 0, "picks": 2}
@@ -187,6 +188,42 @@ def test_settle_fetch_error_keeps_games_pending():
     assert summary == {"settled": 0, "abandoned": 0, "pending": 1, "picks_graded": 0, "user_bets_graded": 0, "parlays_graded": 0}
 
 
+# ---------------------------------------------------------------- pre-game
+
+
+def test_post_kickoff_prediction_is_refused():
+    """61% of the live predictions table had been written after kickoff
+    (2026-08-17) and scoring it reversed the market-vs-model verdict. The
+    store now refuses the write instead of stamping a row it can't score."""
+    g = _game("nba-4002", NOW - timedelta(minutes=30))
+    counts = tracker.record_cards([GameCard(game=g, prediction=_prediction(g, 0.7))])
+    assert counts["predictions"] == 0
+    conn = db.connect()
+    assert conn.execute("SELECT COUNT(*) FROM predictions").fetchone()[0] == 0
+    conn.close()
+
+
+def test_performance_scores_only_pre_game_predictions():
+    """Legacy post-kickoff rows still exist in old stores; performance() must
+    score each game on its last PRE-GAME prediction, never the one that knew
+    the score."""
+    g = _game("nba-4003", NOW - timedelta(hours=3))
+    conn = db.connect()
+    with conn:
+        db.upsert_game(
+            conn, g.id, g.sport.value, g.league, g.start_time, g.home, g.away,
+            100, 90, True,
+        )
+        conn.execute("UPDATE games SET settled_at = ? WHERE game_id = ?", (db.iso(NOW), g.id))
+        # A post-kickoff row that "knew" the result, and an honest pre-game one.
+        db.upsert_prediction(conn, g.id, "nba", "nba-elo-v1", NOW - timedelta(hours=1), 0.99, 0.01)
+        db.upsert_prediction(conn, g.id, "nba", "nba-elo-v1", NOW - timedelta(hours=5), 0.40, 0.60)
+    conn.close()
+    [row] = tracker.performance()["overall"]
+    assert row["n"] == 1
+    assert row["accuracy"] == 0.0  # the 0.40 pre-game call lost; 0.99 is ignored
+
+
 # --------------------------------------------------------------------- dedupe
 
 
@@ -232,7 +269,7 @@ def test_clv_open_vs_pregame_close():
         [
             GameCard(
                 game=g,
-                prediction=_prediction(g, 0.65),  # pick: home
+                prediction=_prediction(g, 0.65, generated_at=t_close),  # pick: home
                 odds=[snap(t_open, -110, -110), snap(t_close, -150, 130),
                       snap(t_live, -400, 320)],
             )

@@ -25,5 +25,13 @@
       "@shared/*": ["shared/*"]
     }
   },
-  "include": ["src", "shared"]
+  // Entry-based, not directory-based, ON PURPOSE. The repo is deployed by
+  // copy-pasting the working tree over another checkout (several GitHub
+  // accounts), and a copy never deletes anything: a module removed here
+  // survives there as a stale file. With `include: ["src"]` that stale file
+  // is typechecked and breaks the release build the moment it references a
+  // type that no longer exists. Walking the import graph from the real
+  // entry instead means a file nobody imports is a file nobody checks —
+  // exactly what Vite bundles. Add new global .d.ts files to this list.
+  "files": ["src/main.tsx", "src/global.d.ts"]
 }

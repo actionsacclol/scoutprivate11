@@ -70,7 +70,7 @@ function newId(): string {
  *  embed's markdown does. */
 function previewParts(p: Pick): { tag: string; rest: string } {
   const tag = SPORT_TAG[p.sport] ?? p.sport.toUpperCase().slice(0, 4)
-  const chance = `${Math.round(p.modelProb * 100)}% to win`
+  const chance = `${Math.round(p.prob * 100)}% to win`
   const rest =
     p.kind === 'value'
       ? ` ML ${fmtAmerican(p.price as number)} @ ${bookAbbrev(p.book as string)} · EV +${((p.ev ?? 0) * 100).toFixed(1)}% · ${chance}`

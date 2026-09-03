@@ -45,6 +45,9 @@ import {
 import { Badge, Empty, Eyebrow, StripBtn } from './common'
 import { cls } from '../utils/format'
 import { useUiMode } from '../uiMode'
+import { CREDIT_VALUE, evaluateParlayPromo, parseAmerican, type ParlayPromo } from '../boost'
+import { fairLine } from '../oddsmath'
+import { decimalFromAmerican } from '../parlay'
 
 type SportFilter = Sport | 'all'
 type Scope = 'today' | 'all'
@@ -98,20 +101,24 @@ function multiplier(decimal: number): string {
 
 /** Plain-text slip summary for the clipboard. */
 function slipText(legs: Leg[], math: ParlayMath): string {
+  const fair = math.marketFairAmerican ?? math.fairAmerican
   const head = math.priced
-    ? `${fmtAmerican(math.offeredAmerican as number)} (fair ${fmtAmerican(math.fairAmerican)})`
-    : `MODEL-ONLY (fair ${fmtAmerican(math.fairAmerican)})`
+    ? `${fmtAmerican(math.offeredAmerican as number)} (market fair ${fmtAmerican(fair)})`
+    : `UNPRICED (market fair ${fmtAmerican(fair)})`
   const lines = [
     `KRYPT SCOUT PARLAY · ${legs.length} LEGS · ${head}`,
     ...legs.map((l, i) => {
       const price = l.bestPrice
         ? `${fmtAmerican(l.bestPrice.american)} @ ${bookAbbrev(l.bestPrice.book)}`
-        : `no line (fair ${fmtAmerican(l.fairAmerican)})`
-      return `${i + 1}. ${l.team} ML ${price} · model ${fmtPct(l.modelProb)}%`
+        : `no line (model fair ${fmtAmerican(l.fairAmerican)})`
+      const chance = l.marketProb !== null ? `market ${fmtPct(l.marketProb)}%` : `model ${fmtPct(l.modelProb)}%`
+      return `${i + 1}. ${l.team} ML ${price} · ${chance}`
     }),
-    math.priced && math.evPerDollar !== null
-      ? `Model odds ${fmtPct(math.combinedModelProb)}% · EV ${math.evPerDollar >= 0 ? '+' : ''}${fmtPct(math.evPerDollar)}% per $1`
-      : `Model odds ${fmtPct(math.combinedModelProb)}% · no combined book price yet`,
+    math.combinedMarketProb !== null
+      ? `Market odds ${fmtPct(math.combinedMarketProb)}% · model says ${fmtPct(math.combinedModelProb)}%${
+          math.marketDrag !== null ? ` · paying ${fmtPct(math.marketDrag)}% under fair` : ''
+        }`
+      : `Model odds ${fmtPct(math.combinedModelProb)}% · no full-market quote for every leg`,
     'krypt.cc/tools/scout',
   ]
   return lines.join('\n')
@@ -414,9 +421,19 @@ export function provenSlipProb(
 
 function Verdict({ math, simple, proven }: { math: ParlayMath; simple: boolean; proven: ProvenSlip | null }) {
   const priced = math.priced && math.offeredAmerican !== null
-  const ev = math.evPerDollar
-  const positive = priced && ev !== null && ev > 0
-  const dragPct = math.vigDrag !== null ? fmtPct(math.vigDrag) : null
+  // MARKET-ANCHORED VERDICT. The headline win chance and fair price come from
+  // the vig-free market, not the model: the model has measured zero
+  // information beyond the closing line, and a backtest of auto-generated
+  // slips (2026-09-02) showed model-fair verdicts calling 87–100% of them
+  // +EV while they lost 30–50% of stake. The model number stays as context.
+  const marketed = math.combinedMarketProb !== null && math.marketFairDecimal !== null
+  const chance = marketed ? (math.combinedMarketProb as number) : math.combinedModelProb
+  const fairDec = marketed ? (math.marketFairDecimal as number) : math.fairDecimal
+  const fairAm = marketed ? (math.marketFairAmerican as number) : math.fairAmerican
+  const drag = marketed ? math.marketDrag : math.vigDrag
+  // Only line shopping can beat the vig-free market price; the model never gets to claim it.
+  const positive = priced && drag !== null && drag < -0.0005
+  const dragPct = drag !== null ? fmtPct(Math.abs(drag)) : null
 
   return (
     <div className="mt-3 border-t border-white/10 pt-3">
@@ -438,25 +455,38 @@ function Verdict({ math, simple, proven }: { math: ParlayMath; simple: boolean; 
           }
         />
         <VerdictStat
-          label={simple ? 'WIN CHANCE' : 'MODEL ODDS'}
-          value={`${fmtPct(math.combinedModelProb)}%`}
+          label={simple ? 'WIN CHANCE' : marketed ? 'MARKET ODDS' : 'MODEL ODDS'}
+          value={`${fmtPct(chance)}%`}
           tone="success"
           help={
-            simple
-              ? 'The chance every leg wins, by our model'
-              : 'Product of leg model probabilities (legs assumed independent — same-game legs are blocked)'
+            marketed
+              ? 'The chance every leg wins according to the vig-free market — the number that has tracked reality. The model’s own figure is shown below it.'
+              : 'Product of leg model probabilities — no full-market quote is available for every leg, so this is the model’s claim, not the market’s'
           }
         />
         <VerdictStat
           label={simple ? 'FAIR' : 'FAIR PRICE'}
-          value={simple ? multiplier(math.fairDecimal) : fmtAmerican(math.fairAmerican)}
+          value={simple ? multiplier(fairDec) : fmtAmerican(fairAm)}
           help={
-            simple
-              ? 'The multiplier this slip should pay if the price matched our win chance exactly'
+            marketed
+              ? 'The price this slip would pay at the vig-free market probability. Anything below it is the books’ compounded vig.'
               : 'Break-even price for the model probability: EV = 0'
           }
         />
       </div>
+
+      {/* The model's own claim, demoted to context. */}
+      {marketed && (
+        <div
+          className="mt-1.5 flex items-baseline justify-between px-0.5 font-mono text-[9px] uppercase tracking-wider text-krypt-muted/70"
+          title="Product of leg model probabilities. Shown for context only: every model here has measured zero information beyond the market, so it never sets the verdict."
+        >
+          <span>Model says</span>
+          <span>
+            {fmtPct(math.combinedModelProb)}% · fair {fmtAmerican(math.fairAmerican)}
+          </span>
+        </div>
+      )}
 
       {/* Track record: what slips like this have ACTUALLY hit, from the
           walk-forward calibration record — the receipts behind WIN CHANCE. */}
@@ -483,16 +513,14 @@ function Verdict({ math, simple, proven }: { math: ParlayMath; simple: boolean; 
                 The books pay{' '}
                 <span className="font-mono font-bold">{multiplier(math.offeredDecimal as number)}</span>{' '}
                 your stake — more than the{' '}
-                <span className="font-mono font-bold">{multiplier(math.fairDecimal)}</span> our win
-                chances say is fair. That's rare for a parlay.
+                <span className="font-mono font-bold">{multiplier(fairDec)}</span> the vig-free
+                market says is fair. That only happens through line shopping, and it is rare.
               </>
             ) : (
               <>
-                <span className="font-mono font-bold">+EV +{fmtPct(ev as number)}%</span> — rare for
-                a parlay, nice.
-                <span className="mt-1 block font-mono text-[10px] text-emerald-300/80">
-                  1/4 KELLY: {fmtPct(math.quarterKelly as number, 2)}% BANKROLL
-                </span>
+                Beats the vig-free market by{' '}
+                <span className="font-mono font-bold">{dragPct}%</span> — line shopping did that, not
+                the model. Rare; it will not last.
               </>
             )}
           </div>
@@ -502,17 +530,19 @@ function Verdict({ math, simple, proven }: { math: ParlayMath; simple: boolean; 
               <>
                 The books pay{' '}
                 <span className="font-mono font-bold">{multiplier(math.offeredDecimal as number)}</span>{' '}
-                your stake. Based on our win chances, a fair slip would pay{' '}
-                <span className="font-mono font-bold">{multiplier(math.fairDecimal)}</span>. You're
-                overpaying by <span className="font-mono font-bold">{dragPct}%</span>.
+                your stake. At the {marketed ? 'vig-free market' : 'model'} win chance a fair slip would pay{' '}
+                <span className="font-mono font-bold">{multiplier(fairDec)}</span>. You're
+                overpaying by <span className="font-mono font-bold">{dragPct}%</span>
+                {math.legCount >= 2 ? ' — that is every leg’s vig, compounded.' : '.'}
               </>
             ) : (
               <>
                 This parlay pays{' '}
                 <span className="font-mono font-bold">{fmtAmerican(math.offeredAmerican as number)}</span>{' '}
-                but is worth{' '}
-                <span className="font-mono font-bold">{fmtAmerican(math.fairAmerican)}</span> —
-                you're giving the book <span className="font-mono font-bold">{dragPct}%</span>.
+                against a {marketed ? 'vig-free market' : 'model'} fair price of{' '}
+                <span className="font-mono font-bold">{fmtAmerican(fairAm)}</span> —
+                you're giving the books <span className="font-mono font-bold">{dragPct}%</span>. Random
+                2–4 leg slips built from this app's own picks lost 31–46% of stake in backtest; the same legs as singles lost 13%.
               </>
             )}
           </div>
@@ -528,11 +558,250 @@ function Verdict({ math, simple, proven }: { math: ParlayMath; simple: boolean; 
       {!simple && priced && math.impliedProbOffered !== null && (
         <div
           className="mt-1.5 font-mono text-[9px] uppercase tracking-wider text-krypt-muted/60"
-          title="The win probability the combined price implies — what the book is charging you to believe"
+          title="The win probability the combined price implies (what the book charges you to believe), the vig-free market's number, and the model's"
         >
-          Price implies {fmtPct(math.impliedProbOffered)}% · model says{' '}
+          Price implies {fmtPct(math.impliedProbOffered)}%
+          {math.combinedMarketProb !== null ? ` · market ${fmtPct(math.combinedMarketProb)}%` : ''} · model{' '}
           {fmtPct(math.combinedModelProb)}%
         </div>
+      )}
+    </div>
+  )
+}
+
+// ------------------------------------------------------------- promo panel
+
+const PROMOS: Array<{ key: ParlayPromo; label: string; help: string }> = [
+  { key: 'none', label: 'NO PROMO', help: 'The plain slip: every leg’s vig compounded' },
+  { key: 'profit', label: 'PROFIT BOOST', help: 'A % token that multiplies the winnings of this slip' },
+  { key: 'nosweat', label: 'NO-SWEAT', help: 'A loss is refunded in site credit, up to a cap' },
+  { key: 'insurance', label: 'INSURANCE', help: 'Refunded in site credit only when exactly one leg loses' },
+  { key: 'bonusbet', label: 'BONUS BET', help: 'The stake itself is site credit that is not returned on a win' },
+]
+
+const PROMO_INPUT =
+  'w-20 rounded-md border border-white/10 bg-black/30 px-2 py-1 font-mono text-[11px] text-white outline-none transition focus:border-white/25 placeholder:text-krypt-muted/40'
+
+/** Price the slip under a book promo against the market-fair leg
+ *  probabilities. Plain parlays lose 13–46% in backtest; promos are the only
+ *  parlay arithmetic that comes out positive, so this is the panel that can
+ *  say PLAY — and it never consults the model. */
+function PromoPanel({ legs, math, stake }: { legs: Leg[]; math: ParlayMath; stake: number }) {
+  const [promo, setPromo] = useState<ParlayPromo>('none')
+  const [boostPct, setBoostPct] = useState('33')
+  const [boostCap, setBoostCap] = useState('')
+  const [refundCap, setRefundCap] = useState('25')
+  const [credit, setCredit] = useState(String(Math.round(CREDIT_VALUE * 100)))
+  const [stakeText, setStakeText] = useState(String(stake))
+  if (!math.priced || math.offeredDecimal === null) return null
+  const modelLegs = legs.filter((l) => l.marketProb === null).length
+  const legProbs = legs.map((l) => l.marketProb ?? l.modelProb)
+  const evaluation = evaluateParlayPromo({
+    legProbs,
+    offeredDecimal: math.offeredDecimal,
+    promo,
+    boostPct: Number(boostPct),
+    boostCap: Number(boostCap) || null,
+    refundCap: Number(refundCap) || null,
+    creditValue: (Number(credit) || CREDIT_VALUE * 100) / 100,
+    stake: Number(stakeText) || null,
+  })
+  const tone =
+    evaluation?.verdict === 'PLAY'
+      ? 'border-emerald-400/30 bg-emerald-500/[0.08] text-emerald-200'
+      : evaluation?.verdict === 'MARGINAL'
+        ? 'border-amber-400/30 bg-amber-500/[0.08] text-amber-200'
+        : 'border-rose-400/25 bg-rose-500/[0.06] text-rose-200'
+  return (
+    <div className="mt-3 rounded-xl border border-white/10 bg-black/20 p-2.5">
+      <div className="flex items-baseline justify-between gap-2">
+        <span className="text-[9px] font-bold uppercase tracking-[0.2em] text-krypt-muted">Book promo on this slip</span>
+        {modelLegs > 0 && (
+          <span className="text-[9px] uppercase tracking-wider text-amber-300/80" title="No full-market quote for these legs, so their model probability stands in — treat the result as provisional.">
+            {modelLegs} leg{modelLegs === 1 ? '' : 's'} on model prob
+          </span>
+        )}
+      </div>
+      <div className="mt-1.5 flex flex-wrap gap-1.5">
+        {PROMOS.map((p) => (
+          <StripBtn key={p.key} active={promo === p.key} onClick={() => setPromo(p.key)} title={p.help}>
+            {p.label}
+          </StripBtn>
+        ))}
+      </div>
+      <div className="mt-2 flex flex-wrap items-end gap-2 font-mono text-[10px] text-krypt-muted">
+        {promo === 'profit' && (
+          <>
+            <label>
+              <span className="block text-[8px] uppercase tracking-widest">Boost %</span>
+              <input className={PROMO_INPUT} value={boostPct} onChange={(e) => setBoostPct(e.target.value)} inputMode="numeric" />
+            </label>
+            <label>
+              <span className="block text-[8px] uppercase tracking-widest">Boost cap</span>
+              <input className={PROMO_INPUT} value={boostCap} onChange={(e) => setBoostCap(e.target.value)} placeholder="none" inputMode="decimal" />
+            </label>
+          </>
+        )}
+        {(promo === 'nosweat' || promo === 'insurance') && (
+          <>
+            <label>
+              <span className="block text-[8px] uppercase tracking-widest">Refund cap</span>
+              <input className={PROMO_INPUT} value={refundCap} onChange={(e) => setRefundCap(e.target.value)} inputMode="decimal" />
+            </label>
+            <label title="What $1 of site credit is worth to you. Bonus bets return no stake; 60–80% of face is the practitioner range.">
+              <span className="block text-[8px] uppercase tracking-widest">Credit %</span>
+              <input className={PROMO_INPUT} value={credit} onChange={(e) => setCredit(e.target.value)} inputMode="numeric" />
+            </label>
+          </>
+        )}
+        {promo !== 'none' && (
+          <label>
+            <span className="block text-[8px] uppercase tracking-widest">{promo === 'bonusbet' ? 'Credit face' : 'Stake'}</span>
+            <input className={PROMO_INPUT} value={stakeText} onChange={(e) => setStakeText(e.target.value)} inputMode="decimal" />
+          </label>
+        )}
+      </div>
+      {evaluation && (
+        <div className={cls('mt-2 rounded-lg border px-2.5 py-1.5', tone)}>
+          <div className="flex items-center justify-between gap-2">
+            <span className="text-[10px] font-bold uppercase tracking-[0.2em]">{promo === 'none' ? 'PLAIN' : evaluation.verdict}</span>
+            <span className="font-mono text-sm font-bold">
+              {evaluation.evPerDollar >= 0 ? '+' : ''}
+              {fmtPct(evaluation.evPerDollar)}% {promo === 'bonusbet' ? 'of face' : 'per $1'}
+            </span>
+          </div>
+          <div className="mt-0.5 font-mono text-[10px] opacity-80">
+            {promo === 'none'
+              ? `Hit ${fmtPct(evaluation.combinedProb)}% · that is the books’ compounded hold and nothing else`
+              : `Plain ${evaluation.plainEvPerDollar >= 0 ? '+' : ''}${fmtPct(evaluation.plainEvPerDollar)}% → with promo ${evaluation.evPerDollar >= 0 ? '+' : ''}${fmtPct(evaluation.evPerDollar)}%`}
+            {evaluation.breakEvenBoostPct !== null && ` · break-even boost ${evaluation.breakEvenBoostPct.toFixed(0)}%`}
+            {evaluation.refundProb !== null && ` · refund fires ${fmtPct(evaluation.refundProb)}% of the time`}
+            {evaluation.evAtStake !== null && promo !== 'none' && ` · EV ${evaluation.evAtStake >= 0 ? '+' : ''}${evaluation.evAtStake.toFixed(2)} on ${stakeText}`}
+          </div>
+          {promo === 'nosweat' && (
+            <div className="mt-0.5 text-[10px] opacity-70">Long legs make this worth more: the refund fires on a loss, so maximise the chance of losing subject to the minimum-odds terms.</div>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ------------------------------------------------------------ SGP pricer
+
+const SGP_RESULTS: Array<{ key: string; label: (c: GameCard) => string }> = [
+  { key: 'home', label: (c) => c.game.home },
+  { key: 'draw', label: () => 'DRAW' },
+  { key: 'away', label: (c) => c.game.away },
+  { key: '1X', label: (c) => `${c.game.home} or draw` },
+  { key: 'X2', label: (c) => `${c.game.away} or draw` },
+  { key: '12', label: () => 'no draw' },
+]
+const SGP_TOTALS: Array<{ key: string; label: string }> = [
+  { key: 'over1.5', label: 'O 1.5' },
+  { key: 'under1.5', label: 'U 1.5' },
+  { key: 'over2.5', label: 'O 2.5' },
+  { key: 'under2.5', label: 'U 2.5' },
+  { key: 'over3.5', label: 'O 3.5' },
+  { key: 'under3.5', label: 'U 3.5' },
+  { key: 'btts', label: 'BTTS' },
+  { key: 'no_btts', label: 'no BTTS' },
+]
+
+/** Soccer same-game pricer. Same-game legs stay out of the independent
+ *  builder because they are correlated; here the pair is priced off the
+ *  card's joint table (Dixon-Coles low-score dependence on the sharp fair
+ *  1X2 + O/U 2.5). Draw & under runs ~50% above the independent product in
+ *  the archive, so the naive fair is wrong by tens of percent — this is the
+ *  honest number to hold a book's SGP quote or SGP promo against. */
+function SgpPricer({ cards, simple }: { cards: GameCard[]; simple: boolean }) {
+  const soccer = useMemo(() => cards.filter((c) => c.game.sport === 'soccer' && c.sgp), [cards])
+  const [gameId, setGameId] = useState('')
+  const [result, setResult] = useState('home')
+  const [total, setTotal] = useState('over2.5')
+  const [offered, setOffered] = useState('')
+  const card = soccer.find((c) => c.game.id === gameId) ?? null
+  if (soccer.length === 0) return null
+  const sgp = card?.sgp ?? null
+  const joint = sgp ? sgp.joints[`${result}|${total}`] : null
+  const independent = sgp ? sgp.singles[result] * sgp.singles[total] : null
+  const price = parseAmerican(offered)
+  const ev = joint !== null && joint !== undefined && price !== null ? joint * decimalFromAmerican(price) - 1 : null
+  return (
+    <div className="mt-4 rounded-xl border border-white/10 bg-black/20 p-2.5">
+      <div className="flex items-baseline justify-between gap-2">
+        <span className="text-[9px] font-bold uppercase tracking-[0.2em] text-krypt-muted">Same-game pricer · soccer</span>
+        <span className="text-[9px] uppercase tracking-wider text-krypt-muted/60">result × total, correlation-adjusted</span>
+      </div>
+      <select
+        className="mt-1.5 w-full rounded-md border border-white/10 bg-black/30 px-2 py-1.5 font-mono text-[11px] text-white outline-none focus:border-white/25"
+        value={gameId}
+        onChange={(e) => setGameId(e.target.value)}
+      >
+        <option value="">Pick a soccer match with a 2.5 total…</option>
+        {soccer.map((c) => (
+          <option key={c.game.id} value={c.game.id}>
+            {matchLabel(c)} · {fmtKick(c.game.start_time).time}
+          </option>
+        ))}
+      </select>
+      {card && sgp && (
+        <>
+          <div className="mt-2 flex flex-wrap gap-1">
+            {SGP_RESULTS.map((r) => (
+              <StripBtn key={r.key} active={result === r.key} onClick={() => setResult(r.key)}>
+                {r.label(card)}
+              </StripBtn>
+            ))}
+          </div>
+          <div className="mt-1 flex flex-wrap gap-1">
+            {SGP_TOTALS.map((t) => (
+              <StripBtn key={t.key} active={total === t.key} onClick={() => setTotal(t.key)}>
+                {t.label}
+              </StripBtn>
+            ))}
+          </div>
+          {joint !== null && joint !== undefined && independent !== null && (
+            <div className="mt-2 rounded-lg border border-white/10 bg-white/[0.03] px-2.5 py-2 font-mono text-[10px] text-krypt-muted">
+              <div className="flex items-baseline justify-between text-white">
+                <span>Fair joint</span>
+                <span className="text-sm font-bold">
+                  {fmtPct(joint)}% · {fmtAmerican(fairLine(joint))}
+                </span>
+              </div>
+              <div className="mt-0.5">
+                Independent product {fmtPct(independent)}% ({fmtAmerican(fairLine(independent))}) —{' '}
+                {joint > independent ? 'legs help each other' : 'legs fight each other'} by{' '}
+                {Math.abs(joint / independent - 1) * 100 > 0.5 ? `${Math.round(Math.abs(joint / independent - 1) * 100)}%` : 'under 1%'}
+                {!sgp.exact && ' · approximate solve'}
+              </div>
+              <div className="mt-0.5">
+                1X2 from {bookAbbrev(sgp.source)} · O/U 2.5 from {bookAbbrev(sgp.over_book)} (over {fmtPct(sgp.fair_over)}%) · λ {sgp.lambda_home.toFixed(2)}/{sgp.lambda_away.toFixed(2)} · ρ {sgp.rho.toFixed(3)}
+              </div>
+              <div className="mt-1.5 flex items-center gap-2">
+                <label className="text-[8px] uppercase tracking-widest">Book’s SGP price</label>
+                <input
+                  className="w-20 rounded-md border border-white/10 bg-black/30 px-2 py-1 font-mono text-[11px] text-white outline-none focus:border-white/25"
+                  value={offered}
+                  onChange={(e) => setOffered(e.target.value)}
+                  placeholder="+250"
+                  inputMode="numeric"
+                />
+                {ev !== null && (
+                  <span className={cls('font-bold', ev >= 0.02 ? 'text-emerald-300' : ev >= -0.01 ? 'text-amber-300' : 'text-rose-300')}>
+                    EV {ev >= 0 ? '+' : ''}
+                    {fmtPct(ev)}% per $1
+                  </span>
+                )}
+              </div>
+              {!simple && (
+                <div className="mt-1 text-[9px] leading-snug opacity-70">
+                  Books hold 15–25% on same-game parlays and already price this dependence; a plain SGP is −EV by construction. Use the fair joint to score a boosted SGP or a no-sweat token.
+                </div>
+              )}
+            </div>
+          )}
+        </>
       )}
     </div>
   )
@@ -966,6 +1235,7 @@ export default function ParlayPage({ boards, demo }: Props) {
                           simple={simple}
                           proven={provenSlipProb(legs, calReports)}
                         />
+                        <PromoPanel legs={legs} math={math} stake={stake} />
 
                         {/* Track the slip — lands on TRACKER with your bets. */}
                         <button
@@ -1018,6 +1288,7 @@ export default function ParlayPage({ boards, demo }: Props) {
                 </>
               )}
             </div>
+            <SgpPricer cards={eligible} simple={simple} />
           </div>
         </aside>
       </div>

@@ -16,5 +16,8 @@
       "@shared/*": ["shared/*"]
     }
   },
-  "include": ["electron", "shared", "vite.config.ts"]
+  // Entry-based for the same reason as tsconfig.json: a stale file left
+  // behind by a copy-paste deploy must not be able to break the build.
+  // These are the exact entries vite-plugin-electron bundles from.
+  "files": ["electron/main.ts", "electron/preload.ts", "vite.config.ts"]
 }

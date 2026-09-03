@@ -245,7 +245,10 @@ export default function AboutPage() {
         <p className="mt-2 text-center text-[11px] text-krypt-muted/60">
           Historical order-book data: the{' '}
           <span className="font-mono text-white/60">pmxt</span> public Polymarket archive
-          (CC BY 4.0) — powers the backtest&apos;s real-fill BOOK column.
+          (CC BY 4.0) — powers the backtest&apos;s real-fill BOOK column. Hockey expected
+          goals: <span className="font-mono text-white/60">MoneyPuck.com</span> — the NHL engine
+          reads its team game file when you drop it in (free for non-commercial use, credit
+          required; never fetched or shipped by the app).
         </p>
         <p className="mt-2 text-center text-[11px] text-krypt-muted/60">
           Part of the <span className="text-krypt-gradient font-semibold">Krypt</span> suite of free

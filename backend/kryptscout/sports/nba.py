@@ -55,19 +55,35 @@ SCOREBOARD_URL = (
     "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard"
 )
 HISTORY_START = date(2024, 10, 1)  # 2024-25 season (preseason filtered out)
-HISTORY_END = date(2026, 6, 30)  # end of the 2025-26 Finals window
+# No history END: the replay always runs through yesterday, like WNBA. A
+# hard cap at the 2025-26 Finals (2026-06-30) froze the engine there — no
+# refresh ever rewrote the state, the Engine Room showed it stale all
+# summer, and the 2026-27 season would never have been ingested.
 SEASON_BOUNDARY_MONTH = 8  # Aug 1 splits NBA seasons (off-season midpoint)
 CURRENT_SEASON_START = date(2025, 8, 1)  # 2025-26 portion, for backtest metrics
 ROLLING_WINDOW = 15  # games in the rolling points-for/against averages
 LEAGUE_AVG_POINTS = 113.0  # fallback before a team has any scoring history
 CHECKPOINT_EVERY_DAYS = 30  # persist state periodically during long backfills
-STATE_VERSION = 3  # v3 adds team names to backtest rows (dollar-ROI join)
+# v3 added team names to backtest rows (dollar-ROI join). v4 (2026-09-02):
+# the Elo retune (K 20→12, home 100→60, carry 0.75→0.5) changes how every
+# rating is accumulated, so a state replayed under the old constants must be
+# discarded and rebuilt from the cached scoreboards.
+STATE_VERSION = 4
 
+# Retuned 2026-09-02 on the engine's own archive (walk-forward, held out
+# from 2026-01): K 20 → 12, home advantage 100 → 60, season carry 0.75 → 0.5
+# took log loss from 0.5961 to 0.5824, −0.0137 [−0.0235, −0.0035]. The old
+# 100-point home edge and fast K were the source of the calibration audit's
+# finding that NBA favourites were overstated by 8 points. Replayed after
+# the retune: slope 1.07 over the whole log and 1.17 on 2026-01+ (favourites
+# now ~2 pts UNDER-stated), so no logit scale is applied here — the retune
+# alone fixed the calibration. Two seasons of data behind it; retune again
+# when a third exists.
 ELO_CONFIG = EloConfig(
-    k=20.0,
-    home_advantage=100.0,
+    k=12.0,
+    home_advantage=60.0,
     mov_scaling=True,
-    season_carry=0.75,
+    season_carry=0.5,
 )
 
 MODEL_NAME_V1 = "nba-elo-v1"
@@ -199,6 +215,10 @@ class NbaEngine(SportEngine):
                 - self.elo.get(game.away)
             )
             nudge = 0.5 * (elo_diff / 100.0)
+            # A team with no scoring history would price at the league-average
+            # placeholder — a constant, not a forecast. The board printed UNDER
+            # edges against exactly that (WNBA, 2026-09-02). Emit no total.
+            scored = bool(self.points_for.get(game.home)) and bool(self.points_for.get(game.away))
             predictions.append(
                 Prediction(
                     game_id=game.id,
@@ -207,9 +227,9 @@ class NbaEngine(SportEngine):
                     generated_at=now,
                     home_win_prob=home_prob,
                     away_win_prob=1.0 - home_prob,
-                    predicted_home_score=round(home_score + nudge, 1),
-                    predicted_away_score=round(away_score - nudge, 1),
-                    predicted_total=round(total, 1),
+                    predicted_home_score=round(home_score + nudge, 1) if scored else None,
+                    predicted_away_score=round(away_score - nudge, 1) if scored else None,
+                    predicted_total=round(total, 1) if scored else None,
                     confidence=abs(home_prob - 0.5) * 2.0,
                 )
             )
@@ -226,7 +246,7 @@ class NbaEngine(SportEngine):
             if self.last_processed
             else HISTORY_START
         )
-        end = min(HISTORY_END, datetime.now(timezone.utc).date() - timedelta(days=1))
+        end = datetime.now(timezone.utc).date() - timedelta(days=1)
         if start <= end:
             self.raw_dir.mkdir(parents=True, exist_ok=True)
             since_checkpoint = 0

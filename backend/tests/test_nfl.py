@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 import math
 import os
 import pickle
@@ -13,6 +14,7 @@ import pandas as pd
 import pytest
 
 from kryptscout.core.elo import EloBook
+from kryptscout.core.calibrate import temper
 from kryptscout.core.schemas import Game, Sport
 from kryptscout.datasources.weather import GameWeather
 from kryptscout.sports import nfl
@@ -87,6 +89,11 @@ def _game(
         away=away,
         neutral_site=neutral,
     )
+
+
+def _pt(diff: float) -> float:
+    """The served probability: Elo expectation through the calibration temperature."""
+    return temper(_p(diff), nfl.CALIBRATION_TEMPERATURE)
 
 
 def _p(diff: float) -> float:
@@ -615,10 +622,8 @@ def test_predict_probabilities_and_scores(tmp_path, no_weather):
 def test_predict_unknown_team_falls_back_to_league_average(tmp_path, no_weather):
     engine = _engine(tmp_path)
     [pred] = asyncio.run(engine.predict([_game(gid="nfl-test-2")]))
-    assert pred.home_win_prob == pytest.approx(
-        1.0 / (1.0 + 10.0 ** (-ELO_CONFIG.home_advantage / 400.0))
-    )
-    assert pred.predicted_total == pytest.approx(2 * nfl.LEAGUE_AVG_POINTS)
+    assert pred.home_win_prob == pytest.approx(_pt(ELO_CONFIG.home_advantage))
+    assert pred.predicted_total is None  # no scoring history: no placeholder total (2026-09-02)
 
 
 def test_predict_applies_qb_and_rest_adjustments(tmp_path, no_weather):
@@ -633,7 +638,7 @@ def test_predict_applies_qb_and_rest_adjustments(tmp_path, no_weather):
         }
     }
     [pred] = asyncio.run(engine.predict([_game(when=when)]))
-    expected = _p(
+    expected = _pt(
         ELO_CONFIG.home_advantage + nfl.QB_K * 5 + nfl.REST_ELO_PER_DAY * 7
     )
     assert pred.home_win_prob == pytest.approx(expected)
@@ -649,7 +654,7 @@ def test_predict_missing_pickle_falls_back_to_elo(tmp_path, no_weather):
         "2026-09-13|Kansas City Chiefs|Denver Broncos": {"home_rest": 7, "away_rest": 7}
     }
     [pred] = asyncio.run(engine.predict([_game(when=when)]))
-    assert pred.home_win_prob == pytest.approx(_p(100 + ELO_CONFIG.home_advantage))
+    assert pred.home_win_prob == pytest.approx(_pt(100 + ELO_CONFIG.home_advantage))
 
 
 def test_predict_uses_model_and_blend_for_scheduled_games(tmp_path, no_weather, monkeypatch):
@@ -679,7 +684,7 @@ def test_predict_uses_model_and_blend_for_scheduled_games(tmp_path, no_weather, 
         expected = nfl.BLEND_ELO_WEIGHT * p_elo + (1 - nfl.BLEND_ELO_WEIGHT) * 0.8
     else:
         expected = 0.8
-    assert pred.home_win_prob == pytest.approx(expected)
+    assert pred.home_win_prob == pytest.approx(temper(expected, nfl.CALIBRATION_TEMPERATURE))
     # And the feature row handed to the model matches the training recipe.
     [row] = seen["rows"]
     assert row["elo_diff"] == pytest.approx(100 + ELO_CONFIG.home_advantage)
@@ -692,7 +697,7 @@ def test_predict_neutral_site_zeroes_home_advantage(tmp_path, no_weather):
     [neutral_pred] = asyncio.run(engine.predict([_game(neutral=True)]))
     assert neutral_pred.home_win_prob == pytest.approx(0.5)
     [home_pred] = asyncio.run(engine.predict([_game()]))
-    assert home_pred.home_win_prob == pytest.approx(_p(ELO_CONFIG.home_advantage))
+    assert home_pred.home_win_prob == pytest.approx(_pt(ELO_CONFIG.home_advantage))
 
 
 def test_predict_schedule_entry_can_flag_neutral(tmp_path, no_weather):
@@ -744,7 +749,7 @@ def test_preseason_never_reaches_the_model(tmp_path, no_weather, monkeypatch):
 def test_preseason_damping_skipped_on_schedule_or_out_of_window(tmp_path, no_weather):
     engine = _engine(tmp_path)
     engine.book.ratings = {"Kansas City Chiefs": 1700.0, "Denver Broncos": 1400.0}
-    p_raw = _p(300 + ELO_CONFIG.home_advantage)
+    p_raw = _pt(300 + ELO_CONFIG.home_advantage)  # served: Elo through the calibration scale
 
     # An August date that games.csv knows about is NOT preseason.
     when = datetime(2026, 8, 15, 23, tzinfo=timezone.utc)
@@ -781,14 +786,17 @@ def test_predict_scales_totals_for_weather(tmp_path, monkeypatch):
 
     monkeypatch.setattr(nfl.weather, "game_weather", windy)
     engine = _engine(tmp_path)
-    [pred] = asyncio.run(engine.predict([_game()]))
+    game = _game()
+    for team in (game.home, game.away):  # scoring history at the league average
+        engine.rolling[team] = deque([(22.0, 22.0)])
+    [pred] = asyncio.run(engine.predict([game]))
     # League-average baseline is 23.25 / 20.75 (total 44); x0.95 for the wind.
     assert pred.predicted_home_score == pytest.approx(23.25 * 0.95, abs=0.06)
     assert pred.predicted_away_score == pytest.approx(20.75 * 0.95, abs=0.06)
     assert pred.predicted_total == pytest.approx(44.0 * 0.95, abs=0.06)
     # Win probability never sees weather.
     assert pred.home_win_prob == pytest.approx(
-        _p(ELO_CONFIG.home_advantage)
+        _pt(ELO_CONFIG.home_advantage)
     )
 
 
@@ -799,7 +807,7 @@ def test_predict_degrades_silently_on_weather_failure(tmp_path, monkeypatch):
     monkeypatch.setattr(nfl.weather, "game_weather", broken)
     engine = _engine(tmp_path)
     [pred] = asyncio.run(engine.predict([_game()]))
-    assert pred.predicted_total == pytest.approx(2 * nfl.LEAGUE_AVG_POINTS)
+    assert pred.predicted_total is None  # no scoring history: no placeholder total (2026-09-02)
 
 
 # -- state round-trip ---------------------------------------------------------

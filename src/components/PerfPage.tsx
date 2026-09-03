@@ -1,8 +1,8 @@
 import { useEffect, useState } from 'react'
 import { CalendarClock, Loader2 } from 'lucide-react'
-import type { ClvReport, PerfDaily, PerformanceReport } from '../types'
+import type { BenchmarkReport, BenchmarkRow, ClvReport, PerfDaily, PerformanceReport } from '../types'
 import type { RoiDaily, RoiSummary } from '../api'
-import { fetchClv, fetchPerformance } from '../api'
+import { fetchBenchmark, fetchClv, fetchPerformance } from '../api'
 import { DEMO_CLV, DEMO_PERFORMANCE } from '../demoIntel'
 import { fmtPct } from '../oddsmath'
 import { Badge, Card, Kbd, Page, Section, StatTile } from './common'
@@ -306,6 +306,7 @@ interface Props {
 export default function PerfPage({ demo, apiUp }: Props) {
   const [perf, setPerf] = useState<PerformanceReport | null>(null)
   const [clv, setClv] = useState<ClvReport | null>(null)
+  const [bench, setBench] = useState<BenchmarkReport | null>(null)
   const [loading, setLoading] = useState(false)
   const roi = useRoi(demo)
 
@@ -320,10 +321,12 @@ export default function PerfPage({ demo, apiUp }: Props) {
     setLoading(true)
     setPerf(null)
     setClv(null)
-    void Promise.all([fetchPerformance(), fetchClv()]).then(([p, c]) => {
+    setBench(null)
+    void Promise.all([fetchPerformance(), fetchClv(), fetchBenchmark()]).then(([p, c, b]) => {
       if (!alive) return
       setPerf(p)
       setClv(c)
+      setBench(b)
       setLoading(false)
     })
     return () => {
@@ -565,6 +568,146 @@ export default function PerfPage({ demo, apiUp }: Props) {
                 )}
               </Card>
             </Section>
+
+            {bench && bench.overall.n > 0 && (
+              <Section
+                title="Vs ESPN's predictor"
+                description="Log loss, lower is better. Each comparator — Scout's pre-game forecast, the last pre-game exchange quote, DraftKings' devigged close — is scored on the games it shares with ESPN, and ESPN is re-scored on exactly those games, so every cell is a like-for-like pair. A free, world-class comparator; measured 2026-09-02 Scout was level with ESPN in MLB and behind in WNBA, and nothing beat the close."
+              >
+                <Card padded={false} className="overflow-hidden">
+                  <div className="overflow-x-auto">
+                    <table className="w-full border-collapse text-left">
+                      <thead>
+                        <tr className="border-b border-white/10 bg-white/[0.02]">
+                          <th className={TH}>Sport</th>
+                          <th className={cls(TH, 'text-right')}>ESPN · all</th>
+                          <th className={cls(TH, 'text-right')}>Scout vs ESPN</th>
+                          <th className={cls(TH, 'text-right')}>Exchange vs ESPN</th>
+                          <th className={cls(TH, 'text-right')}>DK close vs ESPN</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {[...bench.by_sport, bench.overall].map((r) => {
+                          const pair = (p: BenchmarkRow['scout']) =>
+                            p ? (
+                              <td
+                                className={cls(TD, 'text-right whitespace-nowrap', p.log_loss < p.espn_log_loss ? 'text-emerald-300' : 'text-rose-300')}
+                                title={`n=${p.n} shared games · comparator ${num(p.log_loss, 4)} (acc ${Math.round(p.accuracy * 100)}%) vs ESPN ${num(p.espn_log_loss, 4)} (acc ${Math.round(p.espn_accuracy * 100)}%) · comparator better on ${Math.round(p.beats_espn * 100)}% of games`}
+                              >
+                                <span className="font-semibold">{num(p.log_loss, 4)}</span>
+                                <span className="text-krypt-muted/60"> vs {num(p.espn_log_loss, 4)}</span>
+                                <span className="text-krypt-muted/50"> · n={p.n}</span>
+                              </td>
+                            ) : (
+                              <td className={cls(TD, 'text-right text-krypt-muted/40')}>—</td>
+                            )
+                          return (
+                            <tr key={r.sport} className={cls('border-b border-white/5', r.sport === 'all' && 'bg-white/[0.02]')}>
+                              <td className={cls(TD, 'font-sans text-[10px] font-bold uppercase tracking-widest text-krypt-muted')}>{r.sport}</td>
+                              <td className={cls(TD, 'text-right text-white/80')} title={r.espn ? `n=${r.espn.n} · accuracy ${Math.round(r.espn.accuracy * 100)}%` : undefined}>
+                                {r.espn ? `${num(r.espn.log_loss, 4)} · n=${r.espn.n}` : '—'}
+                              </td>
+                              {pair(r.scout)}
+                              {pair(r.exchange)}
+                              {pair(r.close)}
+                            </tr>
+                          )
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                </Card>
+              </Section>
+            )}
+
+            {clv?.lean && (
+              <Section
+                title="Exchange lead vs the close"
+                description="The one signal that survived every test: Kalshi and Polymarket move before DraftKings. Each LEAD badge is scored at the DraftKings price it appeared at against DraftKings' own declared close — same book both ends, so the vig cancels. Measured +1.05% ± 0.30 with a 64% direction hit rate; that sits UNDER the book's vig, so ROI is expected near zero. A reference for judging soft lines, not a pick."
+              >
+                <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+                  <StatTile label="Leads scored" value={clv.lean.overall.n} sub="frozen at first sight, closed by DraftKings" />
+                  <StatTile
+                    label="Same-book CLV"
+                    value={
+                      clv.lean.overall.clv_pct != null
+                        ? `${clv.lean.overall.clv_pct >= 0 ? '+' : ''}${num(clv.lean.overall.clv_pct, 2)}%`
+                        : '—'
+                    }
+                    tone={
+                      clv.lean.overall.clv_pct == null
+                        ? 'neutral'
+                        : clv.lean.overall.clv_pct >= 0
+                          ? 'success'
+                          : 'danger'
+                    }
+                    sub={
+                      clv.lean.overall.clv_se != null
+                        ? `± ${num(clv.lean.overall.clv_se, 2)} · ${clv.lean.overall.significant ? 'significant' : 'not yet significant'}`
+                        : 'needs 30+ to mean anything'
+                    }
+                  />
+                  <StatTile
+                    label="Direction hit rate"
+                    value={clv.lean.overall.hit_rate != null ? `${Math.round(clv.lean.overall.hit_rate * 100)}%` : '—'}
+                    sub={`${clv.lean.overall.n_moved} lines moved · 64% measured, 57% naive`}
+                    help="Share of lines that moved TOWARD the lean side by the close. The favourite shortens 57% of the time on its own; the exchanges got 64%."
+                  />
+                  <StatTile
+                    label="ROI at DraftKings"
+                    value={
+                      clv.lean.overall.roi_pct != null
+                        ? `${clv.lean.overall.roi_pct >= 0 ? '+' : ''}${num(clv.lean.overall.roi_pct, 1)}%`
+                        : '—'
+                    }
+                    tone="neutral"
+                    sub="flat 1u · expected ≈ 0 (CLV < vig)"
+                  />
+                </div>
+                {clv.lean.by_reference.length > 0 && (
+                  <Card padded={false} className="mt-3 overflow-hidden">
+                    <table className="w-full border-collapse text-left">
+                      <thead>
+                        <tr className="border-b border-white/10 bg-white/[0.02]">
+                          <th className={TH}>Reference</th>
+                          <th className={cls(TH, 'text-right')}>N</th>
+                          <th className={cls(TH, 'text-right')}>CLV % (±err)</th>
+                          <th className={cls(TH, 'text-right')}>Hit rate</th>
+                          <th className={cls(TH, 'text-right')}>Beat close</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {[...clv.lean.by_reference.map((r) => ({ label: r.ref_book, row: r })), ...clv.lean.by_sport.map((r) => ({ label: r.sport, row: r }))].map(
+                          ({ label, row }) => (
+                            <tr key={label} className="border-b border-white/5">
+                              <td className={cls(TD, 'font-sans text-[10px] font-bold uppercase tracking-widest text-krypt-muted')}>{label}</td>
+                              <td className={cls(TD, 'text-right text-krypt-muted')}>{row.n}</td>
+                              <td
+                                className={cls(
+                                  TD,
+                                  'text-right font-semibold',
+                                  row.clv_pct == null ? 'text-krypt-muted/40' : row.clv_pct >= 0 ? 'text-emerald-300' : 'text-rose-400',
+                                )}
+                              >
+                                {row.clv_pct == null
+                                  ? '—'
+                                  : `${row.clv_pct >= 0 ? '+' : ''}${num(row.clv_pct, 2)}${row.clv_se != null ? ` ±${num(row.clv_se, 2)}` : ''}`}
+                              </td>
+                              <td className={cls(TD, 'text-right text-krypt-muted')}>
+                                {row.hit_rate != null ? `${Math.round(row.hit_rate * 100)}%` : '—'}
+                              </td>
+                              <td className={cls(TD, 'text-right text-krypt-muted')}>
+                                {row.beat_close_rate != null ? `${Math.round(row.beat_close_rate * 100)}%` : '—'}
+                              </td>
+                            </tr>
+                          ),
+                        )}
+                      </tbody>
+                    </table>
+                  </Card>
+                )}
+              </Section>
+            )}
 
             {clv?.by_tier && (
               <Section

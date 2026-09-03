@@ -20,7 +20,10 @@ Money rules (all enforced per sweep):
   model_prob     recovered from the recorded pick itself: the pick stores
                  its price and EV, and EV = p·d − 1 (d = decimal price), so
                  p = (1+EV)/d. No re-prediction — the engine bets exactly
-                 what the board showed.
+                 what the board showed. Since 2026-09-02 a pick's EV is at
+                 the SHARP FAIR (store/picks), so this is the exchange's
+                 probability, and only a Polymarket-priced pick is tradable
+                 here — none exists by construction (`not_polymarket_priced`).
   fees           the fee rate comes from the market's own Gamma feeSchedule
                  (live source of truth; falls back to SPORTS_TAKER_FEE_RATE)
                  and is persisted per row so grading survives rate changes.
@@ -1148,6 +1151,14 @@ async def _sweep_locked(force: bool) -> dict:
             start = datetime.fromisoformat(row["kickoff"])
             if start <= now + lead or start > now + horizon:
                 skip("out_of_window")
+                continue
+            # Value picks are priced against the exchanges (2026-09-02): a
+            # pick lives at a SPORTSBOOK price that beats the Kalshi fair, so
+            # tailing it on Polymarket buys the reference, not the edge. Only
+            # a Polymarket-priced pick is tradable here, and by construction
+            # there are none — autobet idles until a maker mode exists.
+            if row.get("book") != "polymarket":
+                skip("not_polymarket_priced")
                 continue
             attempts, committed = _attempts(conn, row["game_id"], row["side"])
             if committed:

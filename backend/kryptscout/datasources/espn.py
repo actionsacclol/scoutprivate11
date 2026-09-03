@@ -6,7 +6,7 @@ Elo updates. Tennis uses its own source (see sports/tennis.py).
 """
 from __future__ import annotations
 
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import httpx
 
@@ -45,23 +45,81 @@ EXTRA_PARAMS: dict[str, dict[str, str]] = {
     "basketball/mens-college-basketball": {"groups": "50", "limit": "400"},
 }
 
+# Extra days pulled past today when the default scoreboard lags (see
+# _lags_today) — one day of forward slate, so tomorrow's card and its opening
+# lines are on the board without multiplying per-game odds requests.
+CATCHUP_DAYS = 1
+
+
+def _eastern_tz():
+    """ESPN keys its slates to the US Eastern day."""
+    try:
+        from zoneinfo import ZoneInfo
+
+        return ZoneInfo("America/New_York")
+    except Exception:  # noqa: BLE001 — Windows without tzdata package
+        return timezone(timedelta(hours=-4))  # EDT; the day-boundary slack absorbs it
+
+
+_EASTERN = _eastern_tz()
+
+
+def _lags_today(payload: dict, today: date) -> bool:
+    """True when a daily scoreboard is still serving a day before today.
+
+    ESPN's daily leagues (MLB, NBA, NHL, WNBA, NCAAB) hold the previous day's
+    slate until that day's games are near — well past noon ET for MLB — so an
+    undated request during the morning returns only yesterday's finals and the
+    board renders empty. Week-based scoreboards (NFL, NCAAF) carry no "day"
+    key, and leagues idling between fixtures (soccer, an off-season league)
+    report a future day; neither is missing anything, so neither triggers a
+    second fetch.
+    """
+    day = (payload.get("day") or {}).get("date")
+    if not day:
+        return False
+    try:
+        return date.fromisoformat(day) < today
+    except ValueError:  # unexpected shape — leave the default response alone
+        return False
+
 
 async def scoreboard(sport: Sport, on: date | None = None) -> list[Game]:
-    """Games for a date (today by default), with scores when finished."""
+    """Games for a date (today by default), with scores when finished.
+
+    Undated, this is ESPN's own idea of the current slate, plus today and the
+    next CATCHUP_DAYS days whenever that idea has fallen behind the Eastern
+    date. Yesterday's finals stay in the result either way, so results keep
+    settling. Duplicates across the two responses collapse on game id.
+    """
     params = {"dates": on.strftime("%Y%m%d")} if on else {}
-    games: list[Game] = []
+    today = datetime.now(_EASTERN).date()
+    games: dict[str, Game] = {}
     async with httpx.AsyncClient(timeout=30) as client:
         for path, league in LEAGUE_PATHS[sport]:
-            resp = await client.get(
-                f"{BASE}/{path}/scoreboard",
-                params={**params, **EXTRA_PARAMS.get(path, {})},
-            )
-            resp.raise_for_status()
-            for event in resp.json().get("events", []):
-                game = _parse_event(event, sport, league)
-                if game:
-                    games.append(game)
-    return games
+            extra = EXTRA_PARAMS.get(path, {})
+            payloads = [await _fetch(client, path, {**params, **extra})]
+            if on is None and _lags_today(payloads[0], today):
+                end = today + timedelta(days=CATCHUP_DAYS)
+                payloads.append(
+                    await _fetch(
+                        client,
+                        path,
+                        {"dates": f"{today:%Y%m%d}-{end:%Y%m%d}", **extra},
+                    )
+                )
+            for payload in payloads:
+                for event in payload.get("events", []):
+                    game = _parse_event(event, sport, league)
+                    if game:
+                        games[game.id] = game
+    return list(games.values())
+
+
+async def _fetch(client: httpx.AsyncClient, path: str, params: dict) -> dict:
+    resp = await client.get(f"{BASE}/{path}/scoreboard", params=params)
+    resp.raise_for_status()
+    return resp.json()
 
 
 def _parse_event(event: dict, sport: Sport, league: str) -> Game | None:

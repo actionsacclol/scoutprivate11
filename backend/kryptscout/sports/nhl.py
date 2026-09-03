@@ -1,4 +1,27 @@
-"""NHL engine — Elo win probabilities + Poisson goal totals (v1).
+"""NHL engine — xG-rated win probabilities (v2) over an Elo core (v1).
+
+v2 (2026-09-02): when MoneyPuck's team game-by-game file is present under
+RAW_DIR/nhl/moneypuck/all_teams.csv, each team carries EWMAs of per-game
+expected goals for/against (all situations and 5-on-5), goals for/against,
+and PDO components (finishing = goals − xG, goaltending = xGA − GA, both
+half-speed and regressed), and a walk-forward logistic on the home-minus-
+away differences serves the win probability through a 0.88 logit scale.
+Measured on 13,511 regular-season games 2015-26, test 2024-26 (n=2,624):
+log loss 0.6739 vs the Elo's 0.6798, −0.0059 [−0.0109, −0.0007], with
+resolution 0.010 vs 0.003 — shot quality separates hockey games three
+times better than goals do. Replayed through THIS code against the engine's
+own live Elo log on the same 2,624 games: 0.6775 vs 0.6851, −0.0076
+[−0.0123, −0.0026]. Everything else hockey-specific (OT-adjusted Elo,
+Dixon-Coles, margin Kalman, rest, starter GSAx) measured null; dropping the
+empty-net/OT situations from the xG changed nothing.
+
+The file is NOT fetched by the app: MoneyPuck's terms are non-commercial
+with credit and ask for approval before automated pulls, so the user drops
+the listed file in (personal use) or the app fetches it once MoneyPuck's
+written approval is in hand. Absent the file, everything below is the v1
+Elo engine, unchanged. Credit MoneyPuck.com on the About page.
+
+v1: Elo win probabilities + Poisson goal totals.
 
 Historical results come from the free NHL API (api-web.nhle.com): one
 club-schedule-season JSON per team per season, cached under RAW_DIR/nhl/.
@@ -24,7 +47,9 @@ directly against datasources/espn scoreboard games.
 from __future__ import annotations
 
 import asyncio
+import csv
 import json
+import logging
 import math
 import time
 from collections import defaultdict, deque
@@ -34,8 +59,10 @@ from pathlib import Path
 from typing import Deque, Iterable
 
 import httpx
+import numpy as np
 
 from kryptscout.config import DATA_DIR, RAW_DIR
+from kryptscout.core.calibrate import temper
 from kryptscout.core.elo import EloBook, EloConfig
 from kryptscout.core.schemas import Game, Prediction, Sport
 from kryptscout.datasources import espn
@@ -132,6 +159,185 @@ HISTORICAL_NAMES: dict[str, str] = {"ARI": "Utah Mammoth"}
 
 RollingBook = dict[str, Deque[tuple[int, int]]]
 GoalieBook = dict[str, dict]  # goalie id -> {"name", "ewma", "starts"}
+
+# ---------------------------------------------------------------- xG (v2)
+# MoneyPuck's listed team game-by-game file (careers/gameByGame/all_teams.csv):
+# one row per team per game per situation. Dropped in by the user under the
+# raw cache; see the module docstring for why the app does not fetch it.
+MONEYPUCK_DIR = RAW_NHL_DIR / "moneypuck"
+MONEYPUCK_TEAMS_FILE = "all_teams.csv"
+XG_MODEL_NAME = "nhl-xg-v2"
+ELO_MODEL_NAME = "nhl-elo-v2" if GOALIE_ADJ_ENABLED else "nhl-elo-v1"
+XG_SPAN = 25  # EWMA span in games
+XG_SEASON_CARRY = 0.6  # strength kept at a season boundary
+XG_LEAGUE_XG = 2.8  # league-average xG per team-game, all situations
+XG_LEAGUE_XG5 = 2.0  # at 5-on-5
+XG_LEAGUE_GOALS = 2.8
+XG_MIN_GAMES = 5  # both teams need this many games before the xG path prices them
+XG_MIN_TRAIN_SEASON = 2015  # seasons the fit uses (the measured window)
+XG_MIN_TRAIN_ROWS = 100
+XG_RIDGE = 1.0
+XG_LOGIT_SCALE = 0.88  # test-slope 0.88: the fit is slightly overconfident
+XG_FEATURES = ("xg_diff", "xg5_diff", "g_diff", "sh_diff", "sv_diff")
+# MoneyPuck used dotted codes for four franchises through 2020-21.
+MONEYPUCK_ALIASES = {"L.A": "LAK", "N.J": "NJD", "S.J": "SJS", "T.B": "TBL"}
+
+
+@dataclass(frozen=True)
+class XgGame:
+    """One regular-season game from the MoneyPuck team file, keyed by ESPN names."""
+
+    id: int
+    season: int
+    date: str  # YYYY-MM-DD
+    home: str
+    away: str
+    xg_home: float
+    xg_away: float
+    xg5_home: float
+    xg5_away: float
+    goals_home: int
+    goals_away: int
+
+
+def _moneypuck_team(code: str) -> str:
+    code = MONEYPUCK_ALIASES.get(code, code)
+    return TEAM_NAMES.get(code) or HISTORICAL_NAMES.get(code) or code
+
+
+def load_moneypuck_games(path: Path) -> list[XgGame]:
+    """Regular-season games with both sides' all-situation and 5-on-5 xG.
+
+    A game needs its 'all' and '5on5' rows for both teams; anything partial
+    (a mid-write file, an unfinished game) is skipped. Playoff games are
+    excluded by the game id's type digits, like the Elo replay's gameType.
+    """
+    by_game: dict[int, dict] = {}
+    with path.open(newline="", encoding="utf-8") as fh:
+        for row in csv.DictReader(fh):
+            situation = row.get("situation")
+            if situation not in ("all", "5on5"):
+                continue
+            try:
+                gid = int(row["gameId"])
+                if (gid // 10000) % 100 != 2:
+                    continue  # 02 = regular season
+                side = "home" if row["home_or_away"] == "HOME" else "away"
+                entry = by_game.setdefault(gid, {"season": int(row["season"]), "date": str(row["gameDate"])})
+                entry[side] = _moneypuck_team(row["team"])
+                if situation == "all":
+                    entry[f"xg_{side}"] = float(row["xGoalsFor"])
+                    entry[f"goals_{side}"] = int(float(row["goalsFor"]))
+                else:
+                    entry[f"xg5_{side}"] = float(row["xGoalsFor"])
+            except (KeyError, TypeError, ValueError):
+                continue
+    games: list[XgGame] = []
+    need = ("home", "away", "xg_home", "xg_away", "xg5_home", "xg5_away", "goals_home", "goals_away")
+    for gid, e in by_game.items():
+        if not all(k in e for k in need):
+            continue
+        d = e["date"]
+        date = f"{d[:4]}-{d[4:6]}-{d[6:8]}" if len(d) == 8 else d
+        games.append(XgGame(
+            id=gid, season=e["season"], date=date, home=e["home"], away=e["away"],
+            xg_home=e["xg_home"], xg_away=e["xg_away"], xg5_home=e["xg5_home"], xg5_away=e["xg5_away"],
+            goals_home=e["goals_home"], goals_away=e["goals_away"],
+        ))
+    games.sort(key=lambda g: (g.date, g.id))
+    return games
+
+
+def _fresh_xg_team() -> dict:
+    return {"xgf": 0.0, "xga": 0.0, "xgf5": 0.0, "xga5": 0.0, "gf": 0.0, "ga": 0.0, "sh": 0.0, "sv": 0.0, "n": 0}
+
+
+def xg_features(state: dict[str, dict], home: str, away: str) -> dict | None:
+    """Home-minus-away strength differences, or None until both have history."""
+    h, a = state.get(home), state.get(away)
+    if not h or not a or h["n"] < XG_MIN_GAMES or a["n"] < XG_MIN_GAMES:
+        return None
+    return {
+        "xg_diff": (h["xgf"] - h["xga"]) - (a["xgf"] - a["xga"]),
+        "xg5_diff": (h["xgf5"] - h["xga5"]) - (a["xgf5"] - a["xga5"]),
+        "g_diff": (h["gf"] - h["ga"]) - (a["gf"] - a["ga"]),
+        "sh_diff": h["sh"] - a["sh"],
+        "sv_diff": h["sv"] - a["sv"],
+    }
+
+
+def xg_replay(games: list[XgGame]) -> tuple[dict[str, dict], list[dict]]:
+    """Run the games through the EWMAs in order; return (state, feature rows).
+
+    Each row carries the PRE-game features plus season/date/teams/outcome
+    and n_min (the thinner side's game count), so the fit and the backtest
+    both read strictly pre-game information.
+    """
+    alpha = 2.0 / (XG_SPAN + 1)
+    state: dict[str, dict] = {}
+    rows: list[dict] = []
+    season: int | None = None
+    for g in games:
+        if season is not None and g.season != season:
+            for team in state.values():
+                for key in ("xgf", "xga", "xgf5", "xga5", "gf", "ga", "sh", "sv"):
+                    team[key] *= XG_SEASON_CARRY
+        season = g.season
+        h = state.setdefault(g.home, _fresh_xg_team())
+        a = state.setdefault(g.away, _fresh_xg_team())
+        rows.append({
+            "season": g.season, "date": g.date, "home": g.home, "away": g.away,
+            "home_won": g.goals_home > g.goals_away, "n_min": min(h["n"], a["n"]),
+            "xg_diff": (h["xgf"] - h["xga"]) - (a["xgf"] - a["xga"]),
+            "xg5_diff": (h["xgf5"] - h["xga5"]) - (a["xgf5"] - a["xga5"]),
+            "g_diff": (h["gf"] - h["ga"]) - (a["gf"] - a["ga"]),
+            "sh_diff": h["sh"] - a["sh"], "sv_diff": h["sv"] - a["sv"],
+        })
+        for team, xgf, xga, xgf5, xga5, gf, ga in (
+            (h, g.xg_home, g.xg_away, g.xg5_home, g.xg5_away, g.goals_home, g.goals_away),
+            (a, g.xg_away, g.xg_home, g.xg5_away, g.xg5_home, g.goals_away, g.goals_home),
+        ):
+            team["xgf"] += alpha * (xgf - XG_LEAGUE_XG - team["xgf"])
+            team["xga"] += alpha * (xga - XG_LEAGUE_XG - team["xga"])
+            team["xgf5"] += alpha * (xgf5 - XG_LEAGUE_XG5 - team["xgf5"])
+            team["xga5"] += alpha * (xga5 - XG_LEAGUE_XG5 - team["xga5"])
+            team["gf"] += alpha * (gf - XG_LEAGUE_GOALS - team["gf"])
+            team["ga"] += alpha * (ga - XG_LEAGUE_GOALS - team["ga"])
+            # PDO components at half speed: finishing and goaltending are the
+            # noisiest parts of a result and regress hardest.
+            team["sh"] += 0.5 * alpha * ((gf - xgf) - team["sh"])
+            team["sv"] += 0.5 * alpha * ((xga - ga) - team["sv"])
+            team["n"] += 1
+    return state, rows
+
+
+def fit_xg_logit(rows: list[dict], upto_season: int) -> list[float] | None:
+    """Ridge logistic on seasons strictly before `upto_season`; None when thin."""
+    train = [r for r in rows if XG_MIN_TRAIN_SEASON <= r["season"] < upto_season and r["n_min"] >= XG_MIN_GAMES]
+    if len(train) < XG_MIN_TRAIN_ROWS:
+        return None
+    X = np.column_stack([np.ones(len(train))] + [np.array([r[f] for r in train], float) for f in XG_FEATURES])
+    y = np.array([1.0 if r["home_won"] else 0.0 for r in train])
+    w = np.zeros(X.shape[1])
+    for _ in range(60):
+        z = X @ w
+        p = 1.0 / (1.0 + np.exp(-z))
+        grad = X.T @ (p - y) + XG_RIDGE * np.r_[0.0, w[1:]]
+        hess = (X * (p * (1.0 - p))[:, None]).T @ X + XG_RIDGE * np.eye(len(w))
+        hess[0, 0] -= XG_RIDGE
+        step = np.linalg.solve(hess, grad)
+        w -= step
+        if np.max(np.abs(step)) < 1e-9:
+            break
+    if not np.all(np.isfinite(w)):
+        return None
+    return [float(v) for v in w]
+
+
+def xg_prob(weights: list[float], feats: dict) -> float:
+    """Raw (unscaled) logistic probability from the fitted weights."""
+    z = weights[0] + sum(w * feats[f] for w, f in zip(weights[1:], XG_FEATURES))
+    return 1.0 / (1.0 + math.exp(-z))
 
 
 @dataclass(frozen=True)
@@ -446,12 +652,22 @@ def _score_evals(evals: list[tuple[float, float, GameRecord]]) -> dict[str, floa
 
 class NhlEngine(SportEngine):
     sport = Sport.NHL
-    model_name = "nhl-elo-v2" if GOALIE_ADJ_ENABLED else "nhl-elo-v1"
+
+    @property
+    def model_name(self) -> str:  # type: ignore[override]
+        return XG_MODEL_NAME if self._xg_weights else ELO_MODEL_NAME
 
     def __init__(self, state_path: Path = STATE_PATH, raw_dir: Path = RAW_NHL_DIR):
         self._state_path = state_path
         self._raw_dir = raw_dir
         self._box_dir = raw_dir / "box"
+        # xG path (v2): team EWMAs + fitted weights, present only when the
+        # MoneyPuck file has been dropped in. See _refresh_xg.
+        self._xg_state: dict[str, dict] = {}
+        self._xg_weights: list[float] | None = None
+        self._xg_season: int | None = None
+        self._xg_mtime: float | None = None
+        self._xg_metrics: dict = {}
         self._book = EloBook(config=ELO_CONFIG)
         self._rolling: RollingBook = _new_rolling()
         self._goalies: GoalieBook = {}
@@ -483,7 +699,44 @@ class NhlEngine(SportEngine):
             log=self._backtest_log,
         )
         self._processed.update(r.id for r in new)
+        try:
+            self._refresh_xg()
+        except Exception:  # noqa: BLE001 — the v1 engine must never depend on the v2 file
+            logging.getLogger("kryptscout").exception("nhl: xG refresh failed; serving Elo")
         self._save_state()
+
+    def _refresh_xg(self) -> bool:
+        """Rebuild the xG state and weights from the MoneyPuck file if it changed.
+
+        Returns True when the xG path was (re)fitted. Weights are fitted on
+        seasons strictly before the file's latest season, so the current
+        season is scored walk-forward; `_xg_metrics` reports that score.
+        """
+        path = self._raw_dir / "moneypuck" / MONEYPUCK_TEAMS_FILE
+        if not path.exists():
+            return False
+        mtime = path.stat().st_mtime
+        if self._xg_weights and self._xg_mtime == mtime:
+            return False
+        games = load_moneypuck_games(path)
+        if not games:
+            return False
+        state, rows = xg_replay(games)
+        season = max(g.season for g in games)
+        weights = fit_xg_logit(rows, upto_season=season) or fit_xg_logit(rows, upto_season=season + 1)
+        if weights is None:
+            return False
+        scored = [r for r in rows if r["season"] == season and r["n_min"] >= XG_MIN_GAMES]
+        metrics: dict = {"season": season, "games": len(scored), "fitted_on_seasons_before": season}
+        if scored:
+            probs = [temper(xg_prob(weights, r), XG_LOGIT_SCALE) for r in scored]
+            metrics["log_loss"] = -sum(
+                math.log(max(1e-9, p if r["home_won"] else 1.0 - p)) for p, r in zip(probs, scored)
+            ) / len(scored)
+            metrics["accuracy"] = sum((p >= 0.5) == r["home_won"] for p, r in zip(probs, scored)) / len(scored)
+        self._xg_state, self._xg_weights, self._xg_season = state, weights, season
+        self._xg_mtime, self._xg_metrics = mtime, metrics
+        return True
 
     async def _fetch_boxscores(self, game_ids: list[int]) -> None:
         """Backfill gamecenter boxscores for uncached completed games.
@@ -598,6 +851,13 @@ class NhlEngine(SportEngine):
         self._processed = set(state["processed_ids"])
         self._last_season = state.get("last_season")
         self._backtest_log = list(state.get("backtest") or [])
+        xg = state.get("xg") or {}
+        if xg.get("weights"):
+            self._xg_state = {t: dict(v) for t, v in (xg.get("state") or {}).items()}
+            self._xg_weights = [float(v) for v in xg["weights"]]
+            self._xg_season = xg.get("season")
+            self._xg_mtime = xg.get("mtime")
+            self._xg_metrics = dict(xg.get("metrics") or {})
 
     def _save_state(self) -> None:
         state = {
@@ -610,6 +870,13 @@ class NhlEngine(SportEngine):
             "team_goalie": self._team_goalie,
             "processed_ids": sorted(self._processed),
             "backtest": self._backtest_log,
+            "xg": {
+                "state": self._xg_state,
+                "weights": self._xg_weights,
+                "season": self._xg_season,
+                "mtime": self._xg_mtime,
+                "metrics": self._xg_metrics,
+            },
         }
         self._state_path.write_text(json.dumps(state), encoding="utf-8")
 
@@ -640,28 +907,38 @@ class NhlEngine(SportEngine):
         now = datetime.now(timezone.utc)
         predictions: list[Prediction] = []
         for game in games:
-            home_prob = _expected_home_prob(
-                self._book,
-                game.home,
-                game.away,
-                self._slate_goalie_diff(game.home, game.away),
-            )
+            feats = xg_features(self._xg_state, game.home, game.away) if self._xg_weights else None
+            if feats is not None:
+                home_prob = temper(xg_prob(self._xg_weights, feats), XG_LOGIT_SCALE)
+                model = XG_MODEL_NAME
+            else:
+                home_prob = _expected_home_prob(
+                    self._book,
+                    game.home,
+                    game.away,
+                    self._slate_goalie_diff(game.home, game.away),
+                )
+                model = ELO_MODEL_NAME
             goals_home, goals_away = _predicted_goals(
                 self._rolling, game.home, game.away
             )
             total = goals_home + goals_away
+            # A team with no scoring history would price at the league-average
+            # placeholder — a constant, not a forecast. The board printed UNDER
+            # edges against exactly that (WNBA, 2026-09-02). Emit no total.
+            scored = bool(self._rolling.get(game.home)) and bool(self._rolling.get(game.away))
             predictions.append(
                 Prediction(
                     game_id=game.id,
                     sport=Sport.NHL,
-                    model=self.model_name,
+                    model=model,
                     generated_at=now,
                     home_win_prob=home_prob,
                     away_win_prob=1.0 - home_prob,
-                    predicted_home_score=round(goals_home, 2),
-                    predicted_away_score=round(goals_away, 2),
-                    predicted_total=round(total, 2),
-                    over_prob=_poisson_over_prob(total),
+                    predicted_home_score=round(goals_home, 2) if scored else None,
+                    predicted_away_score=round(goals_away, 2) if scored else None,
+                    predicted_total=round(total, 2) if scored else None,
+                    over_prob=_poisson_over_prob(total) if scored else None,
                 )
             )
         return predictions
@@ -708,6 +985,13 @@ async def _main() -> None:
     await engine.refresh_data()
     print(f"  ratings tracked: {len(engine._book.ratings)} teams, "
           f"{len(engine._goalies)} goalies")
+    if engine._xg_weights:
+        m = engine._xg_metrics
+        print(f"  xG path active (nhl-xg-v2): season {m.get('season')} walk-forward "
+              f"n={m.get('games')} log loss {m.get('log_loss', float('nan')):.4f} "
+              f"acc {m.get('accuracy', float('nan')):.3f}")
+    else:
+        print("  xG path inactive: drop MoneyPuck's all_teams.csv under raw/nhl/moneypuck/ to enable")
 
     print(f"\n  goalie tune on {TUNE_SEASON} (log loss; baseline k=0):")
     baseline_tune = engine.backtest(eval_season=TUNE_SEASON, k_goalie=0.0)

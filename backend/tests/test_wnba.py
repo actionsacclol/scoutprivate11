@@ -92,7 +92,10 @@ def test_predict_unknown_teams_falls_back_to_league_average(tmp_path) -> None:
     pred = asyncio.run(engine.predict([game("Ghost A", "Ghost B")]))[0]
     # Equal 1500 ratings: only the +80 home advantage separates the sides.
     assert 0.5 < pred.home_win_prob < 0.7
-    assert pred.predicted_total == 2 * LEAGUE_AVG_POINTS
+    # No scoring history: NO total. The league-average placeholder used to
+    # ship as 164.0 and the board printed UNDER edges against it.
+    assert pred.predicted_total is None
+    assert pred.predicted_home_score is None and pred.predicted_away_score is None
 
 
 def test_expansion_teams_start_at_1500_and_get_rated(tmp_path) -> None:

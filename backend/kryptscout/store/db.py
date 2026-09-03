@@ -59,6 +59,7 @@ julianday()/date() functions.
 """
 from __future__ import annotations
 
+import json
 import math
 import sqlite3
 from datetime import datetime, timedelta, timezone
@@ -66,6 +67,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from kryptscout.config import DATA_DIR
+from kryptscout.core.schemas import Arb, Lean
 
 # Tests monkeypatch this module attribute to point at a temp database.
 DB_PATH: Path = DATA_DIR / "kryptscout.sqlite"
@@ -133,6 +135,77 @@ CREATE TABLE IF NOT EXISTS line_endpoints (
     PRIMARY KEY (game_id, book)
 );
 
+-- Exchange-lead signals (core/lean.py): one row per game, refreshed until
+-- kickoff like picks, with the FIRST-SIGHT state frozen in entry_* so the
+-- same-book CLV (tracker.lean_clv) scores the price that was actually
+-- available when the lean appeared.
+CREATE TABLE IF NOT EXISTS lean_signals (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    game_id        TEXT NOT NULL UNIQUE,
+    sport          TEXT NOT NULL,
+    side           TEXT NOT NULL,
+    book           TEXT NOT NULL,
+    home_ml        INTEGER NOT NULL,
+    away_ml        INTEGER NOT NULL,
+    ref_book       TEXT NOT NULL,
+    ref_prob       REAL NOT NULL,
+    gap_pts        REAL NOT NULL,
+    agree          INTEGER NOT NULL,
+    created_at     TEXT NOT NULL,
+    updated_at     TEXT NOT NULL,
+    locked_at      TEXT,
+    entry_side     TEXT NOT NULL,
+    entry_home_ml  INTEGER NOT NULL,
+    entry_away_ml  INTEGER NOT NULL,
+    entry_ref_book TEXT NOT NULL,
+    entry_gap_pts  REAL NOT NULL,
+    entry_at       TEXT NOT NULL
+);
+
+-- Every true-arb sighting (core/arb.py), one row per game per 15-minute
+-- bucket. Rare enough that the log IS the feature.
+CREATE TABLE IF NOT EXISTS arb_sightings (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    game_id        TEXT NOT NULL,
+    sport          TEXT NOT NULL,
+    seen_at        TEXT NOT NULL,
+    legs           TEXT NOT NULL,
+    margin_pct     REAL NOT NULL,
+    net_margin_pct REAL NOT NULL
+);
+
+-- ESPN's pre-game win probability per game (datasources/espn_predictor):
+-- a free third reference for the PERFORMANCE benchmark. pre_game = 0 when
+-- the document was modified after kickoff; such rows are never scored.
+CREATE TABLE IF NOT EXISTS espn_predictions (
+    game_id       TEXT PRIMARY KEY,
+    sport         TEXT NOT NULL,
+    home_prob     REAL NOT NULL,
+    away_prob     REAL NOT NULL,
+    last_modified TEXT,
+    fetched_at    TEXT NOT NULL,
+    pre_game      INTEGER NOT NULL
+);
+
+-- Schedule-shaped context per game (core/context, datasources/mlb_context):
+-- rest days from the store's own schedule, the MLB home-plate umpire and
+-- lineup postings with FIRST-SEEN stamps (never overwritten), and a slot for
+-- the NBA referee crew once a verified feed exists. Tracked and scored
+-- (tracker.context_trackers), never a model input.
+CREATE TABLE IF NOT EXISTS game_context (
+    game_id          TEXT PRIMARY KEY,
+    sport            TEXT NOT NULL,
+    rest_home_days   REAL,
+    rest_away_days   REAL,
+    umpire_id        INTEGER,
+    umpire_name      TEXT,
+    umpire_seen_at   TEXT,
+    lineups_seen_at  TEXT,
+    referee_crew     TEXT,
+    referee_seen_at  TEXT,
+    updated_at       TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS picks (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     game_id    TEXT NOT NULL,
@@ -151,6 +224,14 @@ CREATE TABLE IF NOT EXISTS picks (
     result     TEXT,
     units      REAL,
     graded_at  TEXT,
+    -- First price the pick was ever shown at (see upsert_pick): side/book/
+    -- price/timestamp, written once and never refreshed. `price` above
+    -- tracks the board until kickoff, so it is the last pre-game price.
+    entry_side  TEXT,
+    entry_book  TEXT,
+    entry_price INTEGER,
+    entry_at    TEXT,
+    fair_prob   REAL,
     UNIQUE (game_id, model)
 );
 
@@ -318,7 +399,14 @@ def _migrate(conn: sqlite3.Connection) -> None:
     column when absent — cheap, idempotent, safe on every connect.
     """
     additions = {
-        "picks": [("model_prob", "REAL")],  # recorded so strategy backtests can accrue
+        "picks": [("model_prob", "REAL"),  # recorded so strategy backtests can accrue
+                  # First-sight entry price, frozen (upsert_pick). Without it
+                  # `price` — refreshed until kickoff — is the exchange's
+                  # last pre-game quote, and "CLV" compared close to close.
+                  ("entry_side", "TEXT"), ("entry_book", "TEXT"),
+                  ("entry_price", "INTEGER"), ("entry_at", "TEXT"),
+                  # The sharp fair a value pick was priced against (2026-09-02).
+                  ("fair_prob", "REAL")],
         # Gamma question text ("Will Arsenal win ...?") — soccer markets are
         # binary Yes/No with the team only named here and in the slug.
         # books_fetched: pm_book_snapshots pass done (jobs/bookfill.py).
@@ -377,6 +465,11 @@ def upsert_game(
     )
 
 
+def _aware(dt: datetime) -> datetime:
+    """Naive datetimes are UTC by convention throughout the store."""
+    return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
+
+
 def upsert_prediction(
     conn: sqlite3.Connection,
     game_id: str,
@@ -389,14 +482,25 @@ def upsert_prediction(
     predicted_home_score: Optional[float] = None,
     predicted_away_score: Optional[float] = None,
     predicted_total: Optional[float] = None,
-) -> bool:
+    starts_at: Optional[datetime] = None,
+) -> Optional[bool]:
     """Record a prediction, deduping within the hour.
 
     If a row for the same (game_id, model) exists with generated_at less than
     one hour away, that row is updated in place (its generated_at moves to the
     new timestamp) rather than a new row being inserted. Returns True when a
     new row was created, False when an existing row was refreshed.
+
+    Pass `starts_at` (the game's kickoff) wherever it is known: a prediction
+    generated at or after kickoff is REFUSED and None is returned. Every model
+    probability here is strictly pre-game, but the refresh loop kept writing
+    rows for games already under way — 61% of the live table by 2026-08-17 —
+    and scoring those rows reversed the market-vs-model verdict, because the
+    engines had partly seen the games they were "forecasting". A row that
+    cannot be scored honestly is not worth storing.
     """
+    if starts_at is not None and _aware(generated_at) >= _aware(starts_at):
+        return None
     ts = iso(generated_at)
     existing = conn.execute(
         """
@@ -581,6 +685,7 @@ def upsert_pick(
     start_time: datetime,
     now: datetime,
     model_prob: Optional[float] = None,
+    fair_prob: Optional[float] = None,
 ) -> Optional[bool]:
     """Record the recommended bet for (game, model), one row per pair.
 
@@ -591,9 +696,18 @@ def upsert_pick(
     locked_at is stamped if still missing) — and a first-time pick recorded
     after the start is inserted already locked.
 
+    The ENTRY columns (entry_side/book/price/at) are the first priced state
+    the pick was ever shown in, written once and never refreshed. Because
+    `price` refreshes until kickoff, it is the venue's last pre-game quote —
+    98% of recorded Polymarket picks carried the exchange's closing mid
+    (measured 2026-09-02) — so any closing-line comparison built on it was
+    comparing one close to another. CLV is defined against the price you
+    could have taken when the pick appeared; that is what these columns keep.
+
     Returns True when inserted, False when refreshed, None when frozen.
     """
     started = iso(now) >= iso(start_time)
+    entry = (side, book, price, iso(now)) if price is not None else (None,) * 4
     existing = conn.execute(
         "SELECT id, locked_at FROM picks WHERE game_id = ? AND model = ?",
         (game_id, model),
@@ -609,22 +723,192 @@ def upsert_pick(
         conn.execute(
             """
             UPDATE picks SET side = ?, team = ?, book = ?, price = ?,
-                             ev = ?, kelly = ?, model_prob = ?, tier = ?
+                             ev = ?, kelly = ?, model_prob = ?, tier = ?,
+                             fair_prob = ?,
+                             entry_side = COALESCE(entry_side, ?),
+                             entry_book = COALESCE(entry_book, ?),
+                             entry_price = COALESCE(entry_price, ?),
+                             entry_at = COALESCE(entry_at, ?)
             WHERE id = ?
             """,
-            (side, team, book, price, ev, kelly, model_prob, tier, existing["id"]),
+            (side, team, book, price, ev, kelly, model_prob, tier, fair_prob)
+            + entry + (existing["id"],),
         )
         return False
     conn.execute(
         """
         INSERT INTO picks (game_id, sport, model, side, team, book, price,
-                           ev, kelly, model_prob, tier, created_at, locked_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                           ev, kelly, model_prob, tier, created_at, locked_at,
+                           entry_side, entry_book, entry_price, entry_at, fair_prob)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (game_id, sport, model, side, team, book, price, ev, kelly, model_prob,
-         tier, iso(now), iso(start_time) if started else None),
+         tier, iso(now), iso(start_time) if started else None) + entry + (fair_prob,),
     )
     return True
+
+
+def upsert_lean(
+    conn: sqlite3.Connection,
+    lean: "Lean",
+    start_time: datetime,
+    now: datetime,
+) -> Optional[bool]:
+    """Record the exchange-lead signal for a game, one row per game.
+
+    Same freeze rule as picks: before kickoff the current state refreshes in
+    place and the entry_* columns keep the first sighting; at or after
+    kickoff an existing row is locked (never modified) and a first sighting
+    is not stored at all — a lean discovered after the game started says
+    nothing about the pre-game line.
+
+    Returns True when inserted, False when refreshed, None when frozen/skipped.
+    """
+    started = iso(now) >= iso(start_time)
+    existing = conn.execute(
+        "SELECT id, locked_at FROM lean_signals WHERE game_id = ?", (lean.game_id,)
+    ).fetchone()
+    if existing:
+        if started:
+            if existing["locked_at"] is None:
+                conn.execute(
+                    "UPDATE lean_signals SET locked_at = ? WHERE id = ?",
+                    (iso(start_time), existing["id"]),
+                )
+            return None
+        conn.execute(
+            """
+            UPDATE lean_signals SET side = ?, home_ml = ?, away_ml = ?, ref_book = ?,
+                                    ref_prob = ?, gap_pts = ?, agree = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (lean.side, lean.home_ml, lean.away_ml, lean.ref_book, lean.ref_prob,
+             lean.gap_pts, int(lean.agree), iso(now), existing["id"]),
+        )
+        return False
+    if started:
+        return None
+    conn.execute(
+        """
+        INSERT INTO lean_signals (game_id, sport, side, book, home_ml, away_ml,
+                                  ref_book, ref_prob, gap_pts, agree, created_at,
+                                  updated_at, entry_side, entry_home_ml,
+                                  entry_away_ml, entry_ref_book, entry_gap_pts,
+                                  entry_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (lean.game_id, lean.sport.value, lean.side, lean.book, lean.home_ml,
+         lean.away_ml, lean.ref_book, lean.ref_prob, lean.gap_pts, int(lean.agree),
+         iso(now), iso(now), lean.side, lean.home_ml, lean.away_ml, lean.ref_book,
+         lean.gap_pts, iso(now)),
+    )
+    return True
+
+
+ARB_SIGHTING_GAP_MINUTES = 15.0
+
+
+def insert_arb_sighting(conn: sqlite3.Connection, arb: "Arb", seen_at: datetime) -> bool:
+    """Log a true-arb sighting, at most one per game per 15 minutes.
+
+    Returns True when a row was written.
+    """
+    aware = seen_at if seen_at.tzinfo else seen_at.replace(tzinfo=timezone.utc)
+    since = iso(aware - timedelta(minutes=ARB_SIGHTING_GAP_MINUTES))
+    recent = conn.execute(
+        "SELECT 1 FROM arb_sightings WHERE game_id = ? AND seen_at >= ? LIMIT 1",
+        (arb.game_id, since),
+    ).fetchone()
+    if recent:
+        return False
+    conn.execute(
+        """
+        INSERT INTO arb_sightings (game_id, sport, seen_at, legs, margin_pct,
+                                   net_margin_pct)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (arb.game_id, arb.sport.value, iso(aware),
+         json.dumps([leg.model_dump() for leg in arb.legs]),
+         arb.margin_pct, arb.net_margin_pct),
+    )
+    return True
+
+
+def upsert_espn_prediction(conn: sqlite3.Connection, pred) -> None:
+    """One row per game, replaced on re-fetch (the document is frozen pre-game)."""
+    conn.execute(
+        """
+        INSERT INTO espn_predictions (game_id, sport, home_prob, away_prob,
+                                      last_modified, fetched_at, pre_game)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT (game_id) DO UPDATE SET
+            home_prob = excluded.home_prob, away_prob = excluded.away_prob,
+            last_modified = excluded.last_modified, fetched_at = excluded.fetched_at,
+            pre_game = excluded.pre_game
+        """,
+        (pred.game_id, pred.sport.value, pred.home_prob, 1.0 - pred.home_prob,
+         iso(pred.last_modified) if pred.last_modified else None, iso(pred.fetched_at),
+         int(pred.pre_game)),
+    )
+
+
+def espn_predictions_present(conn: sqlite3.Connection, game_ids: list[str]) -> set[str]:
+    """The subset of `game_ids` that already have an ESPN row."""
+    out: set[str] = set()
+    for start in range(0, len(game_ids), 500):
+        chunk = game_ids[start:start + 500]
+        marks = ",".join("?" * len(chunk))
+        out.update(
+            r[0] for r in conn.execute(
+                f"SELECT game_id FROM espn_predictions WHERE game_id IN ({marks})", chunk
+            )
+        )
+    return out
+
+
+def upsert_game_context(
+    conn: sqlite3.Connection,
+    game_id: str,
+    sport: str,
+    now: datetime,
+    *,
+    rest_home: Optional[float] = None,
+    rest_away: Optional[float] = None,
+    umpire_id: Optional[int] = None,
+    umpire_name: Optional[str] = None,
+    lineups_posted: bool = False,
+    referee_crew: Optional[str] = None,
+) -> None:
+    """Merge context for one game. First-seen stamps are set once and kept:
+    the umpire's when an umpire first appears, the lineups' the first time
+    both sides are posted, the referee crew's when it first appears."""
+    ts = iso(now)
+    conn.execute(
+        """
+        INSERT INTO game_context (game_id, sport, rest_home_days, rest_away_days,
+                                  umpire_id, umpire_name, umpire_seen_at,
+                                  lineups_seen_at, referee_crew, referee_seen_at,
+                                  updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT (game_id) DO UPDATE SET
+            rest_home_days = COALESCE(excluded.rest_home_days, game_context.rest_home_days),
+            rest_away_days = COALESCE(excluded.rest_away_days, game_context.rest_away_days),
+            umpire_id = COALESCE(excluded.umpire_id, game_context.umpire_id),
+            umpire_name = COALESCE(excluded.umpire_name, game_context.umpire_name),
+            umpire_seen_at = COALESCE(game_context.umpire_seen_at, excluded.umpire_seen_at),
+            lineups_seen_at = COALESCE(game_context.lineups_seen_at, excluded.lineups_seen_at),
+            referee_crew = COALESCE(excluded.referee_crew, game_context.referee_crew),
+            referee_seen_at = COALESCE(game_context.referee_seen_at, excluded.referee_seen_at),
+            updated_at = excluded.updated_at
+        """,
+        (
+            game_id, sport, rest_home, rest_away,
+            umpire_id, umpire_name, ts if umpire_id is not None else None,
+            ts if lineups_posted else None,
+            referee_crew, ts if referee_crew else None,
+            ts,
+        ),
+    )
 
 
 def grade_pick(

@@ -55,6 +55,16 @@ class MoneylineOdds(BaseModel):
     total_line: Optional[float] = None  # over/under points line
     over_price: Optional[int] = None
     under_price: Optional[int] = None
+    # Exchange top-of-book context (odds/polymarket, odds/kalshi), live only
+    # and never persisted. `microprice_home` is the size-weighted fair
+    # probability of HOME read off the touch — (ask·bid_size + bid·ask_size)
+    # / (bid_size + ask_size) — and `*_depth_usd` is the notional resting at
+    # each side's executable price. core/fair.py prefers a deep microprice
+    # over a devigged ask pair and flags a thin book instead of trusting it.
+    microprice_home: Optional[float] = None
+    home_depth_usd: Optional[float] = None
+    away_depth_usd: Optional[float] = None
+    spread_pts: Optional[float] = None  # ask − bid, probability points
 
 
 class LineEndpoints(BaseModel):
@@ -153,8 +163,134 @@ class Edge(BaseModel):
     price: int  # American odds offered
     model_prob: float
     market_prob: float  # vig-removed implied probability
-    ev_per_dollar: float  # expected profit per $1 staked at model_prob
+    ev_per_dollar: float  # expected profit per $1 staked at the reference probability
     kelly_fraction: float  # full-Kelly stake fraction (cap at 0.25-0.5x in practice)
+    # Value edges (store/picks.compute_edges) are priced against the SHARP
+    # FAIR, not the model: `fair_prob` is the exchange's probability the EV
+    # is measured against, `ref_book` which exchange, `gap_pts` how far the
+    # book's price sits below it, `agree` whether the other exchange (when
+    # quoting) pointed the same way. `model_prob` stays the model's own
+    # number, for context. Totals edges leave these None.
+    fair_prob: Optional[float] = None
+    ref_book: Optional[str] = None
+    gap_pts: Optional[float] = None
+    agree: Optional[bool] = None
+
+
+class ArbLeg(BaseModel):
+    """One side of a locked-in position: the best price on it, and its cost."""
+
+    side: str  # "home" | "away" | "draw"
+    book: str
+    price: int  # American odds
+    implied: float  # raw implied probability of the price
+    cost: float  # dollars per $1 of payout, taker fee included
+    stake_fraction: float  # share of the total stake that goes on this leg
+
+
+class Arb(BaseModel):
+    """True arbitrage across venues (core/arb.py): every outcome bought for
+    less than $1 of payout. Deterministic — no model involved."""
+
+    game_id: str
+    sport: Sport
+    legs: list[ArbLeg]
+    implied_sum: float  # sum of raw implied probabilities (< 1 gross)
+    cost_sum: float  # sum of fee-inclusive costs (< 1 means a real arb)
+    margin_pct: float  # gross return %, before exchange taker fees
+    net_margin_pct: float  # locked-in return % after fees — the one that counts
+
+
+class Lean(BaseModel):
+    """Exchange lead (core/lean.py): the DraftKings side the exchanges say is
+    underpriced. A measured reference, tracked against the close — not a
+    pick, and never fed to autobet."""
+
+    game_id: str
+    sport: Sport
+    side: str  # "home" | "away"
+    book: str  # the target book (DraftKings)
+    price: int  # the target book's American price on `side`
+    home_ml: int  # the target book's full pair at this moment
+    away_ml: int
+    book_prob: float  # target book's devigged (power) probability of `side`
+    ref_book: str  # "kalshi" | "polymarket"
+    ref_prob: float  # the reference's devigged probability of `side`
+    gap_pts: float  # ref_prob − book_prob, probability points
+    agree: bool  # both exchanges were quoting and pointed the same way
+
+
+class FairPrices(BaseModel):
+    """Sharp fair probabilities per side (core/fair.py): the exchange-devigged
+    price — the reference that led DraftKings' close 64% of the time — with a
+    sportsbook's power-devigged pair as a flagged fallback. What an odds boost
+    or promo is scored against. Never a pick."""
+
+    game_id: str
+    sport: Sport
+    source: str  # book the fair came from
+    sharp: bool  # True when `source` is an exchange (kalshi / polymarket)
+    home: float
+    away: float
+    draw: Optional[float] = None
+    fetched_at: datetime
+    # Every full-market book's devigged HOME probability, for context.
+    sources: dict[str, float] = {}
+    # Order-book context of the source when it is an exchange: `thin` means
+    # the touch held less than core.fair.THIN_DEPTH_USD or the spread was
+    # wider than WIDE_SPREAD_PTS — a stale or empty book, not a reference.
+    thin: bool = False
+    depth_usd: Optional[float] = None
+    spread_pts: Optional[float] = None
+
+
+class SgpFair(BaseModel):
+    """Soccer same-game joint probabilities (core/sgp.py): result × total from
+    the sharp fair 1X2 and a real over/under 2.5 quote, Dixon-Coles low-score
+    dependence plus a high-score diagonal. Keeps an SGP fair honest; never a
+    pick."""
+
+    game_id: str
+    sport: Sport
+    source: str  # the 1X2 fair's book
+    over_book: str  # the book whose O/U 2.5 quote set the total
+    total_line: float
+    fair_over: float
+    lambda_home: float
+    lambda_away: float
+    rho: float
+    delta: float
+    exact: bool
+    # Singles by mask name (home/draw/away/1X/X2/12, over/under 1.5/2.5/3.5,
+    # btts/no_btts) and every result|total pair.
+    singles: dict[str, float] = {}
+    joints: dict[str, float] = {}
+
+
+class Forecast(BaseModel):
+    """The probability the app DISPLAYS for a game (core/forecast.py).
+
+    `kind` is "market" when a full-market fair exists (Kalshi, Polymarket,
+    or DraftKings flagged not-sharp) — measured 2026-09-02 to beat every
+    engine, every variant tried and ESPN's predictor, with no blend
+    surviving out of sample — and "model" before any venue quotes, where the
+    engine's probability is shown as a provisional pre-line estimate with
+    its measured error band. The model's own numbers ride along as context.
+    """
+
+    game_id: str
+    sport: Sport
+    kind: str  # "market" | "model"
+    source: str  # book key, or the engine's model name
+    sharp: bool = False
+    thin: bool = False
+    home: float
+    away: float
+    draw: Optional[float] = None
+    error_pts: Optional[float] = None  # model kind: mean |model − eventual open|
+    model_home: Optional[float] = None
+    model_away: Optional[float] = None
+    model_draw: Optional[float] = None
 
 
 class GameCard(BaseModel):
@@ -168,3 +304,13 @@ class GameCard(BaseModel):
     # totals have no walk-forward validation yet, so they never feed
     # picks/autobet until they earn it. Display + manual tracking only.
     totals_edges: list[Edge] = []
+    # Model-free signals. `arb` is a locked-in cross-venue position (rare);
+    # `lean` is the exchange-lead reference. Both are display + tracking.
+    arb: Optional[Arb] = None
+    lean: Optional[Lean] = None
+    # Sharp fair per side for the boost evaluator (core/fair.py).
+    fair: Optional[FairPrices] = None
+    # Soccer same-game joint table (core/sgp.py).
+    sgp: Optional[SgpFair] = None
+    # What the terminal shows as the win probability (core/forecast.py).
+    forecast: Optional[Forecast] = None

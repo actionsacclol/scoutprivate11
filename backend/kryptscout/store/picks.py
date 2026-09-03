@@ -19,8 +19,10 @@ from datetime import datetime
 from typing import Optional
 
 from kryptscout.core import oddsmath
+from kryptscout.core.fair import EXCHANGES, is_thin
 from kryptscout.core.schemas import (
     Edge,
+    FairPrices,
     GameCard,
     MoneylineOdds,
     Prediction,
@@ -28,8 +30,23 @@ from kryptscout.core.schemas import (
     is_in_play,
 )
 
-# EV threshold (per $1) separating STRONG from LEAN value picks (picks.ts).
-STRONG_EV = 0.04
+# VALUE PICKS ARE PRICED AGAINST THE SHARP FAIR, NOT THE MODEL (2026-09-02).
+# Every test this repo has run says the model's disagreement with the market
+# carries no information: claimed +9% EV measured +0.55% (median 0) against
+# the Kalshi fair, and tailing model-vs-market picks returns the vig. The one
+# replicating signal is that the exchanges lead DraftKings. This exact rule,
+# replayed capture-by-capture over 45 days of the live store (656 games, 475
+# with both a DraftKings and an exchange quote): 59 fires, 1.4 a day, 12% of
+# eligible games; the same-book close then moved toward the pick by
+# +1.75 ± 0.45 pts (59% toward, 10% flat, 31% against; Kalshi-led +1.85,
+# Polymarket-led +1.34). Realized ROI on the 51 graded: −14.6%, which at
+# n=51 is noise (σ ≈ 13 pts) but is NOT evidence of profit — the edge sits
+# under DraftKings' vig. So a value edge is a SPORTSBOOK price sitting at
+# least MIN_GAP_PTS below the sharp fair; exchanges never qualify against
+# their own fair; STRONG means the reference was Kalshi (the stronger lead),
+# LEAN Polymarket alone. The tier is honest about being a closing-line
+# signal, not a profit.
+MIN_GAP_PTS = 1.0
 # EV per $1 above which an "edge" is treated as a model artifact, not value.
 MAX_PLAUSIBLE_EV = 0.40
 # Claimed EV above this demotes a value pick STRONG → LEAN: the live graded
@@ -37,11 +54,17 @@ MAX_PLAUSIBLE_EV = 0.40
 # +6.3u (52% win) while every bucket above lost money (EV≥0.30 won 30%). A
 # huge claimed edge against a liquid market is evidence the MODEL is wrong.
 SUSPECT_EV = 0.15
-# Sports whose model has measured NEGATIVE alpha vs the market (tennis:
-# −18.2% walk-forward ROI, −13.4u live 7/12–7/21, CLV ≈ 0, probabilities
-# ~11pp overconfident). Their picks never carry a value tier — the argmax
-# MODEL pick is all the model has honestly earned.
-NO_VALUE_SPORTS = frozenset({"tennis"})
+# Sports whose model has measured NEGATIVE alpha vs the market. Their picks
+# never carry a value tier — the argmax MODEL pick is all the model has
+# honestly earned. Mirrored in src/picks.ts.
+#   tennis  −18.2% walk-forward ROI, −13.4u live 7/12–7/21, CLV ≈ 0,
+#           probabilities ~11pp overconfident.
+#   soccer  STRONG −11.0% walk-forward vs football-data closes (n=2,129, CI
+#           entirely below zero, 2026-07-27); live through 2026-09-02 the
+#           value picks ran −4.2% at midpoint prices (n=166) with same-book
+#           CLV −0.8% ± 0.6 (n=75), and capping a slate to its best edges
+#           returned the same ROI at every cap — a zero-information ranker.
+NO_VALUE_SPORTS = frozenset({"tennis", "soccer"})
 
 _ML_SIDES = ("home", "away", "draw")
 
@@ -56,11 +79,14 @@ class Pick:
     side: str  # "home" | "away" | "draw"
     team: str  # resolved display name; "DRAW" for soccer three-ways
     tier: str  # "STRONG" | "LEAN" | "MODEL"
-    model_prob: float
+    model_prob: float  # the MODEL's probability of the pick side (context)
     book: Optional[str] = None  # value picks only
     price: Optional[int] = None  # American odds at that book (value picks only)
-    ev: Optional[float] = None  # expected profit per $1 (value picks only)
-    kelly: Optional[float] = None  # full-Kelly fraction (value picks only)
+    ev: Optional[float] = None  # expected profit per $1 at the fair (value picks only)
+    kelly: Optional[float] = None  # full-Kelly fraction at the fair (value picks only)
+    fair_prob: Optional[float] = None  # the sharp fair the value edge is priced against
+    ref_book: Optional[str] = None  # which exchange set that fair
+    prob: Optional[float] = None  # the headline probability shown (fair, else forecast)
 
 
 def side_name(side: str, card: GameCard) -> str:
@@ -75,42 +101,56 @@ def side_name(side: str, card: GameCard) -> str:
 def derive_pick(card: GameCard) -> Optional[Pick]:
     """The single recommended bet for one game, or None (picks.ts derivePick).
 
-    Value pick: the highest-EV moneyline edge across all books; STRONG at
-    ev >= STRONG_EV, LEAN otherwise (edges are +EV by construction).
-    Model pick: the argmax-probability side, tier MODEL, no book/price.
+    Value pick: the best moneyline edge — a sportsbook price beating the
+    sharp fair (compute_edges) — STRONG when Kalshi set the fair, LEAN when
+    Polymarket did; a claimed EV above SUSPECT_EV demotes to LEAN (a huge
+    gap to an exchange is a stale exchange, not a gift).
+    Model pick: the displayed forecast's favourite (the market's where one
+    exists, else the model's), tier MODEL, no book/price.
     """
     game, prediction = card.game, card.prediction
     if game.completed or prediction is None:
         return None
+    side_probs = {
+        "home": prediction.home_win_prob,
+        "away": prediction.away_win_prob,
+        "draw": prediction.draw_prob,
+    }
 
-    # ---- value pick: best moneyline edge across all books -------------------
-    # Edges above MAX_PLAUSIBLE_EV are almost always model artifacts (e.g. a
-    # promoted club priced +900 against fallback probabilities), never real
-    # market inefficiency — treat them as no edge and fall through to MODEL.
+    # ---- value pick: best sharp-fair edge across the sportsbooks ------------
     ml_edges = [
         e for e in card.edges
-        if e.side in _ML_SIDES and e.ev_per_dollar <= MAX_PLAUSIBLE_EV
+        if e.side in _ML_SIDES and e.ev_per_dollar <= MAX_PLAUSIBLE_EV and e.fair_prob is not None
     ] if game.sport.value not in NO_VALUE_SPORTS else []
     if ml_edges:
         best = max(ml_edges, key=lambda e: e.ev_per_dollar)  # first wins ties
+        strong = best.ref_book == "kalshi" and best.ev_per_dollar <= SUSPECT_EV
         return Pick(
             game_id=game.id,
             sport=game.sport.value,
             model=prediction.model,
             side=best.side,
             team=side_name(best.side, card),
-            tier="STRONG" if STRONG_EV <= best.ev_per_dollar <= SUSPECT_EV else "LEAN",
+            tier="STRONG" if strong else "LEAN",
             model_prob=best.model_prob,
             book=best.book,
             price=best.price,
             ev=best.ev_per_dollar,
             kelly=best.kelly_fraction,
+            fair_prob=best.fair_prob,
+            ref_book=best.ref_book,
+            prob=best.fair_prob,
         )
 
-    # ---- model pick: argmax probability, no book attached --------------------
-    probs = [("home", prediction.home_win_prob), ("away", prediction.away_win_prob)]
-    if prediction.draw_prob is not None:
-        probs.append(("draw", prediction.draw_prob))
+    # ---- model pick: the displayed forecast's favourite, no book attached ---
+    forecast = card.forecast
+    if forecast is not None:
+        shown = {"home": forecast.home, "away": forecast.away, "draw": forecast.draw}
+        ref = forecast.source if forecast.kind == "market" else None
+    else:
+        shown = side_probs
+        ref = None
+    probs = [(s, p) for s, p in shown.items() if p is not None]
     side, prob = max(probs, key=lambda sp: sp[1])  # first wins ties
     return Pick(
         game_id=game.id,
@@ -119,7 +159,10 @@ def derive_pick(card: GameCard) -> Optional[Pick]:
         side=side,
         team=side_name(side, card),
         tier="MODEL",
-        model_prob=prob,
+        model_prob=side_probs.get(side) if side_probs.get(side) is not None else prob,
+        fair_prob=prob if ref else None,
+        ref_book=ref,
+        prob=prob,
     )
 
 
@@ -129,41 +172,64 @@ def compute_edges(
     pred: Prediction,
     odds_list: list[MoneylineOdds],
     starts_at: datetime | None = None,
+    fair: FairPrices | None = None,
 ) -> list[Edge]:
-    """Model-vs-market +EV edges for one game, sorted by EV descending.
+    """Sportsbook-vs-sharp-fair edges for one game, sorted by EV descending.
 
     The single edge computation behind both the board (api/main) and the
-    capture job, so picks derived from either path see identical edges: per
-    book, devig the full moneyline market (draw included when both the book
-    and the model price it) and keep every side where the model's probability
-    makes the offered price +EV.
+    capture job. A value edge needs: a SHARP fair (an exchange, not thin —
+    core/fair.py), a pre-game quote from a SPORTSBOOK that prices the full
+    market (an exchange can never beat its own fair), and the fair sitting at
+    least MIN_GAP_PTS above the price's implied probability. EV and Kelly are
+    computed at the fair; the model's own probability rides along as context.
+    When both exchanges quote a two-way market they must agree the price is
+    above fair, else there is no edge (a disagreement is no reference);
+    `agree` is True when a second exchange confirmed, None when only one
+    exchange quoted.
 
-    In-play quotes are dropped (core.schemas.is_in_play): our probabilities
-    are strictly pre-game, so an edge measured against a live price is the
-    scoreboard, not market inefficiency. Pass `starts_at` — the game's
-    kickoff — wherever it is known; a game already under way then yields no
-    value edges at all and falls through to a MODEL pick, which is the honest
-    answer once the price the model was arguing with no longer exists.
+    In-play quotes are dropped (core.schemas.is_in_play): a live price
+    against a pre-game reference is the scoreboard, not inefficiency.
     """
+    if fair is None or not fair.sharp or fair.thin or sport.value in NO_VALUE_SPORTS:
+        return []
+    fair_probs = {"home": fair.home, "away": fair.away, "draw": fair.draw}
+    model_probs = {"home": pred.home_win_prob, "away": pred.away_win_prob, "draw": pred.draw_prob}
+    others = [b for b in fair.sources if b in EXCHANGES and b != fair.source]
     edges: list[Edge] = []
     for ml in odds_list:
-        if ml.home_ml is None or ml.away_ml is None:
+        if ml.book in EXCHANGES or ml.home_ml is None or ml.away_ml is None:
             continue
         if is_in_play(ml, starts_at):
             continue
         prices = [ml.home_ml, ml.away_ml]
-        sides = [("home", pred.home_win_prob), ("away", pred.away_win_prob)]
-        if ml.draw_ml is not None and pred.draw_prob is not None:
+        sides = ["home", "away"]
+        if fair.draw is not None:
+            if ml.draw_ml is None:
+                continue  # a 3-way fair needs a 3-way book price
             prices.append(ml.draw_ml)
-            sides.append(("draw", pred.draw_prob))
-        fair = oddsmath.remove_vig(*prices)
-        for (side, model_prob), price, market_prob in zip(sides, prices, fair):
-            ev = oddsmath.expected_value(model_prob, price)
-            # Implausible EV = model artifact, not market inefficiency — never
-            # display it as an edge anywhere (VALUE board, cards, drawers).
-            # The 1e-9 floor keeps float dust (market-consensus fills devig to
-            # exactly the market) from minting zero-EV edges.
+            sides.append("draw")
+        try:
+            book_fair = oddsmath.remove_vig_power(*prices)
+        except (ValueError, ZeroDivisionError):
+            continue
+        for side, price, book_prob in zip(sides, prices, book_fair):
+            p = fair_probs.get(side)
+            if p is None:
+                continue
+            implied = oddsmath.implied_prob(price)
+            gap = (p - implied) * 100.0
+            if gap < MIN_GAP_PTS:
+                continue
+            ev = oddsmath.expected_value(p, price)
             if ev <= 1e-9 or ev > MAX_PLAUSIBLE_EV:
+                continue
+            agree = True
+            for other in others:
+                other_home = fair.sources[other]
+                other_p = other_home if side == "home" else (1.0 - other_home if fair.draw is None else None)
+                if other_p is not None and other_p <= implied:
+                    agree = False
+            if not agree:
                 continue
             edges.append(
                 Edge(
@@ -172,10 +238,14 @@ def compute_edges(
                     side=side,
                     book=ml.book,
                     price=price,
-                    model_prob=model_prob,
-                    market_prob=market_prob,
+                    model_prob=model_probs.get(side) if model_probs.get(side) is not None else p,
+                    market_prob=book_prob,
                     ev_per_dollar=ev,
-                    kelly_fraction=oddsmath.kelly_fraction(model_prob, price),
+                    kelly_fraction=oddsmath.kelly_fraction(p, price),
+                    fair_prob=p,
+                    ref_book=fair.source,
+                    gap_pts=gap,
+                    agree=True if others else None,
                 )
             )
     edges.sort(key=lambda e: e.ev_per_dollar, reverse=True)

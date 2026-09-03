@@ -2,7 +2,7 @@ import { useMemo, useState, type MouseEvent } from 'react'
 import { Check, FlaskConical, Pin, Plus, RefreshCw, Share2, Target, Wallet, X } from 'lucide-react'
 import type { BoardMap, GameCard, Sport } from '../types'
 import { SPORTS, SPORT_TAG } from '../types'
-import { fmtAmerican, fmtPct } from '../oddsmath'
+import { bookAbbrev, fmtAmerican, fmtPct } from '../oddsmath'
 import { daysFromToday, fmtKick } from '../cardview'
 import { derivePicks, lineShop, type Pick, type PickTier } from '../picks'
 import { bookName } from '../config/referrals'
@@ -233,20 +233,32 @@ function StakeRow({ pick }: { pick: Pick }) {
   )
 }
 
+const refName = (b: string | null): string | null =>
+  b === 'kalshi' ? 'Kalshi' : b === 'polymarket' ? 'Polymarket' : b
+
 /** The one plain-English sentence every card leads with. */
 function PlainSentence({ pick }: { pick: Pick }) {
   if (pick.kind === 'value') {
     return (
       <p className="mt-2 border-t border-white/5 pl-1.5 pt-2 text-sm leading-relaxed text-white/80">
-        We give <span className="font-semibold text-white">{pick.team}</span> a{' '}
-        <span className="font-mono font-semibold text-emerald-300">{pct0(pick.modelProb)}%</span>{' '}
-        chance to win — at{' '}
+        <span className="font-semibold text-white">{refName(pick.refBook) ?? 'The exchange'}</span> prices{' '}
+        <span className="font-semibold text-white">{pick.team}</span> at{' '}
+        <span className="font-mono font-semibold text-emerald-300">{pct0(pick.prob)}%</span> to win — at{' '}
         <span className="font-mono font-semibold text-white">{fmtAmerican(pick.price as number)}</span>{' '}
-        the market only implies{' '}
+        {bookAbbrev(pick.book as string)} only implies{' '}
         <span className="font-mono font-semibold text-krypt-muted">
           {pick.marketProb !== null ? pct0(pick.marketProb) : '—'}%
         </span>
-        .
+        . Our model says {pct0(pick.modelProb)}%.
+      </p>
+    )
+  }
+  if (pick.refBook) {
+    return (
+      <p className="mt-2 border-t border-white/5 pl-1.5 pt-2 text-sm leading-relaxed text-white/80">
+        The market favors <span className="font-semibold text-white">{pick.team}</span> at{' '}
+        <span className="font-mono font-semibold text-emerald-300">{pct0(pick.prob)}%</span> — no sportsbook
+        price beats the exchange fair right now. Our model says {pct0(pick.modelProb)}%.
       </p>
     )
   }
@@ -262,7 +274,7 @@ function PlainSentence({ pick }: { pick: Pick }) {
   return (
     <p className="mt-2 border-t border-white/5 pl-1.5 pt-2 text-sm leading-relaxed text-white/80">
       Our model favors <span className="font-semibold text-white">{pick.team}</span> at{' '}
-      <span className="font-mono font-semibold text-emerald-300">{pct0(pick.modelProb)}%</span> — no
+      <span className="font-mono font-semibold text-emerald-300">{pct0(pick.prob)}%</span> — no
       sportsbook edge right now.
     </p>
   )
@@ -310,7 +322,7 @@ function PickCard({ pick, demo, onOpen }: { pick: Pick; demo: boolean; onOpen: (
           TAKE
         </span>
         <TierBadge tier={pick.tier} />
-        <RiskBadge prob={pick.modelProb} />
+        <RiskBadge prob={pick.prob} />
         <span className="ml-auto rounded border border-white/10 bg-white/5 px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-widest text-krypt-muted">
           {league}
         </span>
@@ -372,7 +384,7 @@ function PickCard({ pick, demo, onOpen }: { pick: Pick; demo: boolean; onOpen: (
         <span className="truncate text-[11px] font-semibold text-krypt-muted" title={contextLabel(pick)}>
           {contextLabel(pick)}
         </span>
-        <ProbBars model={pick.modelProb} market={pick.marketProb} />
+        <ProbBars model={pick.prob} market={pick.marketProb} />
         {value ? (
           <span
             className="ml-auto whitespace-nowrap font-mono text-[10px] font-semibold leading-none text-emerald-300"

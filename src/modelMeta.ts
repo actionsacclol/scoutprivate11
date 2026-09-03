@@ -38,8 +38,8 @@ export const FALLBACK_MODEL_META: Record<Sport, ModelMetaEntry> = {
   nba: { model: 'nba-elo-v1', acc: 67.8, note: 'Elo · MOV + rolling scoring' },
   nhl: { model: 'nhl-elo-v1', acc: 53.6, note: 'Elo + Poisson goals' }, // v2 bump lands on this line
   nfl: { model: 'nfl-xgb-v3', acc: 67.5, note: 'Elo + QB + XGBoost blend' },
-  ncaaf: { model: 'ncaaf-elo-v1', acc: 71.2, note: 'Elo · college tuned' },
-  ncaab: { model: 'ncaab-elo-v1', acc: 72.3, note: 'Elo · college tuned' },
+  ncaaf: { model: 'ncaaf-kalman-v2', acc: 75.9, note: 'Kalman margin filter · blowouts count' },
+  ncaab: { model: 'ncaab-kalman-v2', acc: 72.0, note: 'Kalman margin filter · D1 only' },
   mlb: { model: 'mlb-elo-v3', acc: 55.5, note: 'Elo + pitcher EWMA' },
   wnba: { model: 'wnba-elo-v1', acc: 66.3, note: 'Elo · expansion-aware' },
   soccer: { model: 'soccer-poisson-v2', acc: 48.9, note: 'Dixon-Coles-lite · 3-way' },

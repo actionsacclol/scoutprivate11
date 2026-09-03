@@ -372,8 +372,14 @@ function TotalsSection({ card, demo }: { card: GameCard; demo: boolean }) {
         <span className="text-[10px] font-semibold uppercase tracking-[0.2em] text-white/80">
           Total · O/U {line}
         </span>
+        <span
+          className="text-[9px] uppercase tracking-wider text-white/70"
+          title="Vig-free market probability of the over at this line — the number that has tracked reality. The model total is context."
+        >
+          market {Math.round((totals.find((e) => e.side === 'over')?.market_prob ?? 0.5) * 100)}% over
+        </span>
         <span className="text-[9px] uppercase tracking-wider text-krypt-muted/60">
-          model total {pred.predicted_total.toFixed(1)}
+          model {pred.predicted_total.toFixed(1)} ({Math.round((totals.find((e) => e.side === 'over')?.model_prob ?? 0.5) * 100)}% over)
         </span>
       </div>
       <div className="flex flex-wrap items-center gap-2">
@@ -403,7 +409,7 @@ function TotalsSection({ card, demo }: { card: GameCard; demo: boolean }) {
               title={
                 tracked
                   ? 'Tracked — this bet is on your TRACKER'
-                  : `Track ${e.side.toUpperCase()} ${line} at ${fmtAmerican(e.price)} (${e.book}) — model ${Math.round(e.model_prob * 100)}% to hit`
+                  : `Track ${e.side.toUpperCase()} ${line} at ${fmtAmerican(e.price)} (${e.book}) — market ${Math.round(e.market_prob * 100)}% · model ${Math.round(e.model_prob * 100)}%`
               }
               className={cls(
                 'inline-flex items-center gap-1.5 rounded-lg border px-2.5 py-1.5 text-[10px] font-bold uppercase tracking-widest transition',
@@ -628,8 +634,8 @@ function DrawerBody({ card, demo, onClose }: { card: GameCard; demo: boolean; on
                     </span>
                   ) : (
                     <span className="text-white/80">
-                      Our model favors {pick.team} —{' '}
-                      <span className="font-mono">{Math.round(pick.modelProb * 100)}%</span> to win
+                      {pick.refBook ? 'The market favors' : 'Our model favors'} {pick.team} —{' '}
+                      <span className="font-mono">{Math.round(pick.prob * 100)}%</span> to win
                     </span>
                   )}
                 </span>
@@ -640,13 +646,13 @@ function DrawerBody({ card, demo, onClose }: { card: GameCard; demo: boolean; on
                       TAKE {pick.team} {fmtAmerican(pick.price as number)} @ {bookAbbrev(pick.book as string)}
                       <span
                         className="text-emerald-300/60"
-                        title="EV = expected value: average profit per $1 bet if the model probability is right"
+                        title="EV = expected value: average profit per $1 bet if the exchange's fair probability is right"
                       >
                         {' '}· EV +{fmtPct(pick.ev as number)}%
                       </span>
                       <span
                         className="text-krypt-muted/70"
-                        title="MIN = worst price still worth taking (model fair line)"
+                        title="MIN = worst price still worth taking (the exchange fair line)"
                       >
                         {' '}· MIN {fmtAmerican(pick.minAcceptable)}
                       </span>
@@ -654,7 +660,7 @@ function DrawerBody({ card, demo, onClose }: { card: GameCard; demo: boolean; on
                   ) : (
                     <span className="text-white/80">
                       TAKE {pick.team}
-                      <span className="text-krypt-muted"> · MODEL {fmtPct(pick.modelProb)}%</span>
+                      <span className="text-krypt-muted"> · {pick.refBook ? bookAbbrev(pick.refBook) : 'MODEL'} {fmtPct(pick.prob)}%</span>
                       <span
                         className="text-krypt-muted/70"
                         title="Fair = the model's break-even odds; no book beats it right now"

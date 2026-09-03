@@ -277,11 +277,11 @@ function TopPickHero({
           <p className="mt-3 border-t border-white/5 pt-2.5 text-sm leading-relaxed text-white/80">
             {value ? (
               <>
-                We give <span className="font-semibold text-white">{pick.team}</span> a{' '}
-                <span className="font-mono font-semibold text-emerald-300">{pct0(pick.modelProb)}%</span>{' '}
-                chance to win — at{' '}
+                {pick.refBook === 'kalshi' ? 'Kalshi' : pick.refBook === 'polymarket' ? 'Polymarket' : 'The exchange'} prices{' '}
+                <span className="font-semibold text-white">{pick.team}</span> at{' '}
+                <span className="font-mono font-semibold text-emerald-300">{pct0(pick.prob)}%</span> to win — at{' '}
                 <span className="font-mono font-semibold text-white">{fmtAmerican(pick.price as number)}</span>{' '}
-                the market only implies{' '}
+                the book only implies{' '}
                 <span className="font-mono font-semibold text-krypt-muted">
                   {pick.marketProb !== null ? pct0(pick.marketProb) : '—'}%
                 </span>
@@ -289,8 +289,8 @@ function TopPickHero({
               </>
             ) : (
               <>
-                Our model favors <span className="font-semibold text-white">{pick.team}</span> at{' '}
-                <span className="font-mono font-semibold text-emerald-300">{pct0(pick.modelProb)}%</span> — no
+                {pick.refBook ? 'The market' : 'Our model'} favors <span className="font-semibold text-white">{pick.team}</span> at{' '}
+                <span className="font-mono font-semibold text-emerald-300">{pct0(pick.prob)}%</span> — no
                 sportsbook edge right now.
               </>
             )}
@@ -298,10 +298,12 @@ function TopPickHero({
         ) : (
           <div className="mt-3 flex flex-wrap items-center gap-x-3 gap-y-1 border-t border-white/5 pt-2.5 font-mono text-[10px] leading-none">
             <span>
-              <span className="text-emerald-300">MODEL {fmtPct(pick.modelProb)}%</span>
+              <span className="text-emerald-300">
+                {pick.refBook ? pick.refBook.toUpperCase() : 'MODEL'} {fmtPct(pick.prob)}%
+              </span>
               <span className="text-krypt-muted/40"> vs </span>
               <span className="text-krypt-muted">
-                MARKET {pick.marketProb !== null ? `${fmtPct(pick.marketProb)}%` : '—'}
+                {value ? 'BOOK' : 'MODEL'} {value ? (pick.marketProb !== null ? `${fmtPct(pick.marketProb)}%` : '—') : `${fmtPct(pick.modelProb)}%`}
               </span>
             </span>
             {value ? (

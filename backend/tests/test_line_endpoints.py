@@ -170,6 +170,68 @@ def test_away_side_indexes_correctly():
     assert strong["drift_prob_pts"] < 0
 
 
+def _seed_soccer(conn, *, close_draw):
+    db.upsert_game(
+        conn, game_id="soc-1", sport="soccer", league="EPL", start_time=NOW,
+        home="Arsenal", away="Chelsea", home_score=2, away_score=1, completed=True,
+    )
+    conn.execute(
+        "UPDATE games SET settled_at = ? WHERE game_id = 'soc-1'", (db.iso(NOW),)
+    )
+    conn.execute(
+        """INSERT INTO picks (game_id, sport, model, side, team, book, price, ev,
+                              kelly, tier, created_at, result)
+           VALUES ('soc-1','soccer','m','home','Arsenal','polymarket',150,0.05,
+                   0.02,'STRONG',?, 'W')""",
+        (db.iso(NOW),),
+    )
+    db.upsert_line_endpoints(
+        conn, game_id="soc-1", sport="soccer", book="draftkings", fetched_at=NOW,
+        open_home_ml=130, open_away_ml=200,
+        open_draw_ml=240 if close_draw is not None else None,
+        close_home_ml=120, close_away_ml=210, close_draw_ml=close_draw,
+    )
+    conn.commit()
+
+
+def test_three_way_pick_against_two_way_close_is_unscoreable():
+    """The soccer contamination. A pick priced on a 3-way exchange market
+    devigged against a 2-way DraftKings close (no draw price) read as +36.7%
+    EV at a 99.4% positive rate over 166 live picks and made the overall
+    figure 'significant'. Pure geometry — such a row scores in NO column."""
+    conn = db.connect()
+    _seed_soccer(conn, close_draw=None)
+    conn.close()
+    out = tracker.clv_vs_close()
+    assert out["n_unscoreable"] == 1
+    assert out["overall"]["n"] == 0
+    assert out["by_tier"]["STRONG"]["fair_ev_pct"] is None
+
+
+def test_three_way_pick_scores_against_a_three_way_close():
+    conn = db.connect()
+    _seed_soccer(conn, close_draw=240)
+    conn.close()
+    out = tracker.clv_vs_close()
+    assert out["n_unscoreable"] == 0
+    strong = out["by_tier"]["STRONG"]
+    assert strong["n_cross_venue"] == 1
+    assert strong["fair_ev_pct"] is not None and strong["fair_ev_power_pct"] is not None
+
+
+def test_power_devig_column_is_conservative_on_a_dog():
+    """Same pick, two devigs. Multiplicative devig over-credits an underdog
+    entry; the power column does not, and significance is only ever claimed
+    on the power figure. This is what turned +0.90% into +0.16% on the live
+    ledger (2026-09-02)."""
+    conn = db.connect()
+    _seed(conn, entry_book="polymarket", price=200, side="away")
+    conn.close()
+    strong = tracker.clv_vs_close()["by_tier"]["STRONG"]
+    assert strong["fair_ev_power_pct"] < strong["fair_ev_pct"]
+    assert strong["significant"] is False  # n=1 can never trip it
+
+
 def test_sport_filter_applies():
     conn = db.connect()
     _seed(conn, entry_book="polymarket", price=-110)

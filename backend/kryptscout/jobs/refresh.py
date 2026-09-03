@@ -51,8 +51,10 @@ def load_engines() -> None:
             module = importlib.import_module(f"kryptscout.sports.{name}")
             engines.register(module.build_engine())
         except Exception as exc:  # noqa: BLE001
+            # exc_info: an import that only fails inside a frozen bundle needs
+            # the traceback to be diagnosable from a user's log export.
             logging.getLogger("kryptscout").warning(
-                "engine %s unavailable: %s", name, exc
+                "engine %s unavailable: %s", name, exc, exc_info=True
             )
 
 

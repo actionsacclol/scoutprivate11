@@ -18,3 +18,21 @@ def _licensed(monkeypatch):
     licensing tests explicitly override this to False to exercise the gate."""
     from kryptscout import license
     monkeypatch.setattr(license, "is_licensed", lambda *a, **k: True)
+
+
+@pytest.fixture(autouse=True)
+def _engines_ready():
+    """Every test runs as if the sport engines finished loading.
+
+    api.main loads them on a worker thread and the engine-backed endpoints
+    await that (see main._await_engines). Every API test blanks
+    app.router.on_startup so the real sport modules are never imported — which
+    also means the readiness Event is never set, and each such endpoint would
+    block for ENGINE_WARMUP_TIMEOUT_S instead of answering. Declaring the
+    registry ready here keeps that trap out of every fixture; the warm-up tests
+    clear it explicitly to exercise the wait.
+    """
+    from kryptscout.api import main
+    main._engines_ready.set()
+    yield
+    main._engines_ready.clear()

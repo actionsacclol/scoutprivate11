@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 import math
 from dataclasses import replace
 from datetime import date, datetime, timezone
@@ -10,6 +11,7 @@ import pandas as pd
 import pytest
 
 from kryptscout.core.elo import EloBook
+from kryptscout.core.kalman import KalmanBook
 from kryptscout.core.schemas import Game, Sport
 from kryptscout.sports import ncaab
 from kryptscout.sports.ncaab import (
@@ -75,7 +77,7 @@ def test_replay_moves_ratings_and_tracks_rolling_points():
              "home_score": 68, "away_score": 75},
         ]
     )
-    book, rolling, metrics = _replay(df, min_d1_games=1)
+    book, rolling, metrics, _ = _replay(df, min_d1_games=1)
     assert book.get("Duke Blue Devils") > ELO_CONFIG.initial
     assert book.get("North Carolina Tar Heels") < ELO_CONFIG.initial
     assert list(rolling["Duke Blue Devils"]) == [(80, 70), (75, 68)]
@@ -92,7 +94,7 @@ def test_replay_skips_unplayed_and_non_competition_rows():
             {"home_score": 0, "away_score": 0},  # tied placeholder/forfeit
         ]
     )
-    book, rolling, metrics = _replay(df, min_d1_games=1)
+    book, rolling, metrics, _ = _replay(df, min_d1_games=1)
     assert book.ratings == {}
     assert rolling == {}
     assert metrics == {}
@@ -107,10 +109,10 @@ def test_replay_neutral_site_drops_home_advantage():
     # Home won both: log loss reveals the logged pre-game probability.
     assert neutral["overall"]["log_loss"] == pytest.approx(math.log(2.0))
     assert home_court["overall"]["log_loss"] == pytest.approx(
-        -math.log(_hfa_prob())
+        -math.log(KalmanBook(ncaab.KALMAN_CONFIG).expected("h", "a"))
     )
     # Symmetric neutral update: winner's gain mirrors K * MOV * (1 - 0.5).
-    book, _, _ = _replay(_frame([{"home_score": 80, "away_score": 70,
+    book, _, _, _ = _replay(_frame([{"home_score": 80, "away_score": 70,
                                   "neutral_site": True}]), min_d1_games=1)
     ref = EloBook(config=replace(ELO_CONFIG, home_advantage=0.0))
     ref.update("h", "a", True, margin=10)
@@ -131,7 +133,7 @@ def test_replay_pins_non_d1_guest_flat_and_keeps_it_out_of_the_book():
              "home_score": 60, "away_score": 62},
         ]
     )
-    book, rolling, metrics = _replay(df, min_d1_games=2)
+    book, rolling, metrics, _ = _replay(df, min_d1_games=2)
     assert "Quincy Hawks" not in book.ratings
     assert "Quincy Hawks" not in rolling
     # Duke's first update was computed against a flat-1200 opponent.
@@ -156,7 +158,7 @@ def test_replay_applies_season_carry():
              "home_score": 75, "away_score": 60},
         ]
     )
-    book, _, _ = _replay(df, min_d1_games=1)
+    book, _, _, _ = _replay(df, min_d1_games=1)
     ref = EloBook(config=replace(ELO_CONFIG))
     ref.update("Duke Blue Devils", "North Carolina Tar Heels", True, margin=10)
     expected_duke = ELO_CONFIG.initial + ELO_CONFIG.season_carry * (
@@ -193,7 +195,7 @@ def test_replay_keeps_one_elo_identity_across_a_rebrand():
              "home_score": 72, "away_score": 61},
         ]
     )
-    book, rolling, _ = _replay(df, min_d1_games=1)
+    book, rolling, _, _ = _replay(df, min_d1_games=1)
     assert "IUPUI Jaguars" not in book.ratings  # keyed by the latest name only
     assert book.get("IU Indianapolis Jaguars") > ELO_CONFIG.initial
     assert len(rolling["IU Indianapolis Jaguars"]) == 2
@@ -234,6 +236,7 @@ def _game(home: str, away: str, neutral_site: bool = False) -> Game:
 def test_predict_probabilities_and_totals(tmp_path):
     engine = NcaabEngine(state_path=tmp_path / "ncaab_state.json")
     engine.book.ratings = {"Duke Blue Devils": 1900.0, "Longwood Lancers": 1450.0}
+    engine.kalman.means = {"Duke Blue Devils": 25.0, "Longwood Lancers": -20.0}
     engine.rolling = {
         "Duke Blue Devils": ncaab.deque([(85, 65), (81, 63)], maxlen=10),
         "Longwood Lancers": ncaab.deque([(70, 78), (66, 80)], maxlen=10),
@@ -241,9 +244,9 @@ def test_predict_probabilities_and_totals(tmp_path):
     [pred] = asyncio.run(
         engine.predict([_game("Duke Blue Devils", "Longwood Lancers")])
     )
-    assert pred.model == "ncaab-elo-v1"
+    assert pred.model == "ncaab-kalman-v2"
     assert pred.home_win_prob + pred.away_win_prob == pytest.approx(1.0)
-    assert pred.home_win_prob > 0.9  # 450-point Elo gap plus home court
+    assert pred.home_win_prob > 0.9  # 45-point strength gap plus home court
     # home = (Duke PF 83 + LW PA 79)/2 = 81, away = (LW PF 68 + Duke PA 64)/2 = 66,
     # nudged by 0.5 * (450+90)/100 = 2.7 each way; total unchanged.
     assert pred.predicted_home_score == pytest.approx(83.7)
@@ -255,6 +258,9 @@ def test_predict_probabilities_and_totals(tmp_path):
 def test_predict_neutral_site_drops_home_advantage(tmp_path):
     engine = NcaabEngine(state_path=tmp_path / "ncaab_state.json")
     engine.book.ratings = {"Duke Blue Devils": 1800.0, "Kansas Jayhawks": 1700.0}
+    engine.kalman.means = {"Duke Blue Devils": 10.0, "Kansas Jayhawks": 5.0}
+    for team in ("Duke Blue Devils", "Kansas Jayhawks"):  # scoring history → a total
+        engine.rolling[engine._resolve(team)] = deque([(72.5, 72.5)])
 
     [neutral] = asyncio.run(
         engine.predict([_game("Duke Blue Devils", "Kansas Jayhawks",
@@ -265,9 +271,10 @@ def test_predict_neutral_site_drops_home_advantage(tmp_path):
     )
 
     # Neutral: pure 100-point rating gap. Hosted (regression): +90 HFA on top.
-    no_hfa_prob = 1.0 / (1.0 + 10.0 ** (-100.0 / 400.0))
-    assert neutral.home_win_prob == pytest.approx(no_hfa_prob)
-    assert hosted.home_win_prob == pytest.approx(_hfa_prob(100.0))
+    assert neutral.home_win_prob == pytest.approx(
+        engine.kalman.expected("Duke Blue Devils", "Kansas Jayhawks", neutral=True)
+    )
+    assert hosted.home_win_prob == pytest.approx(engine.kalman.expected("Duke Blue Devils", "Kansas Jayhawks"))
     assert neutral.home_win_prob < hosted.home_win_prob
     assert neutral.home_win_prob + neutral.away_win_prob == pytest.approx(1.0)
     # The score nudge also loses the HFA term on a neutral court, but the
@@ -284,8 +291,8 @@ def test_predict_between_equals_at_neutral_site_is_a_coin_flip(tmp_path):
                               neutral_site=True)])
     )
     assert pred.home_win_prob == pytest.approx(0.5)
-    assert pred.predicted_home_score == pytest.approx(ncaab.LEAGUE_AVG_POINTS)
-    assert pred.predicted_away_score == pytest.approx(ncaab.LEAGUE_AVG_POINTS)
+    assert pred.predicted_home_score is None  # no scoring history: no placeholder total (2026-09-02)
+    assert pred.predicted_away_score is None
 
 
 def test_unknown_teams_rate_flat_1200(tmp_path):
@@ -293,12 +300,14 @@ def test_unknown_teams_rate_flat_1200(tmp_path):
     assert engine._rating("Nobody State Fighting Nobodies") == NON_D1_RATING
     # Two unknowns cancel out: only home court separates them.
     [pred] = asyncio.run(engine.predict([_game("Nobody State A", "Nobody State B")]))
-    assert pred.home_win_prob == pytest.approx(_hfa_prob())
-    assert pred.predicted_total == pytest.approx(2 * ncaab.LEAGUE_AVG_POINTS)
+    assert pred.home_win_prob == pytest.approx(engine.kalman.expected("Nobody State A", "Nobody State B"))
+    assert pred.predicted_total is None  # no scoring history: no placeholder total (2026-09-02)
     # A rated team crushes an unknown guest pinned at 1200.
     engine.book.ratings = {"Kansas Jayhawks": 1900.0}
+    engine.kalman.means = {"Kansas Jayhawks": 30.0}
     [pred] = asyncio.run(engine.predict([_game("Kansas Jayhawks", "Nobody State A")]))
-    assert pred.home_win_prob == pytest.approx(_hfa_prob(700.0))
+    assert pred.home_win_prob == pytest.approx(engine.kalman.expected("Kansas Jayhawks", "Nobody State A"))
+    assert pred.home_win_prob > 0.9
 
 
 def test_predict_alias_follows_post_data_rebrand(tmp_path):
@@ -344,7 +353,7 @@ def test_corrupt_state_is_ignored(tmp_path):
 def test_build_engine_contract():
     engine = build_engine()
     assert engine.sport is Sport.NCAAB
-    assert engine.model_name == "ncaab-elo-v1"
+    assert engine.model_name == "ncaab-kalman-v2"
     assert ELO_CONFIG.k == 30.0
     assert ELO_CONFIG.home_advantage == 90.0
     assert ELO_CONFIG.season_carry == 0.55

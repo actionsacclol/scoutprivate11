@@ -74,10 +74,15 @@ def _prediction(game: Game, home_prob: float = 0.6) -> Prediction:
 
 
 def _edge(game: Game, ev: float = 0.06, price: int = 130) -> Edge:
+    # A Polymarket-priced STRONG pick. compute_edges no longer produces one
+    # (value edges are sportsbook prices beating the exchange fair, 2026-09-02),
+    # but the engine's gates, sizing and fills are exercised on one here; the
+    # engine skips every other book as `not_polymarket_priced`.
     return Edge(
         game_id=game.id, sport=game.sport, side="home", book="polymarket",
         price=price, model_prob=0.55, market_prob=0.5,
         ev_per_dollar=ev, kelly_fraction=0.05,
+        fair_prob=0.56, ref_book="kalshi", gap_pts=5.0, agree=True,
     )
 
 
@@ -407,6 +412,7 @@ def test_game_level_dedupe_holds_within_one_sweep(monkeypatch):
             game_id=g.id, sport=g.sport, side=side, book="polymarket",
             price=130, model_prob=0.55, market_prob=0.5,
             ev_per_dollar=0.06, kelly_fraction=0.05,
+            fair_prob=0.56, ref_book="kalshi", gap_pts=5.0, agree=True,
         )
         return GameCard(game=g, prediction=pred, edges=[edge])
 
@@ -439,6 +445,7 @@ def test_best_edge_ranking_picks_the_sharper_side_of_a_contested_game(monkeypatc
             game_id=g.id, sport=g.sport, side=side, book="polymarket",
             price=price, model_prob=0.55, market_prob=0.5,
             ev_per_dollar=0.06, kelly_fraction=0.05,
+            fair_prob=0.56, ref_book="kalshi", gap_pts=5.0, agree=True,
         )
         return GameCard(game=g, prediction=pred, edges=[edge])
 

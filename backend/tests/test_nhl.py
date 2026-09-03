@@ -332,12 +332,13 @@ class TestPredict:
             assert 0.0 < pred.home_win_prob < 1.0
             assert abs(pred.home_win_prob + pred.away_win_prob - 1.0) < 1e-9
             assert pred.draw_prob is None
-            assert pred.predicted_total > 0
-            assert 0.0 <= pred.over_prob <= 1.0
+            if pred.predicted_total is not None:  # unknown teams carry no total
+                assert pred.predicted_total > 0
+                assert 0.0 <= pred.over_prob <= 1.0
             expected_model = "nhl-elo-v2" if nhl.GOALIE_ADJ_ENABLED else "nhl-elo-v1"
             assert pred.model == expected_model
         assert preds[0].home_win_prob > 0.5  # Bruins dominated the replay
-        assert preds[1].predicted_total == 2 * nhl.LEAGUE_AVG_GOALS
+        assert preds[1].predicted_total is None  # no scoring history: no placeholder total (2026-09-02)
 
     def test_fallback_starter_resolution(self, tmp_path, monkeypatch):
         """Predict prices each team's most recent replay starter; unknown -> 0."""

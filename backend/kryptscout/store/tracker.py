@@ -17,7 +17,8 @@ from typing import Awaitable, Callable, Optional
 
 import httpx
 
-from kryptscout.core.oddsmath import remove_vig
+from kryptscout.core import context as context_mod
+from kryptscout.core.oddsmath import american_to_decimal, remove_vig, remove_vig_power
 from kryptscout.core.schemas import Game, GameCard, Sport
 from kryptscout.datasources import espn
 from kryptscout.store import db, picks as picks_mod
@@ -56,13 +57,14 @@ def record_cards(cards: list[GameCard]) -> dict[str, int]:
                 counts["games"] += 1
                 if card.prediction is not None:
                     p = card.prediction
-                    db.upsert_prediction(
+                    written = db.upsert_prediction(
                         conn, p.game_id, p.sport.value, p.model, p.generated_at,
                         p.home_win_prob, p.away_win_prob, p.draw_prob,
                         p.predicted_home_score, p.predicted_away_score,
-                        p.predicted_total,
+                        p.predicted_total, starts_at=g.start_time,
                     )
-                    counts["predictions"] += 1
+                    if written is not None:  # None = post-kickoff, refused
+                        counts["predictions"] += 1
                 for ml in card.odds:
                     if db.insert_snapshot(
                         conn, g.id, g.sport.value, ml.book, ml.fetched_at,
@@ -76,9 +78,22 @@ def record_cards(cards: list[GameCard]) -> dict[str, int]:
                         conn, pick.game_id, pick.sport, pick.model, pick.side,
                         pick.team, pick.book, pick.price, pick.ev, pick.kelly,
                         pick.tier, g.start_time, now, model_prob=pick.model_prob,
+                        fair_prob=pick.fair_prob,
                     )
                     if written is not None:  # None = frozen, left untouched
                         counts["picks"] += 1
+                # Model-free signals ride along: the exchange-lead reference
+                # (scored by lean_clv) and any true-arb sighting. Keys only
+                # appear when something was written.
+                if card.lean is not None:
+                    if db.upsert_lean(conn, card.lean, g.start_time, now) is not None:
+                        counts["leans"] = counts.get("leans", 0) + 1
+                if card.arb is not None and db.insert_arb_sighting(conn, card.arb, now):
+                    counts["arbs"] = counts.get("arbs", 0) + 1
+            # Schedule-shaped context (rest days) for every game just recorded.
+            written = context_mod.record_rest(conn, cards, now)
+            if written:
+                counts["context"] = written
     finally:
         conn.close()
     return counts
@@ -492,9 +507,14 @@ def performance(
             FROM games g
             JOIN predictions p ON p.game_id = g.game_id
             WHERE g.settled_at IS NOT NULL AND g.completed = 1
+              -- Strictly pre-game rows only: legacy rows written after
+              -- kickoff (see db.upsert_prediction) would score the model on
+              -- games it had partly seen.
+              AND julianday(p.generated_at) < julianday(g.start_time)
               AND p.generated_at = (
                     SELECT MAX(p2.generated_at) FROM predictions p2
                     WHERE p2.game_id = p.game_id AND p2.model = p.model
+                      AND julianday(p2.generated_at) < julianday(g.start_time)
               )
               {where}
             ORDER BY g.start_time
@@ -598,9 +618,14 @@ def clv(sport: Sport | None = None, since: date | None = None) -> dict:
             FROM games g
             JOIN predictions p ON p.game_id = g.game_id
             WHERE g.settled_at IS NOT NULL AND g.completed = 1
+              -- Strictly pre-game rows only: legacy rows written after
+              -- kickoff (see db.upsert_prediction) would score the model on
+              -- games it had partly seen.
+              AND julianday(p.generated_at) < julianday(g.start_time)
               AND p.generated_at = (
                     SELECT MAX(p2.generated_at) FROM predictions p2
                     WHERE p2.game_id = p.game_id AND p2.model = p.model
+                      AND julianday(p2.generated_at) < julianday(g.start_time)
               )
               {where}
             ORDER BY g.start_time
@@ -873,7 +898,15 @@ def clv_vs_close(sport: Sport | None = None, since: date | None = None) -> dict:
         recs = db.rows(
             conn,
             f"""
-            SELECT k.tier, k.side, k.price, k.result, k.book AS entry_book, e.*
+            SELECT k.tier, k.result, k.sport AS pick_sport,
+                   -- Score the FIRST-SIGHT entry when the store kept it
+                   -- (db.upsert_pick); legacy rows fall back to the locked
+                   -- price, which is the venue's last pre-game quote.
+                   COALESCE(k.entry_side, k.side) AS side,
+                   COALESCE(k.entry_price, k.price) AS price,
+                   COALESCE(k.entry_book, k.book) AS entry_book,
+                   (k.entry_price IS NOT NULL) AS has_entry,
+                   e.*
             FROM picks k
             JOIN games g ON g.game_id = k.game_id
             JOIN line_endpoints e ON e.game_id = k.game_id
@@ -886,44 +919,58 @@ def clv_vs_close(sport: Sport | None = None, since: date | None = None) -> dict:
         conn.close()
 
     buckets: dict[str, list[dict]] = defaultdict(list)
+    unscoreable = 0
+    entry_recorded = 0
     for rec in recs:
+        entry_recorded += int(bool(rec["has_entry"]))
         open_col, close_col = _SIDE_COLUMNS[rec["side"]]
         open_ml, close_ml = rec[open_col], rec[close_col]
-        if close_ml is None:
-            continue
-        # Devigged drift needs the whole market at both ends; a two-way book
-        # missing one side can still price the pick, so guard per endpoint.
+        # The close must carry the SAME market the pick was priced on. A
+        # soccer pick is a 3-way price (home/draw/away); ESPN's DraftKings
+        # soccer close is 2-way (no draw). Devigging two sides against a
+        # price set for three read as +36.7% "EV" at a 99.4% positive rate
+        # over 166 picks (2026-09-02) and made the overall figure
+        # "significant". Such a row cannot be scored in any column.
+        sides_needed = _MARKET_SIDES.get(rec["pick_sport"], 2)
         opens = [p for p in (rec["open_home_ml"], rec["open_away_ml"],
                              rec["open_draw_ml"]) if p is not None]
         closes = [p for p in (rec["close_home_ml"], rec["close_away_ml"],
                               rec["close_draw_ml"]) if p is not None]
-        p_close_fair = None
-        if len(closes) >= 2:
-            try:
-                p_close_fair = remove_vig(*closes)[_side_index(rec, close_col)]
-            except (ValueError, ZeroDivisionError, IndexError):
-                p_close_fair = None
+        if close_ml is None or len(closes) != sides_needed:
+            unscoreable += 1
+            continue
+        try:
+            idx = _side_index(rec, close_col)
+            p_close_fair = remove_vig(*closes)[idx]
+            p_close_power = remove_vig_power(*closes)[idx]
+        except (ValueError, ZeroDivisionError, IndexError):
+            unscoreable += 1
+            continue
         drift = None
-        if open_ml is not None and len(opens) >= 2 and p_close_fair is not None:
+        if open_ml is not None and len(opens) == sides_needed:
             try:
                 p_open = remove_vig(*opens)[_side_index(rec, open_col)]
                 drift = (p_close_fair - p_open) * 100.0
             except (ValueError, ZeroDivisionError, IndexError):
                 drift = None
 
-        price_clv = fair_ev = None
+        price_clv = fair_ev = fair_ev_power = None
         if rec["price"] is not None:
             if rec["entry_book"] == rec["book"]:
                 # Same book both ends: vig cancels, this is real price improvement.
                 price_clv = (_decimal(rec["price"]) / _decimal(close_ml) - 1.0) * 100.0
-            elif p_close_fair is not None:
+            else:
                 # Different venues: the closing book's vig has to come out or
-                # the exchange wins by construction. See the docstring.
+                # the exchange wins by construction. See the docstring. Both
+                # devig methods are reported — they disagree exactly where it
+                # matters (underdogs), and the power figure is the honest one.
                 q_entry = 1.0 / _decimal(rec["price"])
                 if q_entry > _EPS:
                     fair_ev = (p_close_fair / q_entry - 1.0) * 100.0
+                    fair_ev_power = (p_close_power / q_entry - 1.0) * 100.0
         buckets[rec["tier"]].append({
-            "price_clv": price_clv, "fair_ev": fair_ev, "drift": drift,
+            "price_clv": price_clv, "fair_ev": fair_ev,
+            "fair_ev_power": fair_ev_power, "drift": drift,
             "result": rec["result"],
             "cross_venue": rec["price"] is not None and rec["entry_book"] != rec["book"],
         })
@@ -942,10 +989,12 @@ def clv_vs_close(sport: Sport | None = None, since: date | None = None) -> dict:
     def summarize(items: list[dict]) -> dict:
         priced = [x["price_clv"] for x in items if x["price_clv"] is not None]
         fair = [x["fair_ev"] for x in items if x["fair_ev"] is not None]
+        power = [x["fair_ev_power"] for x in items if x["fair_ev_power"] is not None]
         drifts = [x["drift"] for x in items if x["drift"] is not None]
         decided = [x for x in items if x["result"] in ("W", "L")]
         clv_mean, clv_se, clv_sig = _stats(priced)
-        fair_mean, fair_se, fair_sig = _stats(fair)
+        fair_mean, fair_se, _ = _stats(fair)
+        power_mean, power_se, power_sig = _stats(power)
         return {
             "n": len(items),
             "n_same_book": len(priced),
@@ -960,25 +1009,466 @@ def clv_vs_close(sport: Sport | None = None, since: date | None = None) -> dict:
             "positive_ev_rate": (
                 sum(1 for f in fair if f > 0) / len(fair) if fair else None
             ),
+            # Same picks, power devig. Multiplicative devig over-credits
+            # underdogs, so this is the figure to believe when the two differ.
+            "fair_ev_power_pct": power_mean,
+            "fair_ev_power_se": power_se,
+            "positive_ev_power_rate": (
+                sum(1 for f in power if f > 0) / len(power) if power else None
+            ),
             "drift_prob_pts": _mean(drifts) if drifts else None,
             "win_rate": (
                 sum(1 for x in decided if x["result"] == "W") / len(decided)
                 if decided else None
             ),
-            "significant": bool(clv_sig or fair_sig),
+            # Significance is only ever claimed on the conservative devig.
+            "significant": bool(clv_sig or power_sig),
         }
 
     everything = [x for items in buckets.values() for x in items]
     return {
         "by_tier": {t: summarize(buckets.get(t, [])) for t in ("STRONG", "LEAN", "MODEL")},
         "overall": summarize(everything),
+        "n_unscoreable": unscoreable,
+        # Rows scored at their first-sight entry price rather than the locked
+        # (last pre-game) price. Legacy rows are close-vs-close comparisons.
+        "n_entry_recorded": entry_recorded,
         "note": (
             "price_clv_pct compares entry to the SAME book's close (vig "
             "cancels). fair_ev_pct is for picks whose entry venue differs from "
             "the closing book — exchange prices beat a sportsbook's close by "
-            "construction, so that column devigs the close first. Never read "
-            "the two as one number. Needs ~30+ per tier before 'significant' "
-            "can trip; run `python -m kryptscout.jobs.lines` for more games."
+            "construction, so that column devigs the close first. "
+            "fair_ev_power_pct is the same comparison under power devig, which "
+            "does not over-credit underdogs; trust it over fair_ev_pct when "
+            "they disagree. Never read the columns as one number. Picks whose "
+            "close does not carry their full market (3-way soccer vs a 2-way "
+            "close) are counted in n_unscoreable and excluded everywhere. "
+            "Needs ~30+ per tier before 'significant' can trip; run "
+            "`python -m kryptscout.jobs.lines` for more games."
+        ),
+    }
+
+
+# Sides the pick's own market carries. Anything not listed is a two-way
+# moneyline; soccer picks are priced on a 3-way market and need a 3-way close.
+_MARKET_SIDES = {"soccer": 3}
+
+
+def _score_home(p: float, home_won: bool) -> dict:
+    q = min(1.0 - 1e-9, max(1e-9, p))
+    y = 1.0 if home_won else 0.0
+    return {
+        "log_loss": -math.log(q if home_won else 1.0 - q),
+        "brier": (q - y) ** 2,
+        "correct": 1.0 if (q >= 0.5) == home_won else 0.0,
+    }
+
+
+def _summ(items: list[dict]) -> Optional[dict]:
+    if not items:
+        return None
+    return {
+        "n": len(items),
+        "log_loss": _mean(x["log_loss"] for x in items),
+        "brier": _mean(x["brier"] for x in items),
+        "accuracy": _mean(x["correct"] for x in items),
+    }
+
+
+def context_trackers(min_umpire_n: int = 10) -> dict:
+    """Score the schedule-shaped trackers against the market.
+
+    soccer_rest   completed soccer games where exactly one side was on short
+                  rest (core.context.short_rest_side), scored as a bet on
+                  that side at the last pre-game 3-way reference (Polymarket
+                  first, else any book quoting a draw): win rate, flat ROI,
+                  and the residual = outcome − reference probability. The
+                  cell that measured +7 to +11 pts vs Pinnacle; it needs
+                  n≈300 before it means anything here.
+    mlb_umpires   actual total − the last pre-game DraftKings total, by
+                  home-plate umpire (n ≥ 10 listed), plus how many hours
+                  before first pitch the umpire and the lineups first
+                  appeared.
+    nba_referees  placeholder until a verified feed exists.
+    """
+    conn = db.connect()
+    try:
+        soccer = db.rows(
+            conn,
+            """
+            SELECT g.game_id, g.start_time, g.home_score, g.away_score,
+                   c.rest_home_days, c.rest_away_days,
+                   (SELECT s.home_ml FROM odds_snapshots s WHERE s.game_id = g.game_id AND s.draw_ml IS NOT NULL
+                      AND s.home_ml IS NOT NULL AND s.away_ml IS NOT NULL
+                      AND julianday(s.fetched_at) < julianday(g.start_time)
+                    ORDER BY (s.book = 'polymarket') DESC, s.fetched_at DESC LIMIT 1) AS ref_home,
+                   (SELECT s.away_ml FROM odds_snapshots s WHERE s.game_id = g.game_id AND s.draw_ml IS NOT NULL
+                      AND s.home_ml IS NOT NULL AND s.away_ml IS NOT NULL
+                      AND julianday(s.fetched_at) < julianday(g.start_time)
+                    ORDER BY (s.book = 'polymarket') DESC, s.fetched_at DESC LIMIT 1) AS ref_away,
+                   (SELECT s.draw_ml FROM odds_snapshots s WHERE s.game_id = g.game_id AND s.draw_ml IS NOT NULL
+                      AND s.home_ml IS NOT NULL AND s.away_ml IS NOT NULL
+                      AND julianday(s.fetched_at) < julianday(g.start_time)
+                    ORDER BY (s.book = 'polymarket') DESC, s.fetched_at DESC LIMIT 1) AS ref_draw,
+                   (SELECT s.book FROM odds_snapshots s WHERE s.game_id = g.game_id AND s.draw_ml IS NOT NULL
+                      AND s.home_ml IS NOT NULL AND s.away_ml IS NOT NULL
+                      AND julianday(s.fetched_at) < julianday(g.start_time)
+                    ORDER BY (s.book = 'polymarket') DESC, s.fetched_at DESC LIMIT 1) AS ref_book
+            FROM games g JOIN game_context c ON c.game_id = g.game_id
+            WHERE g.sport = 'soccer' AND g.completed = 1
+              AND g.home_score IS NOT NULL AND g.away_score IS NOT NULL
+              AND c.rest_home_days IS NOT NULL AND c.rest_away_days IS NOT NULL
+            """,
+        )
+        mlb = db.rows(
+            conn,
+            """
+            SELECT g.game_id, g.start_time, g.home_score, g.away_score,
+                   c.umpire_name, c.umpire_seen_at, c.lineups_seen_at,
+                   (SELECT s.total_line FROM odds_snapshots s WHERE s.game_id = g.game_id
+                      AND s.book = 'draftkings' AND s.total_line IS NOT NULL
+                      AND julianday(s.fetched_at) < julianday(g.start_time)
+                    ORDER BY s.fetched_at DESC LIMIT 1) AS close_total
+            FROM games g JOIN game_context c ON c.game_id = g.game_id
+            WHERE g.sport = 'mlb' AND g.completed = 1
+              AND g.home_score IS NOT NULL AND g.away_score IS NOT NULL
+              AND c.umpire_name IS NOT NULL
+            """,
+        )
+    finally:
+        conn.close()
+
+    # ---- soccer short rest
+    units: list[float] = []
+    residuals: list[float] = []
+    wins = 0
+    for rec in soccer:
+        side = context_mod.short_rest_side(rec["rest_home_days"], rec["rest_away_days"])
+        if side is None or rec["ref_home"] is None or rec["ref_away"] is None or rec["ref_draw"] is None:
+            continue
+        prices = [rec["ref_home"], rec["ref_away"], rec["ref_draw"]]
+        try:
+            fair = remove_vig(*prices) if rec["ref_book"] in ("polymarket", "kalshi") else remove_vig_power(*prices)
+        except (ValueError, ZeroDivisionError):
+            continue
+        idx = 0 if side == "home" else 1
+        won = (rec["home_score"] > rec["away_score"]) if side == "home" else (rec["away_score"] > rec["home_score"])
+        wins += int(won)
+        units.append((american_to_decimal(prices[idx]) - 1.0) if won else -1.0)
+        residuals.append((1.0 if won else 0.0) - fair[idx])
+    n = len(units)
+    res_mean = _mean(residuals) if residuals else None
+    res_se = None
+    if n >= 2:
+        var = sum((v - res_mean) ** 2 for v in residuals) / (n - 1)
+        res_se = (var ** 0.5) / (n ** 0.5)
+    soccer_out = {
+        "n": n,
+        "win_rate": (wins / n) if n else None,
+        "roi_pct": (sum(units) / n * 100.0) if n else None,
+        "residual_pts": (res_mean * 100.0) if res_mean is not None else None,
+        "residual_se": (res_se * 100.0) if res_se is not None else None,
+        "significant": bool(n >= 30 and res_se and abs(res_mean / res_se) >= 2.0),
+        "target_n": 300,
+    }
+
+    # ---- MLB umpires + posting timing
+    by_ump: dict[str, list[float]] = defaultdict(list)
+    all_res: list[float] = []
+    ump_leads: list[float] = []
+    lineup_leads: list[float] = []
+    for rec in mlb:
+        start = datetime.fromisoformat(rec["start_time"])
+        for key, sink in (("umpire_seen_at", ump_leads), ("lineups_seen_at", lineup_leads)):
+            if rec[key]:
+                seen = datetime.fromisoformat(rec[key])
+                if seen.tzinfo is None:
+                    seen = seen.replace(tzinfo=timezone.utc)
+                if start.tzinfo is None:
+                    start = start.replace(tzinfo=timezone.utc)
+                sink.append((start - seen).total_seconds() / 3600.0)
+        if rec["close_total"] is None:
+            continue
+        residual = (rec["home_score"] + rec["away_score"]) - float(rec["close_total"])
+        by_ump[rec["umpire_name"]].append(residual)
+        all_res.append(residual)
+
+    def _median(xs: list[float]) -> Optional[float]:
+        if not xs:
+            return None
+        s = sorted(xs)
+        mid = len(s) // 2
+        return s[mid] if len(s) % 2 else (s[mid - 1] + s[mid]) / 2.0
+
+    umpires = []
+    for name, vals in by_ump.items():
+        if len(vals) < min_umpire_n:
+            continue
+        m = _mean(vals)
+        se = ((sum((v - m) ** 2 for v in vals) / (len(vals) - 1)) ** 0.5 / len(vals) ** 0.5) if len(vals) > 1 else None
+        umpires.append({"umpire": name, "n": len(vals), "residual_runs": m, "residual_se": se})
+    umpires.sort(key=lambda u: -abs(u["residual_runs"]))
+    mlb_out = {
+        "n": len(all_res),
+        "residual_runs": _mean(all_res) if all_res else None,
+        "by_umpire": umpires,
+        "umpire_lead_hours_median": _median(ump_leads),
+        "lineups_lead_hours_median": _median(lineup_leads),
+    }
+    return {
+        "soccer_rest": soccer_out,
+        "mlb_umpires": mlb_out,
+        "nba_referees": {"n": 0, "note": "No verified referee-assignment feed yet; the column exists, capture starts with the season."},
+        "note": (
+            "Schedule-shaped trackers scored against the market, never modelled. "
+            "soccer_rest bets the short-rest side at the last pre-game 3-way reference; "
+            "mlb_umpires is the actual total minus the last pre-game DraftKings total by "
+            "home-plate umpire (n >= 10 listed). Expected forecast gain: zero; the soccer "
+            "cell is the one large effect found and needs ~300 games to confirm or retire."
+        ),
+    }
+
+
+def espn_benchmark(sport: Sport | None = None, since: date | None = None) -> dict:
+    """Scout's pre-game forecast vs ESPN's predictor vs the market, same games.
+
+    Rows: decided completed games with a PRE-GAME ESPN document. Scout's
+    number is the last pre-game `predictions` row, falling back to the
+    recorded pick's model probability (the picks table was clean when the
+    predictions table was not). The exchange is the last pre-game Kalshi or
+    Polymarket quote; the close is DraftKings' declared close, power-devigged.
+    Each source is scored on the games where it exists, and ESPN vs Scout
+    head-to-head only where both do. Measured 2026-09-02: MLB level (Scout
+    0.6711 vs ESPN 0.6748), WNBA behind (0.5250 vs 0.4996); nothing beats
+    the close.
+    """
+    clauses, params = [], []
+    if sport is not None:
+        clauses.append("AND g.sport = ?")
+        params.append(sport.value)
+    if since is not None:
+        clauses.append("AND date(g.start_time) >= ?")
+        params.append(since.isoformat())
+    conn = db.connect()
+    try:
+        recs = db.rows(
+            conn,
+            f"""
+            SELECT g.game_id, g.sport, g.home_score, g.away_score, e.home_prob AS espn,
+                   (SELECT p.home_win_prob FROM predictions p
+                     WHERE p.game_id = g.game_id
+                       AND julianday(p.generated_at) < julianday(g.start_time)
+                     ORDER BY p.generated_at DESC LIMIT 1) AS scout_pred,
+                   (SELECT CASE k.side WHEN 'home' THEN k.model_prob WHEN 'away' THEN 1.0 - k.model_prob END
+                      FROM picks k WHERE k.game_id = g.game_id AND k.model != 'market-consensus'
+                       AND k.model_prob IS NOT NULL
+                       AND julianday(k.created_at) < julianday(g.start_time)
+                     ORDER BY k.created_at LIMIT 1) AS scout_pick,
+                   le.close_home_ml, le.close_away_ml,
+                   (SELECT s.home_ml FROM odds_snapshots s
+                     WHERE s.game_id = g.game_id AND s.book IN ('kalshi', 'polymarket')
+                       AND s.home_ml IS NOT NULL AND s.away_ml IS NOT NULL
+                       AND julianday(s.fetched_at) < julianday(g.start_time)
+                     ORDER BY s.fetched_at DESC LIMIT 1) AS ex_home,
+                   (SELECT s.away_ml FROM odds_snapshots s
+                     WHERE s.game_id = g.game_id AND s.book IN ('kalshi', 'polymarket')
+                       AND s.home_ml IS NOT NULL AND s.away_ml IS NOT NULL
+                       AND julianday(s.fetched_at) < julianday(g.start_time)
+                     ORDER BY s.fetched_at DESC LIMIT 1) AS ex_away
+            FROM games g
+            JOIN espn_predictions e ON e.game_id = g.game_id AND e.pre_game = 1
+            LEFT JOIN line_endpoints le ON le.game_id = g.game_id AND le.book = 'draftkings'
+            WHERE g.completed = 1 AND g.home_score IS NOT NULL AND g.away_score IS NOT NULL
+              AND g.home_score != g.away_score
+              {' '.join(clauses)}
+            """,
+            tuple(params),
+        )
+    finally:
+        conn.close()
+
+    # Every comparison is PAIRED: a comparator is scored only on the games it
+    # shares with ESPN, and ESPN is re-scored on exactly those games. Scoring
+    # each source on its own subset makes the columns incomparable — the
+    # first cut of this table had Scout "beating" the close on 184 easy
+    # games while the close was scored on 444.
+    by_sport: dict[str, dict[str, list]] = defaultdict(lambda: defaultdict(list))
+    for rec in recs:
+        home_won = rec["home_score"] > rec["away_score"]
+        bucket = by_sport[rec["sport"]]
+        espn = _score_home(rec["espn"], home_won)
+        bucket["espn"].append(espn)
+        scout = rec["scout_pred"] if rec["scout_pred"] is not None else rec["scout_pick"]
+        if scout is not None:
+            bucket["scout"].append((espn, _score_home(scout, home_won)))
+        if rec["close_home_ml"] is not None and rec["close_away_ml"] is not None:
+            try:
+                p_close = remove_vig_power(rec["close_home_ml"], rec["close_away_ml"])[0]
+                bucket["close"].append((espn, _score_home(p_close, home_won)))
+            except (ValueError, ZeroDivisionError):
+                pass
+        if rec["ex_home"] is not None and rec["ex_away"] is not None:
+            try:
+                p_ex = remove_vig(rec["ex_home"], rec["ex_away"])[0]
+                bucket["exchange"].append((espn, _score_home(p_ex, home_won)))
+            except (ValueError, ZeroDivisionError):
+                pass
+
+    def paired(pairs: list[tuple[dict, dict]]) -> Optional[dict]:
+        if not pairs:
+            return None
+        return {
+            "n": len(pairs),
+            "log_loss": _mean(x["log_loss"] for _, x in pairs),
+            "espn_log_loss": _mean(e["log_loss"] for e, _ in pairs),
+            "brier": _mean(x["brier"] for _, x in pairs),
+            "accuracy": _mean(x["correct"] for _, x in pairs),
+            "espn_accuracy": _mean(e["correct"] for e, _ in pairs),
+            # Share of common games where the comparator's log loss beat ESPN's.
+            "beats_espn": sum(1 for e, x in pairs if x["log_loss"] < e["log_loss"]) / len(pairs),
+        }
+
+    def row(key: str, bucket: dict[str, list]) -> dict:
+        return {
+            "sport": key,
+            "n": len(bucket["espn"]),
+            "espn": _summ(bucket["espn"]),
+            "scout": paired(bucket["scout"]),
+            "exchange": paired(bucket["exchange"]),
+            "close": paired(bucket["close"]),
+        }
+
+    everything: dict[str, list] = defaultdict(list)
+    for bucket in by_sport.values():
+        for key, items in bucket.items():
+            everything[key].extend(items)
+    return {
+        "overall": row("all", everything),
+        "by_sport": [row(k, v) for k, v in sorted(by_sport.items())],
+        "note": (
+            "Log loss (lower is better). Each comparator — Scout's pre-game "
+            "forecast, the last pre-game exchange quote, DraftKings' devigged "
+            "close — is scored on the games it shares with ESPN, and ESPN is "
+            "re-scored on exactly those games, so every pair is like for like. "
+            "ESPN documents modified after kickoff are excluded. Run "
+            "`python -m kryptscout.jobs.predictor` to backfill history."
+        ),
+    }
+
+
+def lean_clv(sport: Sport | None = None, since: date | None = None) -> dict:
+    """Did the exchange-lead reference beat DraftKings' own close?
+
+    Scores every frozen lean (store.lean_signals) at its FIRST-SIGHT entry
+    against the same book's declared close from `line_endpoints` — same
+    book both ends, so the vig cancels and neither the venue nor the devig
+    confound applies. Three numbers per group:
+
+      clv_pct   (dec_entry / dec_close − 1) × 100 on the lean side. The
+                measurement that justified the signal was +1.05% ± 0.30.
+      hit_rate  share of lines that moved TOWARD the lean side by the close
+                (power-devigged), over lines that moved at all. 64% measured;
+                the naive "favourite shortens" rule gets 57%.
+      roi_pct   flat 1u at the entry price, for context only — at ~1% CLV
+                against a ~2.2% per-side vig it is expected to sit at zero.
+
+    Significance needs n ≥ 30 and |mean/se| ≥ 2 on clv_pct; the bar for
+    feeding this into anything that bets is n ≥ 70 AND clv above the vig.
+    """
+    clauses, params = [], []
+    if sport is not None:
+        clauses.append("AND l.sport = ?")
+        params.append(sport.value)
+    if since is not None:
+        clauses.append("AND date(g.start_time) >= ?")
+        params.append(since.isoformat())
+    conn = db.connect()
+    try:
+        recs = db.rows(
+            conn,
+            f"""
+            SELECT l.game_id, l.sport, l.entry_side AS side, l.entry_home_ml,
+                   l.entry_away_ml, l.entry_ref_book AS ref_book, l.entry_gap_pts,
+                   l.entry_at, g.start_time, g.home_score, g.away_score,
+                   e.close_home_ml, e.close_away_ml
+            FROM lean_signals l
+            JOIN games g ON g.game_id = l.game_id
+            JOIN line_endpoints e ON e.game_id = l.game_id AND e.book = l.book
+            WHERE g.completed = 1
+              AND e.close_home_ml IS NOT NULL AND e.close_away_ml IS NOT NULL
+              AND julianday(l.entry_at) < julianday(g.start_time)
+              {' '.join(clauses)}
+            ORDER BY g.start_time
+            """,
+            tuple(params),
+        )
+    finally:
+        conn.close()
+
+    scored: list[dict] = []
+    for rec in recs:
+        idx = 0 if rec["side"] == "home" else 1
+        entry_pair = (rec["entry_home_ml"], rec["entry_away_ml"])
+        close_pair = (rec["close_home_ml"], rec["close_away_ml"])
+        try:
+            p_entry = remove_vig_power(*entry_pair)[idx]
+            p_close = remove_vig_power(*close_pair)[idx]
+        except (ValueError, ZeroDivisionError):
+            continue
+        entry_price, close_price = entry_pair[idx], close_pair[idx]
+        clv = (_decimal(entry_price) / _decimal(close_price) - 1.0) * 100.0
+        moved = abs(p_close - p_entry) > 1e-9
+        won = None
+        if rec["home_score"] is not None and rec["away_score"] is not None:
+            if rec["home_score"] != rec["away_score"]:
+                won = (rec["home_score"] > rec["away_score"]) == (rec["side"] == "home")
+        units = None
+        if won is not None:
+            units = (_decimal(entry_price) - 1.0) if won else -1.0
+        scored.append({
+            "sport": rec["sport"], "ref_book": rec["ref_book"], "clv": clv,
+            "moved": moved, "toward": moved and p_close > p_entry,
+            "units": units,
+        })
+
+    def summarize(items: list[dict]) -> dict:
+        clvs = [x["clv"] for x in items]
+        moved = [x for x in items if x["moved"]]
+        staked = [x["units"] for x in items if x["units"] is not None]
+        mean = _mean(clvs) if clvs else None
+        se = None
+        if len(clvs) >= 2:
+            var = sum((v - mean) ** 2 for v in clvs) / (len(clvs) - 1)
+            se = (var ** 0.5) / (len(clvs) ** 0.5)
+        return {
+            "n": len(items),
+            "clv_pct": mean,
+            "clv_se": se,
+            "beat_close_rate": (sum(1 for v in clvs if v > 0) / len(clvs)) if clvs else None,
+            "n_moved": len(moved),
+            "hit_rate": (sum(1 for x in moved if x["toward"]) / len(moved)) if moved else None,
+            "roi_pct": (sum(staked) / len(staked) * 100.0) if staked else None,
+            "significant": bool(
+                len(clvs) >= 30 and se and abs(mean / se) >= 2.0
+            ),
+        }
+
+    by_sport: dict[str, list[dict]] = defaultdict(list)
+    by_ref: dict[str, list[dict]] = defaultdict(list)
+    for x in scored:
+        by_sport[x["sport"]].append(x)
+        by_ref[x["ref_book"]].append(x)
+    return {
+        "overall": summarize(scored),
+        "by_sport": [{"sport": k, **summarize(v)} for k, v in sorted(by_sport.items())],
+        "by_reference": [{"ref_book": k, **summarize(v)} for k, v in sorted(by_ref.items())],
+        "note": (
+            "Same-book closing-line value of the exchange-lead reference: the "
+            "DraftKings price at first sight vs DraftKings' declared close on "
+            "the side Kalshi/Polymarket favoured. +1.05% ± 0.30 and a 64% "
+            "direction hit rate justified recording it (2026-09-02); that is "
+            "under the book's vig, so roi_pct is expected near zero. Not a "
+            "pick. Run `python -m kryptscout.jobs.lines` to score more games."
         ),
     }
 

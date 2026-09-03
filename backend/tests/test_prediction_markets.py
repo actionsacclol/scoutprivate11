@@ -56,6 +56,18 @@ def _clear_caches():
 # Polymarket
 # ---------------------------------------------------------------------------
 
+@pytest.fixture(autouse=True)
+def _no_live_books(monkeypatch):
+    """Depth is best-effort and fetched per matched market; tests never hit
+    the CLOB or Kalshi order-book endpoints unless they patch these back."""
+    async def none(_id):
+        return None
+    monkeypatch.setattr(polymarket, "_fetch_book", none)
+    monkeypatch.setattr(kalshi, "_fetch_orderbook", none)
+    polymarket._book_cache.clear()
+    kalshi._book_cache.clear()
+
+
 def _pm_event(slug, outcomes, prices, bid, ask, start, **market_extra):
     """Shape observed on GET /events?tag_slug=mlb&closed=false."""
     market = {
@@ -89,7 +101,8 @@ PM_TOR_SD = _pm_event(
 def test_polymarket_parses_real_shaped_event():
     [cand] = polymarket.parse_events([PM_TOR_SD])
     assert cand.outcomes == ["Toronto Blue Jays", "San Diego Padres"]
-    assert cand.prob0 == pytest.approx(0.485)  # mid of 0.48/0.49
+    assert cand.prob0 == pytest.approx(0.49)  # the ASK: what a buyer pays
+    assert cand.prob1 == pytest.approx(0.52)  # 1 - bid: buying the other side
     assert cand.start == datetime(2026, 7, 12, 1, 40, tzinfo=timezone.utc)
 
 
@@ -107,9 +120,11 @@ def test_polymarket_string_prices_and_conversion():
     odds = polymarket.match_game(TOR_SD, polymarket.parse_events([PM_TOR_SD]), NOW)
     assert odds is not None
     assert odds.book == "polymarket"
-    # Toronto (outcome 0) is the away team: p=0.485 -> +106; home 0.515 -> -106
-    assert odds.away_ml == 106
-    assert odds.home_ml == -106
+    # Toronto (outcome 0) is the away team, bought at its ASK 0.49 -> +104;
+    # San Diego is bought at 1 - Toronto's bid = 0.52 -> -108. The pair sums
+    # to 1.01: the spread, which is what a taker actually pays.
+    assert odds.away_ml == 104
+    assert odds.home_ml == -108
 
 
 def test_polymarket_outcome_names_beat_order():
@@ -124,8 +139,8 @@ def test_polymarket_outcome_names_beat_order():
     )
     odds = polymarket.match_game(TOR_SD, polymarket.parse_events([flipped]), NOW)
     assert odds is not None
-    assert odds.home_ml == -106  # 0.515 mid of .51/.52
-    assert odds.away_ml == 106
+    assert odds.home_ml == -108  # San Diego ask .52
+    assert odds.away_ml == 104  # Toronto = 1 - .51
 
 
 def test_polymarket_illiquid_book_skipped():
@@ -179,6 +194,54 @@ def test_polymarket_start_time_gates_matching():
     assert polymarket.match_game(tomorrow, cands, NOW) is None
 
 
+def test_polymarket_top_of_book_reads_the_touch():
+    book = {
+        "bids": [{"price": "0.40", "size": "10"}, {"price": "0.48", "size": "120"}],
+        "asks": [{"price": "0.60", "size": "5"}, {"price": "0.49", "size": "80"}],
+    }
+    assert polymarket.top_of_book(book) == (0.48, 0.49, 120.0, 80.0)
+    assert polymarket.top_of_book({"bids": [], "asks": []}) is None
+    placeholder = {"bids": [{"price": "0.01", "size": "9"}], "asks": [{"price": "0.99", "size": "9"}]}
+    assert polymarket.top_of_book(placeholder) is None
+
+
+def test_polymarket_depth_attaches_microprice_and_notional(monkeypatch):
+    """Toronto is outcome 0 and the AWAY side: its book's microprice is the
+    away fair, so the home microprice is the complement; depth on Toronto is
+    ask·ask_size and on San Diego bid_size·(1 − bid)."""
+    book = {
+        "bids": [{"price": "0.48", "size": "120"}],
+        "asks": [{"price": "0.49", "size": "80"}],
+    }
+
+    async def fake_book(token_id):
+        return book if token_id == "tok-yes" else None
+
+    monkeypatch.setattr(polymarket, "_fetch_book", fake_book)
+    event = _pm_event(
+        "mlb-tor-sd-2026-07-11",
+        '["Toronto Blue Jays", "San Diego Padres"]',
+        '["0.485", "0.515"]',
+        0.48,
+        0.49,
+        "2026-07-12 01:40:00+00",
+        clobTokenIds='["tok-yes", "tok-no"]',
+    )
+
+    async def fake_fetch(sport):
+        return [event]
+
+    monkeypatch.setattr(polymarket, "_fetch_raw_events", fake_fetch)
+    polymarket._slate_cache.clear()
+    provider = polymarket.build_provider()
+    [entry] = asyncio.run(provider.odds_for(Sport.MLB, [TOR_SD]))[TOR_SD.id]
+    micro_tor = (0.49 * 120 + 0.48 * 80) / 200
+    assert entry.microprice_home == pytest.approx(1.0 - micro_tor)
+    assert entry.away_depth_usd == pytest.approx(80 * 0.49)
+    assert entry.home_depth_usd == pytest.approx(120 * 0.52)
+    assert entry.spread_pts == pytest.approx(1.0)
+
+
 def test_polymarket_odds_for_end_to_end(monkeypatch):
     calls = {"n": 0}
 
@@ -191,7 +254,7 @@ def test_polymarket_odds_for_end_to_end(monkeypatch):
     result = asyncio.run(provider.odds_for(Sport.MLB, [TOR_SD, NYY_NYM]))
     assert set(result) == {TOR_SD.id}  # no market for the Mets game -> absent
     [entry] = result[TOR_SD.id]
-    assert (entry.home_ml, entry.away_ml) == (-106, 106)
+    assert (entry.home_ml, entry.away_ml) == (-108, 104)
     # Slate discovery is cached: second call reuses the fetch
     asyncio.run(provider.odds_for(Sport.MLB, [TOR_SD]))
     assert calls["n"] == 1
@@ -249,8 +312,8 @@ def test_polymarket_day_ahead_game_prices():
         game, polymarket.parse_events([PM_MIL_PIT_TOMORROW]), NOW
     )
     assert odds is not None
-    assert odds.away_ml == 111  # Brewers mid 0.475
-    assert odds.home_ml == -111
+    assert odds.away_ml == 108  # Brewers ask
+    assert odds.home_ml == -113  # Pirates = 1 - Brewers bid
 
 
 def test_polymarket_placeholder_book_far_future_skipped():
@@ -314,7 +377,7 @@ SINNER_ZVEREV = Game(
 def test_polymarket_tennis_parses_moneyline_only():
     [cand] = polymarket.parse_events([PM_SINNER_ZVEREV], polymarket._TENNIS_SLUG_RE)
     assert cand.outcomes == ["Jannik Sinner", "Alexander Zverev"]
-    assert cand.prob0 == pytest.approx(0.805)  # mid of 0.80/0.81
+    assert cand.prob0 == pytest.approx(0.81)  # the ask
 
 
 def test_polymarket_tennis_skips_doubles_itf_and_futures():
@@ -332,8 +395,8 @@ def test_polymarket_tennis_full_name_match_and_conversion():
     odds = polymarket.match_tennis(SINNER_ZVEREV, cands, NOW)
     assert odds is not None
     assert odds.book == "polymarket"
-    assert odds.home_ml == -413  # Sinner 0.805
-    assert odds.away_ml == 413
+    assert odds.home_ml == -426  # Sinner ask 0.81
+    assert odds.away_ml == 400  # Zverev = 1 - Sinner bid 0.80
     assert odds.draw_ml is None
 
 
@@ -383,8 +446,8 @@ def test_polymarket_tennis_transliterated_umlauts_match():
     cands = polymarket.parse_events([moeller], polymarket._TENNIS_SLUG_RE)
     odds = polymarket.match_tennis(game, cands, NOW)
     assert odds is not None
-    assert odds.away_ml == -190  # Moeller mid 0.655
-    assert odds.home_ml == 190
+    assert odds.away_ml == -194  # Moeller ask 0.66
+    assert odds.home_ml == 186  # Faurel = 1 - Moeller bid 0.65
 
 
 def test_polymarket_tennis_start_window():
@@ -409,7 +472,7 @@ def test_polymarket_tennis_odds_for_end_to_end(monkeypatch):
     provider = polymarket.build_provider()
     result = asyncio.run(provider.odds_for(Sport.TENNIS, [SINNER_ZVEREV]))
     [entry] = result[SINNER_ZVEREV.id]
-    assert (entry.home_ml, entry.away_ml) == (-413, 413)
+    assert (entry.home_ml, entry.away_ml) == (-426, 400)
 
 
 # ---------------------------------------------------------------------------
@@ -481,17 +544,18 @@ def test_polymarket_soccer_parses_three_way():
     [cand] = polymarket.parse_soccer_events([PM_ZIL_HAJ])
     assert cand.league == "MLS"
     assert cand.teams[0][0] == "MŠK Žilina"
-    assert cand.teams[0][1] == pytest.approx(0.33)
-    assert cand.draw_prob == pytest.approx(0.285)
-    assert cand.teams[1][1] == pytest.approx(0.405)
+    # Each binary market is bought on its YES side at its ask (mid + 1c here).
+    assert cand.teams[0][1] == pytest.approx(0.34)
+    assert cand.draw_prob == pytest.approx(0.295)
+    assert cand.teams[1][1] == pytest.approx(0.415)
 
 
 def test_polymarket_soccer_match_maps_home_draw_away():
     odds = polymarket.match_soccer(ZIL_HAJ, polymarket.parse_soccer_events([PM_ZIL_HAJ]), NOW)
     assert odds is not None
-    assert odds.home_ml == 203  # 0.33
-    assert odds.draw_ml == 251  # 0.285
-    assert odds.away_ml == 147  # 0.405
+    assert odds.home_ml == 194  # ask 0.34
+    assert odds.draw_ml == 239  # ask 0.295
+    assert odds.away_ml == 141  # ask 0.415
 
 
 def test_polymarket_soccer_league_hint_gates_matching():
@@ -536,7 +600,7 @@ def test_polymarket_soccer_odds_for_end_to_end(monkeypatch):
     provider = polymarket.build_provider()
     result = asyncio.run(provider.odds_for(Sport.SOCCER, [ZIL_HAJ]))
     [entry] = result[ZIL_HAJ.id]
-    assert (entry.home_ml, entry.draw_ml, entry.away_ml) == (203, 251, 147)
+    assert (entry.home_ml, entry.draw_ml, entry.away_ml) == (194, 239, 141)
 
 
 def test_polymarket_no_games_and_fetch_failure(monkeypatch):
@@ -590,7 +654,7 @@ def test_kalshi_ticker_datetime_parsing():
 
 def test_kalshi_dollar_strings_and_cents_both_work():
     dollars = _kalshi_market(K_TOR_SD, "Toronto", bid="0.4900", ask="0.5000")
-    assert kalshi.market_prob(dollars) == pytest.approx(0.495)
+    assert kalshi.market_prob(dollars) == pytest.approx(0.50)  # the ask
     cents = {  # legacy integer-cent payloads
         "event_ticker": K_TOR_SD,
         "status": "active",
@@ -599,7 +663,51 @@ def test_kalshi_dollar_strings_and_cents_both_work():
         "yes_ask": 50,
         "last_price": 50,
     }
-    assert kalshi.market_prob(cents) == pytest.approx(0.495)
+    assert kalshi.market_prob(cents) == pytest.approx(0.50)
+
+
+def test_kalshi_top_of_book_from_dollar_ladders():
+    """Live shape 2026-09-02: two BID ladders; the yes ask is 1 − best NO bid."""
+    ob = {"orderbook_fp": {
+        "yes_dollars": [["0.2300", "165.00"], ["0.2500", "336.00"]],
+        "no_dollars": [["0.7200", "992.00"], ["0.7400", "1314.00"]],
+    }}
+    bid, ask, bid_size, ask_size = kalshi.top_of_book(ob)
+    assert (bid, bid_size, ask_size) == (0.25, 336.0, 1314.0)
+    assert ask == pytest.approx(0.26)
+    legacy = {"orderbook": {"yes": [[25, 336]], "no": [[74, 1314]]}}
+    assert kalshi.top_of_book(legacy)[0] == pytest.approx(0.25)
+    assert kalshi.top_of_book({"orderbook_fp": {"yes_dollars": [], "no_dollars": []}}) is None
+
+
+def test_kalshi_depth_from_the_home_market(monkeypatch):
+    async def fake_orderbook(ticker):
+        return {"orderbook_fp": {
+            "yes_dollars": [["0.5100", "400.00"]],
+            "no_dollars": [["0.4700", "100.00"]],  # yes ask 0.53, 100 contracts
+        }}
+
+    monkeypatch.setattr(kalshi, "_fetch_orderbook", fake_orderbook)
+    events = kalshi.parse_markets(
+        [
+            _kalshi_market(K_TOR_SD, "Toronto", bid="0.4900", ask="0.5000"),
+            _kalshi_market(K_TOR_SD, "San Diego", bid="0.5100", ask="0.5300"),
+        ]
+    )
+    monkeypatch.setattr(kalshi, "_slate", _fake_slate(events))
+    provider = kalshi.build_provider()
+    [entry] = asyncio.run(provider.odds_for(Sport.MLB, [TOR_SD]))[TOR_SD.id]
+    # San Diego is home: microprice leans toward the thin ask side.
+    assert entry.microprice_home == pytest.approx((0.53 * 400 + 0.51 * 100) / 500)
+    assert entry.home_depth_usd == pytest.approx(100 * 0.53)
+    assert entry.away_depth_usd == pytest.approx(400 * 0.49)
+    assert entry.spread_pts == pytest.approx(2.0)
+
+
+def _fake_slate(events):
+    async def slate(sport):
+        return events
+    return slate
 
 
 def test_kalshi_city_names_match_espn_display_names():
@@ -612,8 +720,8 @@ def test_kalshi_city_names_match_espn_display_names():
     odds = kalshi.match_game(TOR_SD, events, NOW)
     assert odds is not None
     assert odds.book == "kalshi"
-    assert odds.away_ml == 102  # Toronto 0.495
-    assert odds.home_ml == -106  # San Diego 0.515
+    assert odds.away_ml == 100  # Toronto ask 0.50
+    assert odds.home_ml == -108  # San Diego ask 0.52
 
 
 def test_kalshi_nickname_disambiguates_shared_tokens():
@@ -626,8 +734,8 @@ def test_kalshi_nickname_disambiguates_shared_tokens():
     )
     odds = kalshi.match_game(OAK_CWS, events, NOW)
     assert odds is not None
-    assert odds.home_ml == -147  # White Sox (home) 0.595
-    assert odds.away_ml == 147  # Athletics (away) 0.405
+    assert odds.home_ml == -150  # White Sox (home) ask 0.60
+    assert odds.away_ml == 144  # Athletics (away) ask 0.41
 
 
 def test_kalshi_shorthand_aliases():
@@ -641,7 +749,7 @@ def test_kalshi_shorthand_aliases():
     )
     odds = kalshi.match_game(OAK_CWS, events, NOW)
     assert odds is not None
-    assert odds.home_ml == -147 and odds.away_ml == 147
+    assert odds.home_ml == -150 and odds.away_ml == 144
 
 
 def test_kalshi_inconsistent_complement_skipped():
@@ -673,7 +781,7 @@ def test_kalshi_one_sided_market():
     )
     odds = kalshi.match_game(TOR_SD, events, NOW)
     assert odds is not None
-    assert odds.away_ml == 102
+    assert odds.away_ml == 100
     assert odds.home_ml is None
 
 
@@ -712,7 +820,7 @@ def test_kalshi_odds_for_end_to_end(monkeypatch):
     result = asyncio.run(provider.odds_for(Sport.MLB, [TOR_SD, OAK_CWS]))
     assert set(result) == {TOR_SD.id}
     [entry] = result[TOR_SD.id]
-    assert (entry.home_ml, entry.away_ml) == (-106, 102)
+    assert (entry.home_ml, entry.away_ml) == (-108, 100)
     asyncio.run(provider.odds_for(Sport.MLB, [TOR_SD]))
     assert calls["n"] == 1  # 10-minute slate cache
 

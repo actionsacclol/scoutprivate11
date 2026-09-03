@@ -25,8 +25,21 @@ const STABLE_UPTIME_MS = 30_000;
 // short-lived processes in a tight loop.
 const MAX_RAPID_RESTARTS = 5;
 // How long we give a fresh child to answer /api/health before declaring the
-// startup failed. Generous: the model stack imports pandas/sklearn/xgboost.
-const STARTUP_HEALTH_TIMEOUT_MS = 60_000;
+// startup failed — measured from the last sign of life, NOT from spawn.
+//
+// A fixed spawn-relative budget was wrong on macOS. First launch after install
+// spends 35-45s before uvicorn prints its first line at all: the bundle is
+// unsigned by design (see HARDENING.md), so Gatekeeper verifies every dylib in
+// the onedir tree, cold, off disk. That left a fraction of a 60s budget for the
+// app itself, we SIGKILLed a backend that was working, and the respawn started
+// from an even colder cache — each attempt slower than the last. The user-facing
+// symptom is an install that never comes up.
+//
+// So the rule is "no progress", not "not fast enough": a child that is still
+// emitting output is still starting. The absolute ceiling below is what
+// actually catches a hang.
+const STARTUP_QUIET_TIMEOUT_MS = 60_000;
+const STARTUP_HARD_TIMEOUT_MS = 5 * 60_000;
 const STARTUP_POLL_INTERVAL_MS = 500;
 // Hang watchdog: poll /api/health on this cadence once running; after this
 // many consecutive failures, force-kill + restart. Catches a WEDGED-but-alive
@@ -85,6 +98,12 @@ class PythonBackend {
   private pingInFlight = false;
   private restartAttempts = 0;
   private childStartedAtMs = 0;
+  // Last time the current child wrote to stdout/stderr — the startup probe's
+  // liveness signal (see awaitStartupHealth).
+  private lastOutputAtMs = 0;
+  // Whether the current child ever answered /api/health. A child that never
+  // did is a startup failure no matter how long it took to die.
+  private becameHealthy = false;
   private gaveUp = false;
   private logHandlers: LogCallback[] = [];
   private statusHandlers: ((info: BackendInfo) => void)[] = [];
@@ -355,6 +374,8 @@ class PythonBackend {
       this.pythonOk = true;
       this.startedAt = new Date().toISOString();
       this.childStartedAtMs = Date.now();
+      this.lastOutputAtMs = 0;
+      this.becameHealthy = false;
       this.lastError = null;
 
       child.stdout.setEncoding('utf-8');
@@ -385,7 +406,15 @@ class PythonBackend {
         // Only crashes that happen shortly after launch count toward the
         // rapid-crash cap. A backend that ran fine for a while and then died
         // gets a clean restart (handled inside scheduleRestart).
-        this.scheduleRestart(uptime < STABLE_UPTIME_MS);
+        //
+        // "Ran fine" means it answered a health check — not merely that it
+        // stayed alive a while. A child killed by the startup probe has by
+        // definition never been healthy, and its long-but-useless uptime used
+        // to read as a stable run: budget reset to 0, backoff of
+        // 2000×0 = 0ms, respawn instantly, forever, with no give-up and no
+        // slow-retry tier. That is the loop the mac install logs show.
+        const startedCleanly = this.becameHealthy && uptime >= STABLE_UPTIME_MS;
+        this.scheduleRestart(!startedCleanly);
       });
 
       this.awaitStartupHealth(child, port);
@@ -410,22 +439,33 @@ class PythonBackend {
     }
   }
 
-  /** Poll health until 200 → running, or the startup window expires → kill. */
+  /** Poll health until 200 → running, or the startup stalls/overruns → kill. */
   private awaitStartupHealth(child: ChildProcessWithoutNullStreams, port: number): void {
-    const deadline = Date.now() + STARTUP_HEALTH_TIMEOUT_MS;
+    const startedAt = Date.now();
+    const hardDeadline = startedAt + STARTUP_HARD_TIMEOUT_MS;
     const tick = async (): Promise<void> => {
       // Only ever act on the child we were armed for.
       if (this.child !== child || this.requestedStop) return;
       if (await this.checkHealth(port, 3000)) {
         if (this.child !== child || this.requestedStop) return;
+        this.becameHealthy = true;
         this.setStatus('running');
         this.log('INFO', `backend healthy on http://127.0.0.1:${port}`);
         this.startPingWatchdog(child, port);
         return;
       }
-      if (Date.now() > deadline) {
+      // Silence is the failure signal, not elapsed time. Output on either
+      // stream counts as progress and buys another full quiet window.
+      const lastProgress = Math.max(startedAt, this.lastOutputAtMs);
+      const quietFor = Date.now() - lastProgress;
+      const overrun = Date.now() > hardDeadline;
+      if (quietFor > STARTUP_QUIET_TIMEOUT_MS || overrun) {
         if (this.child !== child) return;
-        this.lastError = `backend never answered /api/health within ${STARTUP_HEALTH_TIMEOUT_MS / 1000}s — restarting`;
+        const elapsed = Math.round((Date.now() - startedAt) / 1000);
+        this.lastError = overrun
+          ? `backend never answered /api/health within ${STARTUP_HARD_TIMEOUT_MS / 60_000}m — restarting`
+          : `backend produced no output for ${Math.round(quietFor / 1000)}s and never ` +
+            `answered /api/health (${elapsed}s after launch) — restarting`;
         this.log('ERROR', this.lastError);
         try {
           child.kill('SIGKILL');
@@ -571,6 +611,9 @@ class PythonBackend {
 
   private onChildOutput(chunk: string, level: string): void {
     const text = chunk.toString();
+    // Progress signal for the startup probe — any output, including uvicorn's
+    // pre-serving banner lines, proves the child is still coming up.
+    this.lastOutputAtMs = Date.now();
     for (const raw of text.split('\n')) {
       const line = raw.trimEnd();
       if (!line.trim()) continue;

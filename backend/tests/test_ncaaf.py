@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 from datetime import date, datetime, timezone
 
 import pandas as pd
 import pytest
 
 from kryptscout.core.elo import EloBook
+from kryptscout.core.kalman import KalmanBook
 from kryptscout.core.schemas import Game, Sport
 from kryptscout.sports import ncaaf
 from kryptscout.sports.ncaaf import (
@@ -102,21 +104,23 @@ def test_replay_moves_ratings_tracks_rolling_and_keys_by_display_name():
              "home_points": 20, "away_points": 24},
         ]
     )
-    book, rolling, records = _replay(df, RESOLVE)
+    book, rolling, records, _ = _replay(df, RESOLVE)
     uga, bama = "Georgia Bulldogs", "Alabama Crimson Tide"
     assert book.get(uga) > ELO_CONFIG.initial > book.get(bama)
     assert "Georgia" not in book.ratings  # keyed by displayName, never school
     assert list(rolling[uga]) == [(31, 17), (24, 20)]
     assert list(rolling[bama]) == [(17, 31), (20, 24)]
     assert len(records) == 2  # 2025 FBS-vs-FBS games feed the backtest
-    assert records[0]["p"] == pytest.approx(
+    # Served probability is the Kalman filter's: two fresh teams, home field.
+    assert records[0]["p"] == pytest.approx(KalmanBook(ncaaf.KALMAN_CONFIG).expected("h", "a"))
+    assert records[0]["p_elo"] == pytest.approx(
         _expected_prob(ELO_CONFIG.initial, ELO_CONFIG.initial, ELO_CONFIG.home_advantage)
     )
 
 
 def test_replay_skips_unplayed_games():
     df = _frame([{"home_team": "Georgia", "away_team": "Alabama"}])  # no score
-    book, rolling, records = _replay(df, RESOLVE)
+    book, rolling, records, _ = _replay(df, RESOLVE)
     assert book.ratings == {}
     assert rolling == {}
     assert records == []
@@ -129,7 +133,7 @@ def test_replay_fcs_opponent_rated_flat_and_never_stored():
              "away_division": "fcs", "home_points": 56, "away_points": 7},
         ]
     )
-    book, rolling, records = _replay(df, RESOLVE)
+    book, rolling, records, _ = _replay(df, RESOLVE)
     uga = "Georgia Bulldogs"
     # FBS side beat a 1250-rated opponent: gains a little, opponent not stored.
     assert book.get(uga) > ELO_CONFIG.initial
@@ -153,7 +157,7 @@ def test_replay_skips_games_with_no_fbs_side():
              "home_points": 28, "away_points": 21},
         ]
     )
-    book, rolling, records = _replay(df, RESOLVE)
+    book, rolling, records, _ = _replay(df, RESOLVE)
     assert book.ratings == {}
     assert rolling == {}
     assert records == []
@@ -166,7 +170,7 @@ def test_replay_neutral_site_zeroes_home_advantage():
              "neutral_site": True, "home_points": 24, "away_points": 21},
         ]
     )
-    _, _, [record] = _replay(neutral, RESOLVE)
+    _, _, [record], _ = _replay(neutral, RESOLVE)
     assert record["p"] == pytest.approx(0.5)  # equal ratings, no HFA
 
     hosted = _frame(
@@ -175,10 +179,8 @@ def test_replay_neutral_site_zeroes_home_advantage():
              "home_points": 24, "away_points": 21},
         ]
     )
-    _, _, [hosted_record] = _replay(hosted, RESOLVE)
-    assert hosted_record["p"] == pytest.approx(
-        _expected_prob(ELO_CONFIG.initial, ELO_CONFIG.initial, ELO_CONFIG.home_advantage)
-    )
+    _, _, [hosted_record], _ = _replay(hosted, RESOLVE)
+    assert hosted_record["p"] == pytest.approx(KalmanBook(ncaaf.KALMAN_CONFIG).expected("h", "a"))
     assert hosted_record["p"] > 0.5
 
 
@@ -193,7 +195,7 @@ def test_replay_applies_season_carry_at_boundary():
              "home_points": 30, "away_points": 20},
         ]
     )
-    book, _, _ = _replay(df, RESOLVE)
+    book, _, _, _ = _replay(df, RESOLVE)
 
     # Replicate season one by hand, then regress 40% to the mean.
     ref = EloBook(config=ELO_CONFIG)
@@ -215,7 +217,7 @@ def test_replay_backtest_records_only_backtest_season():
              "home_points": 28, "away_points": 3},
         ]
     )
-    _, _, records = _replay(df, RESOLVE)
+    _, _, records, _ = _replay(df, RESOLVE)
     assert [r["game_id"] for r in records] == [401770001]
     assert records[0]["home_won"] is True
 
@@ -268,6 +270,7 @@ def test_closing_spread_prefers_consensus():
 def test_predict_probabilities_and_scores(tmp_path):
     engine = NcaafEngine(state_path=tmp_path / "ncaaf_state.json")
     engine.book.ratings = {"Georgia Bulldogs": 1800.0, "Kent State Golden Flashes": 1350.0}
+    engine.kalman.means = {"Georgia Bulldogs": 25.0, "Kent State Golden Flashes": -15.0}
     engine.rolling = {
         "Georgia Bulldogs": ncaaf.deque([(38, 10), (42, 14)], maxlen=8),
         "Kent State Golden Flashes": ncaaf.deque([(13, 45), (17, 41)], maxlen=8),
@@ -281,9 +284,9 @@ def test_predict_probabilities_and_scores(tmp_path):
     )
     [pred] = asyncio.run(engine.predict([game]))
 
-    assert pred.model == "ncaaf-elo-v1"
+    assert pred.model == "ncaaf-kalman-v2"
     assert pred.home_win_prob + pred.away_win_prob == pytest.approx(1.0)
-    assert pred.home_win_prob > 0.9  # 450-point Elo gap plus home field
+    assert pred.home_win_prob > 0.9  # 40-point strength gap plus home field
     # home = (UGA PF 40 + KSU PA 43)/2 + 1.5; away = (KSU PF 15 + UGA PA 12)/2 - 1.5
     assert pred.predicted_home_score == pytest.approx(43.0)
     assert pred.predicted_away_score == pytest.approx(12.0)
@@ -294,6 +297,9 @@ def test_predict_probabilities_and_scores(tmp_path):
 def test_predict_neutral_site_drops_home_advantage(tmp_path):
     engine = NcaafEngine(state_path=tmp_path / "ncaaf_state.json")
     engine.book.ratings = {"Georgia Bulldogs": 1700.0, "Ohio State Buckeyes": 1650.0}
+    engine.kalman.means = {"Georgia Bulldogs": 6.0, "Ohio State Buckeyes": 3.0}
+    for team in ("Georgia Bulldogs", "Ohio State Buckeyes"):  # scoring history → a total
+        engine.rolling[team] = deque([(27.5, 27.5)])
     kwargs = dict(
         sport=Sport.NCAAF,
         start_time=datetime(2026, 8, 29, 16, tzinfo=timezone.utc),
@@ -306,9 +312,11 @@ def test_predict_neutral_site_drops_home_advantage(tmp_path):
     [hosted] = asyncio.run(engine.predict([Game(id="home-game", **kwargs)]))
 
     # Neutral: pure rating gap, no HFA. Hosted (regression): full 65-point HFA.
-    assert neutral.home_win_prob == pytest.approx(_expected_prob(1700.0, 1650.0, 0.0))
+    assert neutral.home_win_prob == pytest.approx(
+        engine.kalman.expected("Georgia Bulldogs", "Ohio State Buckeyes", neutral=True)
+    )
     assert hosted.home_win_prob == pytest.approx(
-        _expected_prob(1700.0, 1650.0, ELO_CONFIG.home_advantage)
+        engine.kalman.expected("Georgia Bulldogs", "Ohio State Buckeyes")
     )
     assert neutral.home_win_prob < hosted.home_win_prob
     assert neutral.home_win_prob + neutral.away_win_prob == pytest.approx(1.0)
@@ -333,9 +341,9 @@ def test_predict_unknown_team_falls_back_to_league_average(tmp_path):
     )
     [pred] = asyncio.run(engine.predict([game]))
     assert pred.home_win_prob == pytest.approx(
-        1.0 / (1.0 + 10.0 ** (-ELO_CONFIG.home_advantage / 400.0))
+        engine.kalman.expected("Georgia Bulldogs", "Georgia Tech Yellow Jackets")
     )
-    assert pred.predicted_total == pytest.approx(2 * ncaaf.LEAGUE_AVG_POINTS)
+    assert pred.predicted_total is None  # no scoring history: no placeholder total (2026-09-02)
 
 
 # -- state round-trip --------------------------------------------------------------
@@ -367,4 +375,4 @@ def test_load_state_tolerates_corrupt_file(tmp_path):
 def test_build_engine_contract():
     engine = build_engine()
     assert engine.sport is Sport.NCAAF
-    assert engine.model_name == "ncaaf-elo-v1"
+    assert engine.model_name == "ncaaf-kalman-v2"

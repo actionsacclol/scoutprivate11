@@ -9,6 +9,27 @@ from kryptscout.core.elo import EloBook, EloConfig
 from kryptscout.core.schemas import MoneylineOdds, is_in_play
 
 
+class TestPowerDevig:
+    def test_sums_to_one(self):
+        assert oddsmath.remove_vig_power(-110, -110) == pytest.approx([0.5, 0.5])
+        assert sum(oddsmath.remove_vig_power(-120, +250, +320)) == pytest.approx(1.0)
+
+    def test_gives_the_longshot_less_than_multiplicative(self):
+        """Favourite-longshot bias: proportional devig hands the dog too much
+        probability, power devig shaves more off it. Measured on 277 live
+        picks the difference alone was a +0.9% phantom edge on underdogs."""
+        mult = oddsmath.remove_vig(-300, +240)
+        power = oddsmath.remove_vig_power(-300, +240)
+        assert power[1] < mult[1] and power[0] > mult[0]
+
+    def test_arb_market_solves_below_k_one(self):
+        assert oddsmath.remove_vig_power(+105, +105) == pytest.approx([0.5, 0.5])
+
+    def test_rejects_degenerate_prices(self):
+        with pytest.raises(ValueError):
+            oddsmath.remove_vig_power()
+
+
 class TestOddsMath:
     def test_american_decimal_roundtrip(self):
         for odds in (-500, -150, -110, +100, +130, +250, +1200):

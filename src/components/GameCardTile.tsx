@@ -234,6 +234,60 @@ const GameCardTile = forwardRef<HTMLDivElement, Props>(function GameCardTile(
 
             {/* Footer: model fair vs best book per side + totals — or an honest
                 no-lines note when no book has quoted this game yet. */}
+            {/* Model-free signals. ARB is a locked-in cross-venue position net
+                of exchange fees (rare). LEAD is the exchange-lead reference:
+                which DraftKings side Kalshi/Polymarket say is underpriced —
+                tracked against the close on PERFORMANCE, never a pick. */}
+            {card.arb && (
+              <div
+                className="mt-2 rounded-md border border-amber-400/30 bg-amber-500/10 px-2 py-1 font-mono text-[9px] leading-4 text-amber-200"
+                title={`Buy every side at the best price: ${card.arb.legs
+                  .map((l) => `${l.side.toUpperCase()} ${fmtAmerican(l.price)} @ ${bookAbbrev(l.book)} (${Math.round(l.stake_fraction * 100)}% of stake)`)
+                  .join(' · ')}. Locked-in return ${card.arb.net_margin_pct.toFixed(2)}% after exchange fees (${card.arb.margin_pct.toFixed(2)}% gross).`}
+              >
+                <span className="font-bold tracking-widest">ARB</span> +{card.arb.net_margin_pct.toFixed(2)}% locked
+                {!simple && (
+                  <span className="text-amber-200/70">
+                    {' '}
+                    · {card.arb.legs.map((l) => `${bookAbbrev(l.book)} ${fmtAmerican(l.price)}`).join(' / ')}
+                  </span>
+                )}
+              </div>
+            )}
+            {card.lean && (
+              <div
+                className="mt-2 rounded-md border border-sky-400/25 bg-sky-500/[0.08] px-2 py-1 font-mono text-[9px] leading-4 text-sky-200"
+                title={`${card.lean.ref_book === 'kalshi' ? 'Kalshi' : 'Polymarket'} prices ${card.lean.side === 'home' ? game.home : game.away} at ${fmtPct(card.lean.ref_prob)}% vs DraftKings' vig-free ${fmtPct(card.lean.book_prob)}% (${card.lean.gap_pts.toFixed(1)} pts${card.lean.agree ? ', both exchanges agree' : ''}). Measured: the exchanges lead DraftKings' close 64% of the time for about +1% closing-line value — under the vig, so a reference, not a pick.`}
+              >
+                <span className="font-bold tracking-widest">LEAD</span>{' '}
+                {card.lean.ref_book === 'kalshi' ? 'KAL' : 'PM'} → {card.lean.side === 'home' ? 'HOME' : 'AWAY'} DK{' '}
+                {fmtAmerican(card.lean.price)}
+                {!simple && <span className="text-sky-200/70"> · +{card.lean.gap_pts.toFixed(1)} pts</span>}
+              </div>
+            )}
+            {/* Which number the side probabilities below are. The market where
+                one exists — it beats every model here and ESPN's predictor —
+                else the model, labelled with its measured pre-line error. */}
+            {card.forecast && (
+              <div
+                className={cls(
+                  'mt-2 flex items-baseline justify-between font-mono text-[9px] uppercase tracking-[0.18em]',
+                  card.forecast.kind === 'market' ? 'text-krypt-muted/60' : 'text-amber-300/70',
+                )}
+                title={
+                  card.forecast.kind === 'market'
+                    ? `Win probabilities are the ${card.forecast.sharp ? 'exchange' : 'book'}'s own vig-free number (${bookAbbrev(card.forecast.source)}). Measured 2026-09-02: it beats every model in this app and ESPN's predictor, and no blend improves on it.${card.forecast.model_home != null ? ` Model said ${fmtPct(card.forecast.model_home)}% home.` : ''}`
+                    : `No venue has quoted this game yet. This is the model's provisional pre-line estimate; measured against where lines eventually open it is off by about ${card.forecast.error_pts ?? '?'} points on average. Not a pick.`
+                }
+              >
+                <span>Forecast</span>
+                <span>
+                  {card.forecast.kind === 'market'
+                    ? `${bookAbbrev(card.forecast.source)}${card.forecast.sharp ? '' : ' · book'}${card.forecast.thin ? ' · thin' : ''}`
+                    : `model · pre-line ±${card.forecast.error_pts ?? '?'} pts`}
+                </span>
+              </div>
+            )}
             {odds.length === 0 ? (
               <div
                 className="mt-2.5 border-t border-white/5 pt-2 text-center font-mono text-[9px] uppercase tracking-[0.2em] text-krypt-muted/50"
@@ -250,7 +304,7 @@ const GameCardTile = forwardRef<HTMLDivElement, Props>(function GameCardTile(
                   <div key={s.key} className="flex min-w-0 items-baseline justify-between gap-1.5">
                     <span className="shrink-0 text-krypt-muted/50">{s.tag}</span>
                     <span className="truncate text-right">
-                      <span className="text-white/70" title="Model fair line (break-even price)">
+                      <span className="text-white/70" title="Fair line at the displayed forecast (break-even price)">
                         {fmtAmerican(fairLine(s.prob))}
                       </span>
                       <span className="text-krypt-muted/40"> → </span>
@@ -341,7 +395,7 @@ const GameCardTile = forwardRef<HTMLDivElement, Props>(function GameCardTile(
               className="ml-auto shrink-0 rounded border border-white/10 bg-white/5 px-1.5 py-0.5 font-mono text-[9px] font-semibold leading-none text-krypt-muted"
               title="Fair = the model's break-even odds; no book beats it right now"
             >
-              FAIR {fmtAmerican(pick.fairPrice)} · MODEL
+              FAIR {fmtAmerican(pick.fairPrice)} · {pick.refBook ? pick.refBook.toUpperCase() : 'MODEL'}
             </span>
           )}
         </div>

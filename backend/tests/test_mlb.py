@@ -462,7 +462,7 @@ def test_predict_unknown_team_falls_back_to_league_average(tmp_path, offline_pro
     assert pred.home_win_prob == pytest.approx(
         1.0 / (1.0 + 10.0 ** (-ELO_CONFIG.home_advantage / 400.0))
     )
-    assert pred.predicted_total == pytest.approx(2 * LEAGUE_AVG_RUNS)
+    assert pred.predicted_total is None  # no scoring history: no placeholder total (2026-09-02)
 
 
 def test_predict_applies_probable_pitcher_adjustment(tmp_path, monkeypatch):

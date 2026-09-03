@@ -34,6 +34,10 @@ PREDICTION = Prediction(
     home_win_prob=0.62, away_win_prob=0.38,
 )
 ODDS = MoneylineOdds(book="fakebook", fetched_at=NOW, home_ml=-120, away_ml=105)
+# Value edges are priced against the exchange fair (2026-09-02): Kalshi at
+# -140/+120 devigs to ~0.56 home, and fakebook's -120 implies 0.545 — a
+# 1.7-point gap, so the board carries one STRONG home edge.
+KALSHI = MoneylineOdds(book="kalshi", fetched_at=NOW, home_ml=-140, away_ml=120)
 
 
 class FakeEngine:
@@ -60,7 +64,7 @@ def client(monkeypatch):
     monkeypatch.setattr(engines, "_REGISTRY", {Sport.NBA: FakeEngine()})
 
     async def fake_merged_odds(sport, games):
-        return {GAME.id: [ODDS]}
+        return {GAME.id: [ODDS, KALSHI]}
 
     monkeypatch.setattr(odds_providers, "merged_odds", fake_merged_odds)
     with TestClient(main.app) as test_client:
@@ -91,7 +95,9 @@ def test_board_serves_and_records(client):
     assert card["game"]["id"] == GAME.id
     assert card["prediction"]["model"] == "nba-fake-v1"
     assert card["odds"][0]["book"] == "fakebook"
-    assert card["edges"]  # home is +EV at -120 vs 0.62
+    assert card["edges"]  # fakebook -120 sits under the Kalshi fair
+    assert card["edges"][0]["ref_book"] == "kalshi" and card["edges"][0]["book"] == "fakebook"
+    assert card["forecast"]["kind"] == "market" and card["forecast"]["source"] == "kalshi"
 
     # Serving the board recorded the game, prediction and odds snapshot.
     conn = db.connect()
@@ -103,7 +109,7 @@ def test_board_serves_and_records(client):
         conn.close()
     assert [g["game_id"] for g in games] == [GAME.id]
     assert preds == [{"game_id": GAME.id, "model": "nba-fake-v1"}]
-    assert snaps == [{"game_id": GAME.id, "book": "fakebook"}]
+    assert sorted(s["book"] for s in snaps) == ["fakebook", "kalshi"]
 
 
 def test_board_survives_record_failure(client, monkeypatch):
@@ -259,5 +265,5 @@ def test_movement_roundtrip_via_board(client):
     resp = client.get("/api/movement/nba-1001")
     assert resp.status_code == 200
     books = resp.json()["books"]
-    assert list(books) == ["fakebook"]
+    assert sorted(books) == ["fakebook", "kalshi"]
     assert books["fakebook"][0]["home_ml"] == -120

@@ -240,7 +240,7 @@ export default function TerminalPage({ boards, demo, apiUp }: Props) {
       SPORTS.map((s) => {
         const sp = picks.filter((p) => p.sport === s)
         const val = sp.find((p) => p.kind === 'value')
-        const metric = val ? (val.ev ?? 0) * 100 : sp.length ? sp[0].modelProb * 100 : null
+        const metric = val ? (val.ev ?? 0) * 100 : sp.length ? sp[0].prob * 100 : null
         return {
           sport: s,
           count: cards.filter((c) => c.game.sport === s && !c.game.completed).length,
@@ -352,7 +352,7 @@ export default function TerminalPage({ boards, demo, apiUp }: Props) {
         id: p.gameId,
         sport: p.sport,
         label: `${abbr(p.card.game.away)}@${abbr(p.card.game.home)}`,
-        prob: p.modelProb,
+        prob: p.prob,
         ev: p.ev,
         value: p.kind === 'value',
       })),
@@ -799,7 +799,7 @@ export default function TerminalPage({ boards, demo, apiUp }: Props) {
       modelHist.length = 0
       marketHist.length = 0
     }
-    const m = topPick.modelProb
+    const m = topPick.prob
     const k =
       topPick.marketProb ?? (topPick.price != null ? impliedProb(topPick.price) : m - 0.02)
     topRef.current = { m, k }
@@ -1027,7 +1027,7 @@ export default function TerminalPage({ boards, demo, apiUp }: Props) {
       const model = p.card.prediction?.model ?? modelMetaRef.current[p.sport].model
       q.push({
         tag: 'PRED',
-        msg: `${model} ${abbr(p.team)} ${(p.modelProb * 100).toFixed(1)}%`,
+        msg: `${p.refBook ?? model} ${abbr(p.team)} ${(p.prob * 100).toFixed(1)}%`,
         color: 'var(--tx)',
       })
       if (p.kind === 'value') {
@@ -1306,7 +1306,7 @@ export default function TerminalPage({ boards, demo, apiUp }: Props) {
                 <span className="tag">prob.history</span>
               </div>
               <div className="st-now st-num">
-                {topPick ? (topPick.modelProb * 100).toFixed(1) + '%' : '—'}
+                {topPick ? (topPick.prob * 100).toFixed(1) + '%' : '—'}
               </div>
             </div>
             <canvas ref={chartRef} height={128} />
@@ -1394,9 +1394,9 @@ export default function TerminalPage({ boards, demo, apiUp }: Props) {
                 <div className="st-tchip" key={p.gameId}>
                   <b>{abbr(p.team)}</b>
                   <span className="arw">▸</span>
-                  {p.card.prediction?.model ?? modelMeta[p.sport].model}
+                  {p.refBook ?? p.card.prediction?.model ?? modelMeta[p.sport].model}
                   <span className="arw">▸</span>
-                  <span className="st-num">{(p.modelProb * 100).toFixed(1)}%</span>
+                  <span className="st-num">{(p.prob * 100).toFixed(1)}%</span>
                   <span className="arw">▸</span>
                   {p.kind === 'value' ? (
                     <span className="g-win st-num">TAKE {fmtAmerican(p.price ?? 0)}</span>

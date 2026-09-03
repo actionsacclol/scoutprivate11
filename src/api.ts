@@ -7,6 +7,7 @@ import type {
   PerformanceReport,
   Sport,
   WeatherInfo,
+  BenchmarkReport,
 } from './types'
 import { SPORTS } from './types'
 import { apiFetch, invalidateApiBase } from './backendBase'
@@ -45,8 +46,37 @@ export async function fetchBoard(sport: Sport): Promise<GameCard[]> {
   return fetchJSON<GameCard[]>(`/api/board/${sport}`)
 }
 
+/**
+ * Resolve once the backend reports its sport engines registered.
+ *
+ * The backend serves /api/health the moment uvicorn binds, but the board
+ * endpoints park until the model stack (numpy/pandas/sklearn/xgboost) finishes
+ * importing — ~25-35s on a cold first launch after a macOS install. Fetching
+ * boards before then just burns the 8s request timeout on all nine sports and
+ * paints an empty board. Poll the cheap health endpoint instead.
+ *
+ * Returns false if readiness never arrives, in which case the caller should go
+ * ahead and fetch anyway rather than stall forever.
+ */
+export async function waitForEngines(timeoutMs = 120_000): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs
+  for (;;) {
+    try {
+      const h = await fetchJSON<{ enginesReady?: boolean }>('/api/health', 4000)
+      // Absent on older backends — anything but an explicit false means ready,
+      // so a version skew can never wedge the board behind this poll.
+      if (h.enginesReady !== false) return true
+    } catch {
+      invalidateApiBase()
+    }
+    if (Date.now() >= deadline) return false
+    await new Promise((r) => setTimeout(r, 1000))
+  }
+}
+
 /** Fetch every sport's board in parallel; a failed sport yields an empty board. */
 export async function fetchAllBoards(): Promise<BoardMap> {
+  await waitForEngines()
   const results = await Promise.all(
     SPORTS.map(async (sport: Sport): Promise<[Sport, GameCard[]]> => {
       try {
@@ -93,6 +123,14 @@ export async function fetchMovement(gameId: string): Promise<MovementReport | nu
 export async function fetchPerformance(): Promise<PerformanceReport | null> {
   try {
     return await fetchJSON<PerformanceReport>('/api/performance')
+  } catch {
+    return null
+  }
+}
+
+export async function fetchBenchmark(): Promise<BenchmarkReport | null> {
+  try {
+    return await fetchJSON<BenchmarkReport>('/api/benchmark')
   } catch {
     return null
   }

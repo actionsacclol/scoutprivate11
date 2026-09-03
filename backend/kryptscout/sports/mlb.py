@@ -444,6 +444,10 @@ class MlbEngine(SportEngine):
             p_home = _expected_home_prob(self.book, game.home, game.away, pitcher_diff)
             home_runs = (self._avg(game.home, idx=0) + self._avg(game.away, idx=1)) / 2.0
             away_runs = (self._avg(game.away, idx=0) + self._avg(game.home, idx=1)) / 2.0
+            # A team with no scoring history would price at the league-average
+            # placeholder — a constant, not a forecast. The board printed UNDER
+            # edges against exactly that (WNBA, 2026-09-02). Emit no total.
+            scored = bool(self.rolling.get(game.home)) and bool(self.rolling.get(game.away))
             predictions.append(
                 Prediction(
                     game_id=game.id,
@@ -452,9 +456,9 @@ class MlbEngine(SportEngine):
                     generated_at=now,
                     home_win_prob=p_home,
                     away_win_prob=1.0 - p_home,
-                    predicted_home_score=round(home_runs, 1),
-                    predicted_away_score=round(away_runs, 1),
-                    predicted_total=round(home_runs + away_runs, 1),
+                    predicted_home_score=round(home_runs, 1) if scored else None,
+                    predicted_away_score=round(away_runs, 1) if scored else None,
+                    predicted_total=round(home_runs + away_runs, 1) if scored else None,
                     confidence=abs(p_home - 0.5) * 2.0,
                 )
             )

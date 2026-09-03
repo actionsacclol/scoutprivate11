@@ -14,23 +14,27 @@ export interface SideView {
   mlKey: 'home_ml' | 'away_ml' | 'draw_ml'
 }
 
-/** Display order for a card's sides: AWAY @ HOME (tennis: P1 vs P2). */
+/** Display order for a card's sides: AWAY @ HOME (tennis: P1 vs P2).
+ *  Probabilities come from the DISPLAYED forecast (card.forecast: the
+ *  market where one exists, else the model) and fall back to the raw model
+ *  prediction on older payloads and demo data. */
 export function sideViews(card: GameCard): SideView[] {
-  const { game, prediction } = card
-  if (!prediction) return []
+  const { game, prediction, forecast } = card
+  const home = forecast ? forecast.home : prediction?.home_win_prob
+  const away = forecast ? forecast.away : prediction?.away_win_prob
+  const draw = forecast ? forecast.draw : prediction?.draw_prob
+  if (home === undefined || away === undefined) return []
   if (game.sport === 'tennis') {
     return [
-      { key: 'home', name: game.home, tag: 'P1', prob: prediction.home_win_prob, mlKey: 'home_ml' },
-      { key: 'away', name: game.away, tag: 'P2', prob: prediction.away_win_prob, mlKey: 'away_ml' },
+      { key: 'home', name: game.home, tag: 'P1', prob: home, mlKey: 'home_ml' },
+      { key: 'away', name: game.away, tag: 'P2', prob: away, mlKey: 'away_ml' },
     ]
   }
-  const views: SideView[] = [
-    { key: 'away', name: game.away, tag: 'A', prob: prediction.away_win_prob, mlKey: 'away_ml' },
-  ]
-  if (prediction.draw_prob !== null) {
-    views.push({ key: 'draw', name: 'DRAW', tag: 'D', prob: prediction.draw_prob, mlKey: 'draw_ml' })
+  const views: SideView[] = [{ key: 'away', name: game.away, tag: 'A', prob: away, mlKey: 'away_ml' }]
+  if (draw !== null && draw !== undefined) {
+    views.push({ key: 'draw', name: 'DRAW', tag: 'D', prob: draw, mlKey: 'draw_ml' })
   }
-  views.push({ key: 'home', name: game.home, tag: 'H', prob: prediction.home_win_prob, mlKey: 'home_ml' })
+  views.push({ key: 'home', name: game.home, tag: 'H', prob: home, mlKey: 'home_ml' })
   return views
 }
 

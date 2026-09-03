@@ -50,6 +50,7 @@ import httpx
 import pandas as pd
 
 from kryptscout.config import DATA_DIR, RAW_DIR
+from kryptscout.core.kalman import KalmanBook, KalmanConfig
 from kryptscout.core.elo import EloBook, EloConfig
 from kryptscout.core.schemas import Game, Prediction, Sport
 from kryptscout.datasources import espn
@@ -176,6 +177,15 @@ async def _download_season(
 # -- Elo replay -------------------------------------------------------------------
 
 
+# Kalman margin filter (core/kalman.py) — the served win probability since
+# v2. Tuned 2026-09-02 on cfbd 2021-26 (tune 2023-24, held out 2025,
+# n=3,829): log loss 0.4774 vs the Elo config's 0.5251, −0.0477
+# [−0.0556, −0.0389], accuracy 75.9%. Elo's margin-of-victory multiplier
+# compresses the blowouts that carry most of college football's information.
+# The Elo book still runs: it feeds the score nudge and the FCS handling.
+KALMAN_CONFIG = KalmanConfig(sigma=15.0, q=3.0, hfa=2.5, init_var=150.0, season_var=30.0)
+
+
 def _expected_prob(home_rating: float, away_rating: float, hfa: float) -> float:
     """P(home wins) given explicit ratings and per-game home advantage."""
     diff = home_rating + hfa - away_rating
@@ -220,7 +230,7 @@ def _game_update(
 
 def _replay(
     df: pd.DataFrame, resolve: Callable[[str], str]
-) -> tuple[EloBook, dict[str, deque], list[dict]]:
+) -> tuple[EloBook, dict[str, deque], list[dict], KalmanBook]:
     """Replay completed games chronologically through a fresh EloBook.
 
     Returns the fitted book (keyed by ESPN displayName), per-team rolling
@@ -230,6 +240,7 @@ def _replay(
     it with synthetic data.
     """
     book = EloBook(config=ELO_CONFIG)
+    kalman = KalmanBook(KALMAN_CONFIG)
     rolling: dict[str, deque] = {}
     records: list[dict] = []
 
@@ -248,6 +259,7 @@ def _replay(
 
         if current_season is not None and row.season != current_season:
             book.new_season()
+            kalman.new_season()
         current_season = row.season
 
         home = resolve(row.home_team) if home_fbs else row.home_team
@@ -257,9 +269,12 @@ def _replay(
         margin = abs(home_score - away_score)
         hfa = 0.0 if bool(row.neutral_site) else ELO_CONFIG.home_advantage
 
-        p_home = _game_update(
+        p_elo = _game_update(
             book, home, away, home_won, margin, hfa,
             home_rated=home_fbs, away_rated=away_fbs,
+        )
+        p_home = kalman.update(
+            home, away, home_score, away_score, neutral=bool(row.neutral_site)
         )
         if home_fbs and away_fbs and row.season >= BACKTEST_SEASON and margin > 0:
             records.append(
@@ -267,6 +282,7 @@ def _replay(
                     "game_id": int(row.game_id),
                     "season": int(row.season),
                     "p": p_home,
+                    "p_elo": p_elo,
                     "home_won": home_won,
                 }
             )
@@ -278,7 +294,7 @@ def _replay(
             if fbs:
                 rolling.setdefault(team, deque(maxlen=ROLLING_WINDOW)).append((pf, pa))
 
-    return book, rolling, records
+    return book, rolling, records, kalman
 
 
 # -- backtest metrics ------------------------------------------------------------
@@ -387,11 +403,12 @@ async def _fetch_cfbd_spreads(
 
 class NcaafEngine(SportEngine):
     sport = Sport.NCAAF
-    model_name = "ncaaf-elo-v1"
+    model_name = "ncaaf-kalman-v2"
 
     def __init__(self, state_path: Path = STATE_PATH) -> None:
         self.state_path = state_path
         self.book = EloBook(config=ELO_CONFIG)
+        self.kalman = KalmanBook(KALMAN_CONFIG)
         self.rolling: dict[str, deque] = {}
         self.metrics: dict = {}
         self._load_state()
@@ -405,17 +422,18 @@ class NcaafEngine(SportEngine):
         for game in games:
             # Neutral-site games (bowls, kickoff classics) carry no home
             # edge: zero Elo HFA and no home-ward points shift.
-            hfa = 0.0 if game.neutral_site else ELO_CONFIG.home_advantage
             points_edge = 0.0 if game.neutral_site else HOME_POINTS_EDGE
-            p_home = _expected_prob(
-                self.book.get(game.home), self.book.get(game.away), hfa
-            )
+            p_home = self.kalman.expected(game.home, game.away, neutral=game.neutral_site)
             home_score = (
                 self._avg(game.home, idx=0) + self._avg(game.away, idx=1)
             ) / 2.0 + points_edge
             away_score = (
                 self._avg(game.away, idx=0) + self._avg(game.home, idx=1)
             ) / 2.0 - points_edge
+            # A team with no scoring history would price at the league-average
+            # placeholder — a constant, not a forecast. The board printed UNDER
+            # edges against exactly that (WNBA, 2026-09-02). Emit no total.
+            scored = bool(self.rolling.get(game.home)) and bool(self.rolling.get(game.away))
             predictions.append(
                 Prediction(
                     game_id=game.id,
@@ -424,9 +442,9 @@ class NcaafEngine(SportEngine):
                     generated_at=now,
                     home_win_prob=p_home,
                     away_win_prob=1.0 - p_home,
-                    predicted_home_score=round(home_score, 1),
-                    predicted_away_score=round(away_score, 1),
-                    predicted_total=round(home_score + away_score, 1),
+                    predicted_home_score=round(home_score, 1) if scored else None,
+                    predicted_away_score=round(away_score, 1) if scored else None,
+                    predicted_total=round(home_score + away_score, 1) if scored else None,
                     confidence=abs(p_home - 0.5) * 2.0,
                 )
             )
@@ -444,7 +462,7 @@ class NcaafEngine(SportEngine):
                     frames.append(pd.read_csv(path, low_memory=False))
             spreads = await _fetch_cfbd_spreads(client, BACKTEST_SEASON)
         df = pd.concat(frames, ignore_index=True)
-        self.book, self.rolling, records = _replay(df, resolve)
+        self.book, self.rolling, records, self.kalman = _replay(df, resolve)
         self.metrics = _compute_metrics(records, spreads)
         self._save_state()
 
@@ -464,6 +482,7 @@ class NcaafEngine(SportEngine):
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "model": self.model_name,
             "ratings": self.book.ratings,
+            "kalman": self.kalman.to_state(),
             "rolling": {team: list(w) for team, w in self.rolling.items()},
             "metrics": self.metrics,
         }
@@ -481,6 +500,9 @@ class NcaafEngine(SportEngine):
             config=ELO_CONFIG,
             ratings={k: float(v) for k, v in state.get("ratings", {}).items()},
         )
+        # A state written before v2 has no filter: fresh means/variances until
+        # the next refresh replays the archive (deterministic, seconds).
+        self.kalman = KalmanBook.from_state(KALMAN_CONFIG, state.get("kalman"))
         self.rolling = {
             team: deque((tuple(g) for g in window), maxlen=ROLLING_WINDOW)
             for team, window in state.get("rolling", {}).items()

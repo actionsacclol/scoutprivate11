@@ -9,9 +9,17 @@ Converting a point-estimate total into P(over) needs a scoring distribution:
              research (roughly: NBA ~19, WNBA ~16, NCAAB ~17, NFL ~13.5,
              NCAAF ~15.5). Discretized so integer lines can push.
 
-These are deliberately simple first-cut distributions — the walk-forward
-totals backtest (future work) is what will validate/retune them. EV accounts
-for pushes (refunds): EV = p_win*b - p_lose at net decimal payout b.
+These are deliberately simple first-cut distributions. VALIDATED 2026-09-02
+on the live store, strictly pre-game: on the one sport with a sample (soccer,
+n=108) the model total matches DraftKings' closing total on accuracy but its
+P(over) adds nothing beyond the market (log loss 0.688 vs 0.679; edges −2.8%
+[−26, +20]); pooled, the model's residual coefficient is negative (z −1.3),
+and where it disagrees with the market by 10+ probability points the market
+is right in both directions. The board had been flagging an edge on 66% of
+games — the model sits ~1.9 points from the early line while the line itself
+moves ~1.5 — which is a distribution problem, not information. Hence
+MIN_DISAGREEMENT below, and totals stay display-only, never picks/autobet.
+EV accounts for pushes (refunds): EV = p_win*b - p_lose at net decimal payout b.
 """
 from __future__ import annotations
 
@@ -38,6 +46,23 @@ SIGMA: dict[Sport, Optional[float]] = {
     Sport.NHL: None,
     Sport.SOCCER: None,
     # Tennis has no meaningful points total on our boards.
+}
+
+
+# Minimum distance between the model total and the book's line, in the
+# line's own units (goals for soccer/NHL), before an over/under edge is
+# shown at all. Roughly each sport's typical pre-game move of the total:
+# provisional floors, to be retuned once the totals sample is in the
+# hundreds. Below the floor the disagreement is inside the line's own noise.
+MIN_DISAGREEMENT: dict[Sport, float] = {
+    Sport.NBA: 3.0,
+    Sport.WNBA: 3.0,
+    Sport.NCAAB: 3.0,
+    Sport.NFL: 2.0,
+    Sport.NCAAF: 2.5,
+    Sport.MLB: 0.75,
+    Sport.NHL: 0.5,
+    Sport.SOCCER: 0.35,
 }
 
 
@@ -119,6 +144,9 @@ def totals_edges(card: GameCard) -> list[Edge]:
         return []
     edges: list[Edge] = []
     for o in quotes:
+        gap = abs(float(pred.predicted_total) - float(o.total_line))
+        if gap < MIN_DISAGREEMENT.get(card.game.sport, 0.0):
+            continue  # inside the line's own noise: no edge to show
         probs = outcome_probs(card.game.sport, float(pred.predicted_total), float(o.total_line))
         if probs is None:
             continue

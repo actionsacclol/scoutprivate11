@@ -25,11 +25,26 @@ backend/kryptscout/
                   elo.py (shared Elo engine: K, home adv, MOV, season carry)
                   modelio.py (stamps model pickles with the sklearn/xgboost
                   MAJOR.MINOR that wrote them; loaders reject a foreign stamp)
+                  arb.py / lean.py / fair.py — model-free signals: fee-inclusive
+                  true arbs, the exchange-lead reference (Kalshi/PM lead DK),
+                  and the sharp fair per side (depth-weighted microprice when
+                  the exchange book was read; thin books flagged) that the
+                  boost evaluator scores against. sgp.py — soccer same-game
+                  joint table (Dixon-Coles on the sharp 1X2 + O/U 2.5).
+                  forecast.py — the DISPLAYED probability: market where one
+                  exists, else the model labelled pre-line with its error.
+                  kalman.py — margin filter behind the college engines;
+                  calibrate.py — temperature scaling (WNBA 0.69, NFL 0.84).
+                  Display + tracking only; none feed picks/autobet.
   sports/         base.py (SportEngine ABC + registry; engines load via importlib)
                   nba nhl nfl mlb wnba soccer tennis ncaaf ncaab .py — one engine per sport
                   contract: upcoming_games() / predict() / refresh_data(); each module's
                   __main__ runs a holdout backtest (acc + log loss vs devigged close where data allows)
   datasources/    espn.py (schedules/results, no key), injuries.py (ESPN feeds),
+                  espn_predictor.py (ESPN's pre-game win probability, the
+                  PERFORMANCE benchmark's third reference; jobs/predictor.py backfills),
+                  mlb_context.py (home-plate umpire + lineup first-seen; scored
+                  with core/context rest days by tracker.context_trackers),
                   weather.py + stadiums.py (Open-Meteo + 62-venue dome table)
   odds/           providers.py (OddsProvider ABC + registry; providers independent & best-effort)
                   espn_odds.py polymarket.py kalshi.py (free) + the_odds_api.py (optional key)
@@ -74,7 +89,11 @@ shared/types.ts          the IPC contract (KryptApi-style window.scout surface) 
 ## Key conventions (read before editing)
 
 - **The honest-model rule.** The product's identity is that it never overclaims: the About page and README state the devigged closing line beats every v1 model; backtests use strictly pre-game info; PERFORMANCE (model record) and TRACKER (user record) are auto-graded and uneditable; the parlay page exists to talk users out of bad slips. Never add copy or features implying guaranteed profit, and never let affiliate concerns touch model output, odds display, or pick selection.
-- **Pick derivation exists twice on purpose.** `src/picks.ts` (UI) and `backend/kryptscout/store/picks.py` (ROI tracking) implement the same derivePick logic and must produce identical picks — same tie-breaks, same exclusions (no totals, no completed games). Change one, change both.
+- **The models carry no information beyond the closing line — measured, repeatedly (last: 2026-09-02).** Every "edge" found so far has been an instrument artifact: cross-venue vig, in-play prices, post-kickoff prediction rows, multiplicative devig on underdogs, and the pick's refreshed price being the venue's close. Before quoting any edge: score at the first-sight `entry_*` price, against a close carrying the pick's full market, under POWER devig (`remove_vig_power`), from strictly pre-game rows, at the executable ask. The only measured signal is microstructure — Kalshi/Polymarket lead DraftKings (`core/lean.py`, ~+1% same-book CLV, under the vig) — and the only deterministic edge is a fee-inclusive true arb (`core/arb.py`). Neither feeds picks or autobet; both are tracked. A model must clear a significant positive residual coefficient vs the close on held-out data before it may drive money.
+- **Exchange quotes are executable asks, not midpoints.** `odds/polymarket` and `odds/kalshi` price what a buyer pays; the two sides sum to 1 + spread, and `remove_vig` recovers the mid. Never "fix" this back to the midpoint — it overstates every exchange EV by half the spread.
+- **`NO_VALUE_SPORTS` is `{tennis, soccer}`** in both `store/picks.py` and `src/picks.ts`; a sport gets in by measuring negative alpha vs the close and gets out the same way.
+- **Predictions are refused after kickoff** (`db.upsert_prediction(starts_at=…)`), and `performance()`/`clv()` score only pre-game rows. Any new consumer of `predictions` must filter `generated_at < start_time` too.
+- **Pick derivation exists twice on purpose.** `src/picks.ts` (UI) and `backend/kryptscout/store/picks.py` (ROI tracking) implement the same derivePick logic and must produce identical picks — same tie-breaks, same exclusions (no totals, no completed games). Change one, change both. Since 2026-09-02 value edges are computed ONLY in the backend (`compute_edges`, sportsbook price vs the sharp fair from `core/fair.py`, MIN_GAP_PTS = 1); the TS side reads `card.edges` and mirrors the tiering (STRONG = Kalshi-led, LEAN = Polymarket-led) and the MODEL fallback (the displayed forecast's favourite). Exchanges never produce value picks, so autobet has nothing to bet by construction (`not_polymarket_priced`).
 - **modelMeta.ts is the only place backtest numbers live in src/.** Three copies drifted twice before; `/api/models` overrides at runtime, the table is the offline fallback. When an engine version bumps, update its one line.
 - **Typecheck with `npm run typecheck` (tsc --noEmit on both tsconfigs).** Never run bare `tsc` — it emits `.js` files next to the `.ts` sources, which silently shadow them in the Vite/Electron build (a whole "purge stale .js shadows" cleanup commit exists because of this).
 - **`KRYPT_SCOUT_USERDATA`** — set by the supervisor for packaged builds; the backend puts `data/` and `models/` under it (see `backend/kryptscout/config.py`). Unset (dev/CLI/tests), paths are repo-local. Never write inside the frozen bundle dir.
@@ -85,7 +104,7 @@ shared/types.ts          the IPC contract (KryptApi-style window.scout surface) 
 - **`odds_snapshots` is bucketed, not append-per-capture** (`db.SNAPSHOT_MIN_GAP_MINUTES`). `GET /api/board/{sport}` records on every read and the renderer polls all nine sports every 60s, which grew 1,300+ rows for one game. Buckets are fixed wall-clock windows — a window *relative* to the stored row ratchets forward on every poll and collapses the series to a single point.
 - **Referral links**: `src/config/referrals.ts` is the only file to edit for monetization; every book click app-wide routes through `bookLink()`. Affiliate disclosure lives on AboutPage, the BonusesPage banner, README, and DISCLAIMER — keep all four when copy changes.
 - **PyInstaller gotchas** (scripts/py-bundle.mjs): --onedir only (onefile blows the 60 s health window); `--collect-submodules kryptscout` (importlib engine loading); `--collect-binaries/--collect-data xgboost` but NOT `--collect-all xgboost` (drags in xgboost.testing → uninstalled `hypothesis` → build failure).
-- **Data-source hygiene**: runtime-download + cache under `RAW_DIR`, never redistribute files (football-data, tennis-data are personal-use). Tennis is TML (MIT, ATP) + tennis-data.co.uk (WTA) — do not reintroduce Sackmann CSVs (CC BY-NC-SA).
+- **Data-source hygiene**: runtime-download + cache under `RAW_DIR`, never redistribute files (football-data, tennis-data are personal-use). MoneyPuck (NHL xG) is stricter: non-commercial with credit and approval required before automated pulls, so the app neither fetches nor ships it — the user drops the listed `all_teams.csv` under `RAW_DIR/nhl/moneypuck/` and `sports/nhl.py` picks it up (`nhl-xg-v2`, Elo otherwise). Tennis is TML (MIT, ATP) + tennis-data.co.uk (WTA) — do not reintroduce Sackmann CSVs (CC BY-NC-SA).
 - Settings writes are atomic (stage → rename); sqlite connections are short-lived; the IPC contract lives in `electron/ipc.ts` + `electron/preload.ts` + `shared/types.ts` and the three must stay in sync.
 
 ## How to run / build

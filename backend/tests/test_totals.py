@@ -81,6 +81,14 @@ def test_totals_edges_lean_matches_model():
     assert 0 < edges[0].model_prob < 1
 
 
+def test_small_disagreement_shows_no_edge():
+    """Validated 2026-09-02: the board flagged an edge on 66% of games while
+    the model sat inside the line's own typical move. A 1.5-point gap on an
+    NBA total (floor 3.0) is noise, not an edge."""
+    assert totals.totals_edges(_card(total_pred=226.0, line=224.5)) == []
+    assert len(totals.totals_edges(_card(total_pred=228.0, line=224.5))) == 2
+
+
 def test_totals_edges_empty_without_quote_or_total():
     card = _card(232.0, 224.5)
     card.odds[0].total_line = None

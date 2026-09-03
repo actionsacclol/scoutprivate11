@@ -62,10 +62,28 @@ def _prediction(
     )
 
 
-def _edge(game: Game, side: str, ev: float, book: str = "dk", price: int = 130) -> Edge:
+def _edge(
+    game: Game, side: str, ev: float, book: str = "dk", price: int = 130,
+    ref_book: str | None = None,
+) -> Edge:
+    """A sharp-fair value edge. The reference defaults to Kalshi (STRONG) for
+    ev >= 0.04 and Polymarket (LEAN) below, which keeps the older tier tests
+    reading the way they did under the EV threshold they were written for."""
+    if ref_book is None:
+        ref_book = "kalshi" if ev >= 0.04 else "polymarket"
     return Edge(
         game_id=game.id, sport=game.sport, side=side, book=book, price=price,
         model_prob=0.55, market_prob=0.5, ev_per_dollar=ev, kelly_fraction=0.05,
+        fair_prob=0.56, ref_book=ref_book, gap_pts=5.0, agree=True,
+    )
+
+
+def _fair(game: Game, home: float, source: str = "kalshi", draw: float | None = None, thin: bool = False):
+    from kryptscout.core.schemas import FairPrices
+    away = 1.0 - home - (draw or 0.0)
+    return FairPrices(
+        game_id=game.id, sport=game.sport, source=source, sharp=source in ("kalshi", "polymarket"),
+        home=home, away=away, draw=draw, fetched_at=NOW, sources={source: home}, thin=thin,
     )
 
 
@@ -107,18 +125,36 @@ def test_value_pick_takes_best_moneyline_edge_and_excludes_totals():
     )
     p = picks.derive_pick(card)
     assert (p.side, p.team, p.book, p.price) == ("home", "Home Team", "dk", -120)
-    assert (p.ev, p.kelly, p.tier) == (0.05, 0.05, "STRONG")  # ev >= 0.04
+    assert (p.ev, p.kelly, p.tier) == (0.05, 0.05, "STRONG")  # Kalshi-led reference
+    assert (p.fair_prob, p.ref_book, p.prob) == (0.56, "kalshi", 0.56)
+    assert p.model_prob == 0.55  # the model's own number rides along as context
 
 
-def test_value_pick_lean_tier_below_strong_threshold():
+def test_value_pick_lean_tier_when_only_polymarket_references():
     g = _game("nba-2", NOW + timedelta(hours=4))
     card = GameCard(
         game=g,
         prediction=_prediction(g, 0.6),
-        edges=[_edge(g, "away", 0.039, book="fd", price=110)],
+        edges=[_edge(g, "away", 0.039, book="fd", price=110, ref_book="polymarket")],
     )
     p = picks.derive_pick(card)
     assert (p.side, p.team, p.tier) == ("away", "Away Team", "LEAN")
+
+
+def test_model_pick_follows_the_displayed_forecast():
+    """With a market forecast on the card the MODEL pick is the market's
+    favourite (what the card shows), and the model's own number is kept."""
+    from kryptscout.core.schemas import Forecast
+    g = _game("nba-fc", NOW + timedelta(hours=4))
+    card = GameCard(
+        game=g,
+        prediction=_prediction(g, 0.58),  # model likes home
+        forecast=Forecast(game_id=g.id, sport=g.sport, kind="market", source="kalshi", sharp=True,
+                          home=0.45, away=0.55, model_home=0.58, model_away=0.42),
+    )
+    p = picks.derive_pick(card)
+    assert (p.side, p.tier, p.ref_book) == ("away", "MODEL", "kalshi")
+    assert p.prob == 0.55 and p.model_prob == pytest.approx(0.42)
 
 
 def test_value_pick_equal_ev_keeps_first_edge_like_ts_reduce():
@@ -155,11 +191,28 @@ def test_no_value_sport_only_yields_model_picks():
     assert (p.side, p.model_prob) == ("home", 0.6)
 
 
-def test_draw_value_pick_resolves_team_to_draw():
+def test_soccer_edges_never_carry_a_value_tier():
+    """Soccer joined tennis in NO_VALUE_SPORTS (STRONG −11% walk-forward on
+    2,129 picks, CI below zero). A draw edge on the board still yields the
+    argmax MODEL pick, with DRAW resolved as the team name and no price."""
     g = _game("soccer-1", NOW + timedelta(hours=4), sport=Sport.SOCCER)
     card = GameCard(
         game=g,
         prediction=_prediction(g, 0.30, draw_prob=0.40, model="soccer-elo-v1"),
+        edges=[_edge(g, "draw", 0.06, book="dk", price=250)],
+    )
+    p = picks.derive_pick(card)
+    assert (p.side, p.team, p.tier) == ("draw", "DRAW", "MODEL")
+    assert (p.book, p.price, p.ev) == (None, None, None)
+
+
+def test_draw_value_pick_resolves_team_to_draw():
+    """The value-draw branch itself (team name DRAW) — exercised on a sport
+    that is not in NO_VALUE_SPORTS, since soccer no longer reaches it."""
+    g = _game("nba-draw", NOW + timedelta(hours=4))
+    card = GameCard(
+        game=g,
+        prediction=_prediction(g, 0.30, draw_prob=0.40),
         edges=[_edge(g, "draw", 0.06, book="dk", price=250)],
     )
     p = picks.derive_pick(card)
@@ -202,11 +255,11 @@ def test_no_pick_for_completed_game_or_missing_prediction():
 def test_pick_updates_before_start_and_freezes_after():
     g = _game("nba-10", NOW + timedelta(hours=6))
 
-    def card(ev: float, price: int, book: str) -> GameCard:
+    def card(ev: float, price: int, book: str, ref: str | None = None) -> GameCard:
         return GameCard(
             game=g,
             prediction=_prediction(g, 0.6),
-            edges=[_edge(g, "home", ev, book=book, price=price)],
+            edges=[_edge(g, "home", ev, book=book, price=price, ref_book=ref)],
         )
 
     counts = tracker.record_cards([card(0.05, -120, "dk")])
@@ -216,7 +269,7 @@ def test_pick_updates_before_start_and_freezes_after():
     assert first["locked_at"] is None
 
     # Line moved before start: same row refreshed, created_at preserved.
-    counts = tracker.record_cards([card(0.02, 105, "fd")])
+    counts = tracker.record_cards([card(0.02, 105, "fd", ref="polymarket")])
     assert counts["picks"] == 1
     (moved,) = _pick_rows()
     assert moved["id"] == first["id"]
@@ -230,6 +283,31 @@ def test_pick_updates_before_start_and_freezes_after():
     (frozen,) = _pick_rows()
     assert (frozen["book"], frozen["price"], frozen["tier"]) == ("fd", 105, "LEAN")
     assert frozen["locked_at"] is not None
+
+
+def test_entry_price_is_frozen_at_first_sight():
+    """`price` tracks the board until kickoff — 98% of recorded Polymarket
+    picks ended up carrying the exchange's closing mid — so the first priced
+    state is kept separately and never refreshed. CLV is measured against
+    the price you could actually have taken when the pick appeared."""
+    g = _game("nba-12", NOW + timedelta(hours=6))
+    pred = _prediction(g, 0.6)
+    # First sighting: MODEL pick, no price → no entry yet.
+    tracker.record_cards([GameCard(game=g, prediction=pred)])
+    (row,) = _pick_rows()
+    assert row["entry_price"] is None
+    # Lines post: first priced state becomes the entry.
+    tracker.record_cards(
+        [GameCard(game=g, prediction=pred, edges=[_edge(g, "home", 0.05, book="pm", price=120)])]
+    )
+    # Line moves and the pick flips side: price/side refresh, entry does not.
+    tracker.record_cards(
+        [GameCard(game=g, prediction=pred, edges=[_edge(g, "away", 0.06, book="pm", price=-105)])]
+    )
+    (row,) = _pick_rows()
+    assert (row["side"], row["price"]) == ("away", -105)
+    assert (row["entry_side"], row["entry_book"], row["entry_price"]) == ("home", "pm", 120)
+    assert row["entry_at"] is not None
 
 
 def test_first_pick_after_start_inserts_already_locked():
@@ -259,6 +337,19 @@ def _settle_value_pick(
         [GameCard(game=g, prediction=pred,
                   edges=[_edge(g, side, 0.05, price=price)])]
     )
+    if sport is Sport.SOCCER:
+        # Soccer no longer derives value picks (NO_VALUE_SPORTS), so price
+        # the recorded MODEL row by hand: the grading math for a priced
+        # draw/side is what these tests pin, not the derivation.
+        conn = db.connect()
+        with conn:
+            conn.execute(
+                """UPDATE picks SET side = ?, team = ?, book = 'dk', price = ?,
+                                    ev = 0.05, kelly = 0.02, tier = 'LEAN'
+                   WHERE game_id = ?""",
+                (side, "DRAW" if side == "draw" else g.home, price, g.id),
+            )
+        conn.close()
     if abandoned:
         # No result within lookback: settle marks the game abandoned.
         summary = asyncio.run(
@@ -468,6 +559,10 @@ PREDICTION = Prediction(
     home_win_prob=0.62, away_win_prob=0.38,
 )
 ODDS = MoneylineOdds(book="fakebook", fetched_at=NOW, home_ml=-120, away_ml=105)
+# Value edges are priced against the exchange fair (2026-09-02): Kalshi at
+# -140/+120 devigs to ~0.56 home; fakebook's -120 implies 0.545, a 1.7-point
+# gap, so the captured pick is a STRONG value pick at fakebook.
+KALSHI = MoneylineOdds(book="kalshi", fetched_at=NOW, home_ml=-140, away_ml=120)
 
 
 class FakeEngine:
@@ -489,7 +584,7 @@ def client(monkeypatch):
     monkeypatch.setattr(capture_job, "load_engines", lambda: None)
 
     async def fake_merged_odds(sport, games):
-        return {GAME.id: [ODDS]}
+        return {GAME.id: [ODDS, KALSHI]}
 
     # Both the board endpoint and capture_all go through the provider registry.
     monkeypatch.setattr(main.odds_providers, "merged_odds", fake_merged_odds)
@@ -555,9 +650,9 @@ def test_jobs_capture_records_board_and_pick(client):
     assert resp.status_code == 200
     results = resp.json()["results"]
     assert results == {
-        "nba": {"games": 1, "predictions": 1, "snapshots": 1, "picks": 1}
+        "nba": {"games": 1, "predictions": 1, "snapshots": 2, "picks": 1}
     }
-    # Home at -120 vs 0.62 is a +EV edge: the stored pick is a value pick.
+    # fakebook's -120 sits under the Kalshi fair: the stored pick is a value pick.
     (row,) = _pick_rows()
     assert (row["side"], row["book"], row["price"]) == ("home", "fakebook", -120)
     assert row["tier"] == "STRONG"
@@ -772,15 +867,53 @@ def test_market_fallback_kills_fake_edges():
     )
     odds = [_ml("polymarket", -1718, 1718)]
     filled = picks.apply_market_fallback(shrug, odds)
-    edges = picks.compute_edges(g.id, g.sport, filled, odds)
-    assert edges == []  # model == market -> no EV anywhere
+    edges = picks.compute_edges(g.id, g.sport, filled, odds, fair=_fair(g, 0.94, "polymarket"))
+    assert edges == []  # an exchange never beats its own fair
+
+
+def test_edges_need_a_sharp_fair_a_sportsbook_price_and_a_point_of_gap():
+    """The value edge, defined: a sportsbook price at least MIN_GAP_PTS below
+    the exchange fair. The model's opinion is irrelevant to whether an edge
+    exists; it rides along as context."""
+    g = _game("nba-edge", NOW + timedelta(hours=4))
+    pred = _prediction(g, 0.40)  # the model DISLIKES the home side
+    dk = _ml("draftkings", 100, -120)  # home +100: implied 0.50
+    # No fair at all, or a thin one, or a sportsbook fallback: no value edges.
+    assert picks.compute_edges(g.id, g.sport, pred, [dk], fair=None) == []
+    assert picks.compute_edges(g.id, g.sport, pred, [dk], fair=_fair(g, 0.56, thin=True)) == []
+    assert picks.compute_edges(g.id, g.sport, pred, [dk], fair=_fair(g, 0.56, "draftkings")) == []
+    # Kalshi says home 0.56: +100 sits 6 pts under fair -> one STRONG edge.
+    [edge] = picks.compute_edges(g.id, g.sport, pred, [dk], fair=_fair(g, 0.56))
+    assert (edge.side, edge.book, edge.ref_book) == ("home", "draftkings", "kalshi")
+    assert edge.fair_prob == 0.56 and edge.gap_pts == pytest.approx(6.0)
+    assert edge.ev_per_dollar == pytest.approx(0.56 * 2 - 1)
+    assert edge.model_prob == 0.40  # context only
+    # Under a point of gap: nothing.
+    assert picks.compute_edges(g.id, g.sport, pred, [dk], fair=_fair(g, 0.505)) == []
+    # The exchange's own price is never an edge.
+    assert picks.compute_edges(g.id, g.sport, pred, [_ml("kalshi", 100, -120)], fair=_fair(g, 0.56)) == []
+
+
+def test_edges_need_both_exchanges_to_agree_when_both_quote():
+    from kryptscout.core.schemas import FairPrices
+    g = _game("nba-agree", NOW + timedelta(hours=4))
+    pred = _prediction(g, 0.5)
+    dk = _ml("draftkings", 100, -120)
+    both = FairPrices(game_id=g.id, sport=g.sport, source="kalshi", sharp=True, home=0.56, away=0.44,
+                      fetched_at=NOW, sources={"kalshi": 0.56, "polymarket": 0.48})
+    assert picks.compute_edges(g.id, g.sport, pred, [dk], fair=both) == []  # PM says 0.48 < 0.50 implied
+    both.sources["polymarket"] = 0.53
+    [edge] = picks.compute_edges(g.id, g.sport, pred, [dk], fair=both)
+    assert edge.agree is True
+    [solo] = picks.compute_edges(g.id, g.sport, pred, [dk], fair=_fair(g, 0.56))
+    assert solo.agree is None  # nobody to agree with
 
 
 def test_compute_edges_caps_implausible_ev():
-    g = _game("tennis-4", NOW + timedelta(hours=4), sport=Sport.TENNIS)
-    shrug_kept = _prediction(g, 0.5, model="x").model_copy(update={"confidence": 0.5})
-    # 50% model vs +1718: EV ~ +8.09/$ — a model artifact, never a display edge.
-    edges = picks.compute_edges(g.id, g.sport, shrug_kept, [_ml("polymarket", -1718, 1718)])
+    g = _game("nba-cap", NOW + timedelta(hours=4))
+    pred = _prediction(g, 0.5)
+    # A fair of 0.90 against +1718 would be EV +8/$: a stale reference, not an edge.
+    edges = picks.compute_edges(g.id, g.sport, pred, [_ml("draftkings", -1718, 1718)], fair=_fair(g, 0.10))
     assert all(e.ev_per_dollar <= picks.MAX_PLAUSIBLE_EV for e in edges)
     assert not any(e.side == "away" for e in edges)
 
@@ -800,11 +933,12 @@ def test_compute_edges_ignores_named_in_play_feed():
     # count as another pre-game book, even before kickoff.
     g = _game("nba-live-1", NOW + timedelta(hours=4))
     pred = _prediction(g, 0.62)
+    fair = _fair(g, 0.56)
     live = _ml_at("draftkings_live_odds", 100, -120, NOW)
-    assert picks.compute_edges(g.id, g.sport, pred, [live], g.start_time) == []
+    assert picks.compute_edges(g.id, g.sport, pred, [live], g.start_time, fair) == []
     # The identical prices from the pre-game feed do produce an edge.
     pregame = _ml_at("draftkings", 100, -120, NOW)
-    assert picks.compute_edges(g.id, g.sport, pred, [pregame], g.start_time)
+    assert picks.compute_edges(g.id, g.sport, pred, [pregame], g.start_time, fair)
 
 
 def test_compute_edges_drops_quotes_taken_after_kickoff():
@@ -813,11 +947,12 @@ def test_compute_edges_drops_quotes_taken_after_kickoff():
     start = NOW - timedelta(hours=1)
     g = _game("nba-live-2", start)
     pred = _prediction(g, 0.62)
-    in_play = _ml_at("polymarket", 100, -120, start + timedelta(minutes=30))
-    assert picks.compute_edges(g.id, g.sport, pred, [in_play], start) == []
+    fair = _fair(g, 0.56)
+    in_play = _ml_at("draftkings", 100, -120, start + timedelta(minutes=30))
+    assert picks.compute_edges(g.id, g.sport, pred, [in_play], start, fair) == []
     # A quote captured before kickoff is still fair game.
-    before = _ml_at("polymarket", 100, -120, start - timedelta(minutes=30))
-    assert picks.compute_edges(g.id, g.sport, pred, [before], start)
+    before = _ml_at("draftkings", 100, -120, start - timedelta(minutes=30))
+    assert picks.compute_edges(g.id, g.sport, pred, [before], start, fair)
 
 
 def test_in_play_game_falls_through_to_model_pick():
@@ -826,8 +961,8 @@ def test_in_play_game_falls_through_to_model_pick():
     start = NOW - timedelta(hours=1)
     g = _game("nba-live-3", start)
     pred = _prediction(g, 0.62)
-    odds = [_ml_at("kalshi", 100, -120, start + timedelta(minutes=30))]
-    edges = picks.compute_edges(g.id, g.sport, pred, odds, start)
+    odds = [_ml_at("draftkings", 100, -120, start + timedelta(minutes=30))]
+    edges = picks.compute_edges(g.id, g.sport, pred, odds, start, _fair(g, 0.56))
     pick = picks.derive_pick(GameCard(game=g, prediction=pred, odds=odds, edges=edges))
     assert pick is not None
     assert pick.tier == "MODEL"
@@ -839,4 +974,4 @@ def test_compute_edges_without_kickoff_still_blocks_named_feeds():
     g = _game("nba-live-4", NOW + timedelta(hours=4))
     pred = _prediction(g, 0.62)
     live = _ml_at("draftkings_live", 100, -120, NOW)
-    assert picks.compute_edges(g.id, g.sport, pred, [live]) == []
+    assert picks.compute_edges(g.id, g.sport, pred, [live], fair=_fair(g, 0.56)) == []

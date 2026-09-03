@@ -2,6 +2,277 @@
 
 ## Unreleased
 
+- **The "closing-line signal" was the devig** (MEASUREMENT, 2026-09-02): with
+  the close backfilled over twice the sample (line_endpoints 431 → 895 games),
+  non-soccer exchange picks scored against the DraftKings close read
+  **+0.90% ± 0.20 under multiplicative devig and +0.16% ± 0.20 under power
+  devig** (n=277). Multiplicative devig over-credits underdogs — dogs +1.8%,
+  favourites 0.0%, and the split flips under power devig. Only MLB survives at
+  +0.30% ± 0.13, a tenth of the taker cost. Net of Polymarket's taker fee and
+  half-spread the same picks sit at about −2.8%; the open-to-close drift on
+  their side is −0.74 pts (the market moves *away* from them). A market-
+  anchored model (DraftKings + exchange gaps + model residual) adds nothing
+  beyond the close on either the live store (residual z −0.18) or 6,648
+  archive soccer matches vs Pinnacle closes (z −0.16 to −1.30). Consequences
+  below.
+- **`clv_vs_close` no longer manufactures a soccer edge** (FIX): soccer picks
+  are priced on a 3-way market but ESPN's DraftKings soccer close is 2-way (no
+  draw). Devigging two sides against a price set for three read as **+36.7% EV
+  at a 99.4% positive rate over 166 picks** and flipped the overall figure to
+  "significant". Rows whose close does not carry the pick's full market are now
+  counted in `n_unscoreable` and excluded from every column. The scorer also
+  reports `fair_ev_power_pct` (power devig) next to `fair_ev_pct`, and
+  `significant` is only ever claimed on the power figure.
+  `core.oddsmath.remove_vig_power` is new. `test_line_endpoints.py` pins both.
+- **Picks keep their first-sight entry price** (FIX): `picks.price` refreshes
+  until kickoff, so it was the venue's *last pre-game quote* — 98% of recorded
+  Polymarket picks carried the exchange's closing mid — and every "CLV" built
+  on it compared one close to another. New `entry_side/entry_book/entry_price/
+  entry_at` columns are written once and never refreshed (`db.upsert_pick`,
+  migrated on connect); `clv_vs_close` scores the entry when present and
+  reports `n_entry_recorded`.
+- **Post-kickoff predictions are refused** (FIX): 61% of the live `predictions`
+  table had been written after kickoff and scoring it reversed the market-vs-
+  model verdict. `db.upsert_prediction(starts_at=…)` returns None and writes
+  nothing once the game has started; `performance()` and `clv()` score each
+  game on its last *pre-game* row only, so legacy stores stay honest too.
+- **Soccer joins tennis in `NO_VALUE_SPORTS`** (both `store/picks.py` and
+  `src/picks.ts`): STRONG −11.0% walk-forward vs football-data closes
+  (n=2,129, CI below zero), live value picks −4.2% at midpoint prices with
+  same-book CLV −0.8% ± 0.6, and a slate capped to its best edges returns the
+  same ROI at every cap. Soccer now yields MODEL picks only, which also takes
+  it out of autobet.
+- **Exchange quotes are priced at the executable ask** (FIX): Polymarket and
+  Kalshi quotes were the bid/ask *midpoint*, which nobody can trade, so every
+  exchange EV on the board overstated by roughly half the spread (~1% of stake
+  on a 1c book). `odds/polymarket` now prices outcome 0 at its ask and outcome
+  1 at 1 − bid (`Candidate.prob1`, `extract_buy_prices`); `odds/kalshi` prices
+  each team at its yes ask. The pair sums to 1 + spread exactly as a book's
+  pair sums to 1 + vig; `remove_vig` recovers the mid for consensus purposes.
+  Edges that vanish under this change were never real.
+- **True arbs, model-free** (NEW): `core/arb.py` finds games where the best
+  price on every side across DraftKings, Polymarket and Kalshi buys $1 of
+  payout for less than $1 — net of exchange taker fees (0.05·p(1−p)
+  Polymarket, 0.07·p(1−p) Kalshi), pre-game quotes only, full-market quotes
+  only. `GameCard.arb`, an ARB badge on the tile, a "True arbs" section on
+  VALUE (every board, including no-value sports), sightings logged to
+  `arb_sightings` (one per game per 15 min) and served by `GET /api/arbs`.
+- **Exchange lead — the one signal that survived** (NEW): on 233 live games,
+  the DraftKings side that Kalshi favoured ~8h before kickoff predicted the
+  direction of DraftKings' own close **64% of the time (CI 58–70%; "favourite
+  shortens" gets 57%) for +1.05% ± 0.30 same-book CLV**, +1.37% with 6h+ of
+  lead, stable across halves, present on underdogs (Polymarket alone: 59%,
+  +0.87%). That is under DraftKings' ~2.2% per-side vig, so it is a
+  *reference*, not a pick: `core/lean.py` flags it (`GameCard.lean`, LEAD
+  badge), `lean_signals` freezes the first-sight DraftKings pair, and
+  `tracker.lean_clv()` (`GET /api/lean`, also `lean` in `/api/clv`, a section
+  on PERFORMANCE) scores it against the declared close. Nothing feeds it to
+  picks or autobet until the live figure clears the vig at n ≥ 70.
+- **Parlay verdict is market-anchored** (FIX): a backtest of auto-generated
+  slips from this app's own picks (2026-09-02) showed the model-fair verdict
+  stamping 87–100% of them +EV while random 2/3/4-leg slips lost 31/46/40% of
+  stake (CIs entirely below zero; the same legs as singles lost 13%). The
+  model's claimed hit rate ran 1.5–2.5× actual on EV-ranked slips; the
+  market-implied rate tracked reality in every policy. WIN CHANCE and FAIR
+  now come from the vig-free market (power devig of each leg's full-market
+  quote; `Leg.marketProb`, `ParlayMath.combinedMarketProb/marketFairDecimal/
+  marketDrag`), the model's number is a context line, and a "+EV" verdict can
+  only come from line shopping beating the vig-free market — never from the
+  model. No auto-parlay generator ships; the numbers say it would be a loss
+  generator with a rubber stamp.
+- **Build survives copy-paste deploys** (CHANGE): both tsconfigs typecheck
+  from the real entry points (`src/main.tsx`, `electron/main.ts`,
+  `electron/preload.ts`, `vite.config.ts`) instead of whole directories. The
+  tree is deployed by copying the folder over another checkout, and a copy
+  never deletes: a module removed here survives there and, under
+  `include: ["electron"]`, the stale `telegram-picks.ts` broke the release
+  typecheck (verified by copying 0.3.2 over a 0.3.1 clone). A file nobody
+  imports is now a file nobody checks — the same set Vite bundles. RELEASING.md
+  has the copy-paste procedure.
+- **NBA engine no longer frozen at the 2025-26 Finals** (FIX): a hard
+  `HISTORY_END = 2026-06-30` stopped `refresh_data` from processing any day
+  after June 30, so no refresh ever rewrote `nba_state.json` (the Engine
+  Room showed it stale all summer, RETRAIN rebuilt only the XGB pickle — which
+  the validation gate then parks behind Elo, so nothing visible changed) and
+  the 2026-27 season would never have been ingested. The replay now runs
+  through yesterday like WNBA. STATE_VERSION 3→4 so the ratings are rebuilt
+  under the retuned Elo constants (K 12, home 60, carry 0.5) from the cached
+  scoreboards instead of carrying K-20 ratings forward.
+- **Value picks are priced against the exchanges, not the model** (CHANGE):
+  `store/picks.compute_edges` now needs the sharp fair (`core/fair.py`) and
+  emits an edge only for a SPORTSBOOK price sitting at least one probability
+  point under it (`MIN_GAP_PTS`), both exchanges agreeing when both quote; an
+  exchange never beats its own fair. STRONG = Kalshi set the fair, LEAN =
+  Polymarket did; a claimed EV above SUSPECT_EV still demotes (a huge gap to
+  an exchange is a stale exchange). EV and Kelly are at the fair; the model's
+  own probability is carried as context (`Edge.model_prob`, `Pick.model_prob`)
+  and the fair as `Edge.fair_prob` / `Pick.fair_prob` (new picks column).
+  MODEL picks are the displayed forecast's favourite, so a card and its pick
+  never disagree. Why: every measurement this repo has run says model-vs-
+  market disagreement carries no information (claimed +9% EV measured +0.55%,
+  median 0, against the Kalshi fair; tailing it returns the vig), while this
+  exact rule replayed capture-by-capture over 45 days of the live store (656
+  games, 475 with both a DraftKings and an exchange quote) fired 59 times —
+  1.4 a day, 12% of eligible games — and the same-book close then moved
+  toward the pick by +1.75 ± 0.45 pts (59% toward / 10% flat / 31% against;
+  Kalshi-led +1.85, Polymarket-led +1.34). Realized ROI on the 51 graded
+  fires: −14.6%, noise at that n (σ ≈ 13 pts) but not profit — the edge sits
+  under DraftKings' vig. The tier is honest about being a closing-line signal.
+  Autobet gains a `not_polymarket_priced` skip: no value pick is exchange-
+  priced any more, so it idles by design until a maker mode exists. Copy on
+  PICKS, DASHBOARD, VALUE and the drawer names the reference instead of "our
+  model".
+- **Schedule-shaped trackers** (NEW): a `game_context` row per game with
+  rest days for both sides (from the store's own schedule, `core/context.py`,
+  written by `record_cards`), the MLB home-plate umpire and lineup postings
+  with first-seen timestamps (one hydrated MLB Stats API schedule call per
+  capture, `datasources/mlb_context.py`), and a referee-crew slot for the
+  NBA once a verified feed exists. `tracker.context_trackers()`
+  (`GET /api/trackers`) scores them against the market: the short-rest
+  soccer side at the last pre-game 3-way reference (the one large effect the
+  information sweep found, +7–11 pts vs Pinnacle on 478 games, fading by
+  season — n≈300 confirms or retires it), and actual-minus-close totals by
+  umpire. Never a model input; expected forecast gain is zero by design.
+- **NHL xG path, `nhl-xg-v2`** (NEW, opt-in by data): when MoneyPuck's
+  listed team game file sits under `raw/nhl/moneypuck/all_teams.csv`, the
+  NHL engine rates teams on expected goals instead of goals — EWMAs (span
+  25, season carry 0.6) of xG for/against at all situations and 5-on-5,
+  goals for/against, and half-speed PDO components — and serves a
+  walk-forward ridge logistic on the home-minus-away differences through a
+  0.88 logit scale. Measured on 13,511 regular-season games 2015-26, test
+  2024-26 (n=2,624): log loss 0.6739 vs Elo's 0.6798, −0.0059 [−0.0109,
+  −0.0007], resolution 0.010 vs 0.003; through the shipped code against the
+  engine's own live Elo log on the same 2,624 games, 0.6775 vs 0.6851
+  (−0.0076 [−0.0123, −0.0026]). Starter GSAx, OT-adjusted Elo,
+  Dixon-Coles, a margin Kalman and rest all measured null and are not
+  built. The app never fetches or ships the file: MoneyPuck's terms are
+  non-commercial with credit and ask for approval before automated pulls;
+  without the file the engine is the unchanged v1 Elo. Credit on About.
+  No free historical NHL closing lines exist any more (the SBRO archive is
+  dead), so the gap to the market is scored forward from October via the
+  lines backfill. ESPN's predictor answers 400 for hockey and NHL was
+  removed from its supported set.
+- **ESPN's predictor captured as a third reference** (NEW):
+  `datasources/espn_predictor.py` reads ESPN's pre-game win probability from
+  the same unauthenticated core API as the odds document (no key, no
+  published limit; concurrency 4, once per game, never on the board poll).
+  The capture job stores it for every upcoming supported game (MLB, WNBA,
+  NBA, NCAAF, NCAAB — the NFL and NHL endpoints answer 400) and
+  `python -m kryptscout.jobs.predictor` backfills settled history, since ESPN
+  serves the document for completed events frozen before kickoff (documents
+  modified after kickoff are stored with pre_game = 0 and never scored).
+  `tracker.espn_benchmark()` (`GET /api/benchmark`, a section on PERFORMANCE)
+  scores ESPN, Scout's pre-game forecast, the last pre-game exchange quote
+  and DraftKings' devigged close on the same games. Measured 2026-09-02:
+  Scout level with ESPN in MLB (0.6711 vs 0.6748), behind in WNBA (0.5250 vs
+  0.4996); nothing beats the close.
+- **The displayed forecast is the market** (CHANGE): every card now carries
+  `GameCard.forecast` (`core/forecast.py`) and the terminal's side
+  probabilities and fair lines read it. Where any full-market fair exists —
+  Kalshi, Polymarket, or DraftKings flagged as a book — that vig-free number
+  is the forecast and the model becomes context; before any venue quotes,
+  the model is shown labelled "pre-line ±N pts" with its measured error
+  against the eventual open (MLB 4, WNBA 8, soccer 10, NFL 10, NCAAF 16).
+  Measured 2026-09-02 on the engines' own logs and the live store: the
+  market beats every engine, every variant tried and ESPN's predictor, and
+  no blend survives out of sample (model coefficient beside the market −0.10,
+  z −0.4); switching the displayed number cuts held-out log loss by 0.013
+  (MLB), 0.028 (WNBA) and 0.067 (tennis). Picks, parlay legs and the boost
+  evaluator are unchanged — they already priced off the market.
+- **College engines move to a Kalman margin filter** (`ncaaf-kalman-v2`,
+  `ncaab-kalman-v2`; `core/kalman.py`): a state-space rating on score
+  margins with a tuned noise model, replacing Elo for the served win
+  probability (the Elo book still drives score nudges and FCS/non-D1
+  handling). Walk-forward on the engines' archives with paired bootstrap:
+  NCAAF log loss 0.4774 vs 0.5251 (−0.0477 [−0.0556, −0.0389], n=3,829),
+  NCAAB 0.5288 vs 0.5513 (−0.0225 [−0.0281, −0.0171], n=5,319). Elo's
+  margin-of-victory multiplier compresses the blowouts that carry most of
+  college's information; and college is where the exchanges quote almost
+  nothing, so the standalone number is the number users see. Replayed through
+  the shipped engine on its own FBS-vs-FBS 2025 record (n=808): 0.5327 vs
+  Elo's 0.5584. Old state files load with a fresh filter until the next
+  refresh replays the archive.
+- **NBA Elo retuned, NBA/WNBA/NFL recalibrated** (FIX): the calibration
+  audit found NBA and WNBA overstating favourites by 8 and 6 points (slopes
+  0.82 / 0.78) and the NFL by 3. NBA's constants go to K 12 / home 60 /
+  carry 0.5 (−0.0137 [−0.0235, −0.0035] held-out log loss; the 100-point
+  home edge was the overconfidence). WNBA applies temperature 0.69 and the
+  NFL 0.84 on the served log-odds (`core/calibrate.py`). MLB, NHL, soccer
+  and tennis were already calibrated and are untouched. Measured, not
+  built: gradient boosting, Glicko, K schedules, per-team home advantage,
+  rest/weather/referee/QB features and market blends all lost or were noise.
+- **Depth-weighted fair from the public order books** (NEW): `odds/polymarket`
+  reads the CLOB `/book` for each matched two-way market and `odds/kalshi`
+  reads `/markets/{ticker}/orderbook` for the home team's market (cached 90 s,
+  five in flight, best-effort — a failed fetch leaves the quote without
+  depth). Each exchange quote now carries `microprice_home` (the size-
+  weighted touch), `home/away_depth_usd` and `spread_pts`; `core/fair.py`
+  prices an exchange at its microprice, demotes a THIN book (touch under
+  $250 or spread over 3 pts) below any deep exchange and flags it, and
+  `core/lean.py` refuses a thin reference outright. This is the answer to
+  the lead rule's largest-gap bucket returning nothing: a big gap usually
+  meant the exchange was stale, not that DraftKings was wrong.
+- **Parlay promos priced against the market fair** (NEW): `src/boost.ts`
+  gains the exact formulas for a profit boost with a cap, a no-sweat token
+  (refund in site credit at 70% of face), parlay insurance (refund only when
+  exactly one leg loses), a bonus-bet stake, and the plain slip; a PROMO
+  panel under the parlay verdict prices the current slip under each. Backtest
+  (2026-09-02): plain and auto-generated slips lose 13–46%; a no-sweat SGP
+  token is worth ≈ +46% of a $25 cap even at a 20% hold, a 33% profit boost
+  on three −110 legs +11.6% (break-even 13/17/22% for 2/3/4 legs), insurance
+  ≈ +13%. Promos are the only parlay arithmetic that comes out positive.
+- **Soccer same-game joint table** (NEW): `core/sgp.py` solves each match's
+  (λ_home, λ_away, ρ) exactly from the sharp fair 1X2 and a real over/under
+  2.5 quote — two Poisson rates cannot hit 1X2 and O/U together, so the
+  Dixon-Coles low-score parameter is the third unknown — with a global
+  high-score diagonal δ = 0.30 fitted on 5,794 matches and validated on
+  1,455. Draw & under 2.5 runs +49% above the independent product in the
+  archive and the grid reproduces it; every result × O/U-2.5 pair sits
+  inside the observed 95% interval per league and per favourite strength.
+  `GameCard.sgp` carries the singles and every result|total joint; a
+  SAME-GAME PRICER on the PARLAY page prices a pair, shows the independent
+  product it corrects, and scores a typed SGP quote. Same-game legs stay
+  out of the independent builder. Not an edge: books hold 15–25% on SGPs and
+  already price this; it keeps the app's fair honest for SGP promos.
+  `test_sgp.py` pins eight archive vectors to 3e-4.
+- **Totals: validated, gated, and one placeholder removed** (FIX): the
+  never-run totals validation ran on the live store (soccer n=108: model
+  total MAE 1.28 vs the close's 1.31, P(over) log loss 0.688 vs 0.679,
+  edges −2.8% [−26, +20]; pooled model residual z −1.3; where the model
+  disagreed with the market by 10+ points the market was right both ways).
+  The board had flagged an edge on 66% of games, so `core/totals.py` now
+  requires the model to sit at least a sport-specific MIN_DISAGREEMENT from
+  the line (NBA/WNBA/NCAAB 3, NFL 2, NCAAF 2.5, MLB 0.75, NHL 0.5, soccer
+  0.35) before showing one, and the drawer leads with the market's devigged
+  P(over). Every engine now emits NO total when either team lacks scoring
+  history: WNBA had been shipping the placeholder 164.0 (2 × league average)
+  and the board printed UNDER edges against a constant.
+- **Intraday overreaction: tested, not tracked** (MEASUREMENT): on 451 games
+  the negative autocorrelation of DraftKings' pre-game moves replicates
+  (r −0.19 on non-zero changes) but half of it is exact quote undo in the
+  relayed feed, the move-so-far reverses by the close at β ≈ −0.03, and every
+  fade rule (6/3/1 h, 1–3 pt thresholds, exchange-unconfirmed subset) earns
+  0.0–0.4% same-book CLV on n up to 281. Not worth a feature.
+- **Boost evaluator** (NEW): `core/fair.py` puts a sharp fair probability on
+  every card (`GameCard.fair`: Kalshi, then Polymarket, then a flagged
+  sportsbook fallback; pre-game, full-market quotes only). The VALUE page
+  scores an odds boost or a profit-boost token against it — effective price,
+  EV per $1, edge in points, quarter-Kelly, EV at the promo's max stake, and
+  a PLAY / MARGINAL / PASS verdict (PLAY needs +2%, because the reference is
+  only good to about a point) — and TRACK logs it to MY BETS at the effective
+  price so it grades like any bet. This is the one place the app can point
+  at money: the model has no edge against a liquid line, but a boost is the
+  book handing out a price above the sharp fair by construction.
+- **Maker mode, measured before built** (MEASUREMENT): reconstructing resting
+  Polymarket bids over 211 recorded picks, joining the bid fills 39% of orders
+  (median 3h), earns the 0.5c half-spread and gives back 0.54c ± 0.20 of
+  adverse post-fill drift — fills are the picks the market was leaving.
+  Maker beats the current FAK path by +5.7 ± 1.6 pts of stake on filled
+  orders (the avoided fee), and collapses on 2c books. It turns a −3.5% cost
+  drag into ≈ −1% adverse selection with no model edge underneath: better,
+  not profitable. Not built; the dry-run spec (queue position, fill time from
+  the trades feed, +5/+30/+60 min drift) is in the session notes.
+
 - **Closing-line value is now backfillable** (MEASUREMENT): ESPN's odds
   document already carried each book's declared `open` and `close`, and the
   parser was reading only the flat current `moneyLine` and discarding both.

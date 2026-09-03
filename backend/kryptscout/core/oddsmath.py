@@ -38,6 +38,55 @@ def remove_vig(*american_prices: int) -> list[float]:
     return [r / total for r in raw]
 
 
+def remove_vig_power(*american_prices: int) -> list[float]:
+    """Vig-free probabilities by the POWER method: each raw implied
+    probability is raised to the exponent k that makes the market sum to 1.
+
+    `remove_vig` (multiplicative) shaves the same proportion off every side,
+    which hands longshots more probability than they deserve — the
+    favourite-longshot bias. Measured 2026-09-02 on 277 exchange picks scored
+    against the DraftKings close: multiplicative devig reported +0.90% ± 0.20
+    of "closing-line value", concentrated entirely in underdogs (+1.8% on
+    dogs, 0.0% on favourites); under this method the same picks read
+    +0.16% ± 0.20 and the dog/favourite split flipped. The edge was the devig.
+
+    So this is the conservative reference for any claimed edge on a dog, and
+    the one `tracker.clv_vs_close` reports alongside the multiplicative
+    figure. Bisection on k: the sum is monotone decreasing in k, and 60 halvings
+    of [0.05, 20] pin it well past float precision for 2- and 3-way markets.
+    An arb market (raw sum < 1) solves to k < 1 rather than raising.
+    """
+    raw = [implied_prob(p) for p in american_prices]
+    if not raw or any(not 0.0 < r < 1.0 for r in raw):
+        raise ValueError("Every price must imply a probability strictly in (0, 1)")
+    lo, hi = 0.05, 20.0
+    for _ in range(60):
+        k = (lo + hi) / 2.0
+        if sum(r ** k for r in raw) > 1.0:
+            lo = k  # still over 1: push probabilities down harder
+        else:
+            hi = k
+    k = (lo + hi) / 2.0
+    out = [r ** k for r in raw]
+    total = sum(out)  # residual float dust only
+    return [v / total for v in out]
+
+
+def microprice(bid: float, ask: float, bid_size: float, ask_size: float) -> float:
+    """Size-weighted fair probability at the touch.
+
+    The microprice leans toward the side with LESS resting size — a thin ask
+    is about to be lifted, so fair sits nearer the ask — and it is the
+    standard depth-aware midpoint in market microstructure. With equal sizes
+    it is the plain mid; with no size information callers should fall back
+    to the mid.
+    """
+    total = bid_size + ask_size
+    if total <= 0:
+        return (bid + ask) / 2.0
+    return (ask * bid_size + bid * ask_size) / total
+
+
 def expected_value(model_prob: float, american: int) -> float:
     """Expected profit per $1 staked, given our probability and the offered price."""
     dec = american_to_decimal(american)

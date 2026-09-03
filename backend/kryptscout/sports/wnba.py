@@ -40,6 +40,7 @@ from typing import Iterator, Optional
 import httpx
 
 from kryptscout.config import DATA_DIR, RAW_DIR
+from kryptscout.core.calibrate import temper
 from kryptscout.core.elo import EloBook, EloConfig
 from kryptscout.core.schemas import Game, Prediction, Sport
 from kryptscout.datasources import espn
@@ -62,6 +63,12 @@ ELO_CONFIG = EloConfig(
     mov_scaling=True,
     season_carry=0.75,
 )
+# Calibration audit 2026-09-02 on this engine's walk-forward log (n=869):
+# slope 0.78, favourites overstated by 6.3 points, the 0.8–0.9 bin hitting
+# 77%. Temperature 0.69 on the Elo log-odds fixed it on the held-out slice
+# (+0.0021 log loss). Applied to the served probability and the backtest
+# log alike so the reported metrics describe what ships.
+CALIBRATION_TEMPERATURE = 0.69
 
 
 def _season_key(day: date) -> int:
@@ -101,7 +108,7 @@ class WnbaEngine(SportEngine):
         now = datetime.now(timezone.utc)
         predictions: list[Prediction] = []
         for game in games:
-            home_prob = self.elo.expected(game.home, game.away)
+            home_prob = temper(self.elo.expected(game.home, game.away), CALIBRATION_TEMPERATURE)
             home_score = (
                 self._avg(self.points_for, game.home)
                 + self._avg(self.points_against, game.away)
@@ -118,6 +125,10 @@ class WnbaEngine(SportEngine):
                 - self.elo.get(game.away)
             )
             nudge = 0.5 * (elo_diff / 100.0)
+            # A team with no scoring history would price at the league-average
+            # placeholder — a constant, not a forecast. The board printed UNDER
+            # edges against exactly that (WNBA, 2026-09-02). Emit no total.
+            scored = bool(self.points_for.get(game.home)) and bool(self.points_for.get(game.away))
             predictions.append(
                 Prediction(
                     game_id=game.id,
@@ -126,9 +137,9 @@ class WnbaEngine(SportEngine):
                     generated_at=now,
                     home_win_prob=home_prob,
                     away_win_prob=1.0 - home_prob,
-                    predicted_home_score=round(home_score + nudge, 1),
-                    predicted_away_score=round(away_score - nudge, 1),
-                    predicted_total=round(total, 1),
+                    predicted_home_score=round(home_score + nudge, 1) if scored else None,
+                    predicted_away_score=round(away_score - nudge, 1) if scored else None,
+                    predicted_total=round(total, 1) if scored else None,
                     confidence=abs(home_prob - 0.5) * 2.0,
                 )
             )
@@ -181,7 +192,7 @@ class WnbaEngine(SportEngine):
         self, day: date, home: str, away: str, home_score: int, away_score: int
     ) -> None:
         """One historical result: log the pre-game prob, then update state."""
-        prob = self.elo.expected(home, away)
+        prob = temper(self.elo.expected(home, away), CALIBRATION_TEMPERATURE)
         home_won = home_score > away_score
         # 5-field rows: team names let the dollar-ROI backtest join this log
         # against backfilled Polymarket prices (store/roibacktest.py).

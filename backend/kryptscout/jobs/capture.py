@@ -19,7 +19,13 @@ import asyncio
 import importlib
 import logging
 
+from kryptscout.core import arb as arb_mod
+from kryptscout.core import fair as fair_mod
+from kryptscout.core import forecast as forecast_mod
+from kryptscout.core import lean as lean_mod
+from kryptscout.core import sgp as sgp_mod
 from kryptscout.core.schemas import GameCard, MoneylineOdds, Sport
+from kryptscout.datasources import espn_predictor, mlb_context
 from kryptscout.odds import providers as odds_providers
 from kryptscout.sports import base as engines
 from kryptscout.store import picks as picks_mod
@@ -39,8 +45,10 @@ def load_engines() -> None:
             module = importlib.import_module(f"kryptscout.sports.{name}")
             engines.register(module.build_engine())
         except Exception as exc:  # noqa: BLE001
+            # exc_info: an import that only fails inside a frozen bundle needs
+            # the traceback to be diagnosable from a user's log export.
             logging.getLogger("kryptscout").warning(
-                "engine %s unavailable: %s", name, exc
+                "engine %s unavailable: %s", name, exc, exc_info=True
             )
 
 
@@ -62,13 +70,33 @@ async def capture_sport(sport: Sport, with_odds: bool) -> dict[str, int]:
         # Same fallback + edges the board computes, so recorded picks match
         # the terminal exactly (incl. market-consensus fills).
         pred = picks_mod.apply_market_fallback(predictions.get(game.id), odds)
+        fair = fair_mod.sharp_fair(game.id, sport, odds, game.start_time)
         edges = (
-            picks_mod.compute_edges(game.id, sport, pred, odds, game.start_time)
+            picks_mod.compute_edges(game.id, sport, pred, odds, game.start_time, fair)
             if pred
             else []
         )
-        cards.append(GameCard(game=game, prediction=pred, odds=odds, edges=edges))
-    return tracker.record_cards(cards)
+        card = GameCard(
+            game=game, prediction=pred, odds=odds, edges=edges,
+            arb=arb_mod.find_arb(game.id, sport, odds, game.start_time),
+            lean=lean_mod.find_lean(game.id, sport, odds, game.start_time),
+            fair=fair,
+        )
+        card.sgp = sgp_mod.sgp_fair(card)
+        card.forecast = forecast_mod.display_forecast(card)
+        cards.append(card)
+    counts = tracker.record_cards(cards)
+    # ESPN's predictor, once per game, best-effort: a free third reference
+    # for the PERFORMANCE benchmark. Never on the board poll.
+    espn_rows = await espn_predictor.capture([c.game for c in cards])
+    if espn_rows:
+        counts["espn"] = espn_rows
+    # MLB home-plate umpire + lineup first-seen (one schedule call), best-effort.
+    if sport is Sport.MLB:
+        ctx_rows = await mlb_context.capture(cards)
+        if ctx_rows:
+            counts["mlb_context"] = ctx_rows
+    return counts
 
 
 async def capture_all(

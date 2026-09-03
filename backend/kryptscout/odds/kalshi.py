@@ -5,8 +5,12 @@ winners live in per-sport series (KXMLBGAME, KXWNBAGAME, ...): each game is
 one event (e.g. ``KXMLBGAME-26JUL121610TORSD``) holding one binary market
 per team whose Yes side is that team winning. Prices arrive as dollar
 strings ("0.4900") on current payloads or integer cents (49) on older ones;
-both mean probability 0.49. We convert the yes bid/ask midpoint to American
-odds with core.oddsmath.prob_to_american.
+both mean probability 0.49. We convert the yes ASK — what a buyer of that
+team actually pays — to American odds with core.oddsmath.prob_to_american.
+The two teams' asks sum to 1 + spread, like a sportsbook pair sums to
+1 + vig; `remove_vig` recovers the mid for consensus purposes while EV is
+measured against the executable price. (Until 2026-09-02 this was the
+bid/ask midpoint, which overstated every Kalshi edge by half the spread.)
 
 These are ~vig-free real-money probabilities — no bookmaker margin, just
 the bid/ask spread — often the sharpest free moneyline signal available.
@@ -19,13 +23,13 @@ import asyncio
 import logging
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Optional
 
 import httpx
 
-from kryptscout.core.oddsmath import prob_to_american
+from kryptscout.core.oddsmath import microprice, prob_to_american
 from kryptscout.core.schemas import Game, MoneylineOdds, Sport
 from kryptscout.odds.providers import OddsProvider
 
@@ -85,6 +89,8 @@ class KalshiEvent:
     game_date: Optional[date]  # Eastern date from the ticker
     start: Optional[datetime]  # UTC, when the ticker carries HHMM
     team_probs: list[tuple[str, float]]  # (team name, yes-win probability)
+    # team name -> market ticker, for the public order-book endpoint.
+    tickers: dict[str, str] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -161,10 +167,11 @@ def _price_prob(market: dict, base: str) -> Optional[float]:
 
 
 def market_prob(market: dict) -> Optional[float]:
-    """Yes-side probability from the order book; None when illiquid.
+    """Executable yes-side price from the order book; None when illiquid.
 
-    Mid of yes bid/ask when the book is real; a degenerate book (bid ~0 and
-    ask ~1) is skipped; a wide book falls back to the last trade price.
+    The yes ASK when the book is real — a buyer of this team pays the ask,
+    not the mid; a degenerate book (bid ~0 and ask ~1) is skipped; a wide
+    book falls back to the last trade price.
     """
     bid = _price_prob(market, "yes_bid")
     ask = _price_prob(market, "yes_ask")
@@ -173,7 +180,7 @@ def market_prob(market: dict) -> Optional[float]:
         if bid <= 0.01 and ask >= 0.99:
             return None  # nobody quoting either side
         if 0.0 < bid < ask < 1.0 and (ask - bid) <= MAX_SPREAD:
-            return (bid + ask) / 2.0
+            return ask
     if last is not None and 0.0 < last < 1.0:
         return last
     return None
@@ -227,7 +234,99 @@ def parse_markets(raw_markets: list[dict]) -> list[KalshiEvent]:
             event = KalshiEvent(ticker, game_date, start, [])
             grouped[ticker] = event
         event.team_probs.append((team, prob))
+        ticker_id = str(market.get("ticker") or "")
+        if ticker_id:
+            event.tickers[team] = ticker_id
     return list(grouped.values())
+
+
+# ---------------------------------------------------------------------------
+# Order books (public, no key)
+# ---------------------------------------------------------------------------
+
+BOOK_TTL = 90.0
+BOOK_TIMEOUT = 5.0
+_book_cache: dict[str, tuple[float, Optional[dict]]] = {}
+
+TopOfBook = tuple[float, float, float, float]  # yes bid, yes ask, bid size, ask size
+
+
+def _levels(raw: Any, scale: float) -> list[tuple[float, float]]:
+    out: list[tuple[float, float]] = []
+    for level in raw or []:
+        try:
+            out.append((float(level[0]) * scale, float(level[1])))
+        except (TypeError, ValueError, IndexError):
+            continue
+    return out
+
+
+def top_of_book(orderbook: Optional[dict]) -> Optional[TopOfBook]:
+    """(yes bid, yes ask, size at bid, size at ask) from GET /markets/{t}/orderbook.
+
+    Kalshi publishes two BID ladders: `yes_dollars` (bids for YES) and
+    `no_dollars` (bids for NO). A YES buyer lifts the best NO bid, so the yes
+    ask is 1 − best NO bid and its size is that level's size (contracts, $1
+    payout each). Legacy payloads carry the same ladders in cents under
+    `orderbook.yes/no`. None for empty or crossed books.
+    """
+    if not isinstance(orderbook, dict):
+        return None
+    fp = orderbook.get("orderbook_fp") or {}
+    yes = _levels(fp.get("yes_dollars"), 1.0)
+    no = _levels(fp.get("no_dollars"), 1.0)
+    if not yes or not no:
+        legacy = orderbook.get("orderbook") or {}
+        yes = _levels(legacy.get("yes"), 0.01)
+        no = _levels(legacy.get("no"), 0.01)
+    if not yes or not no:
+        return None
+    bid, bid_size = max(yes, key=lambda level: level[0])
+    no_bid, no_size = max(no, key=lambda level: level[0])
+    ask = 1.0 - no_bid
+    if not (0.0 < bid < ask < 1.0):
+        return None
+    return bid, ask, bid_size, no_size
+
+
+async def _fetch_orderbook(ticker: str) -> Optional[dict]:
+    """One market's order book, cached BOOK_TTL seconds; None on any failure."""
+    if not ticker:
+        return None
+    cached = _book_cache.get(ticker)
+    if cached and time.monotonic() - cached[0] < BOOK_TTL:
+        return cached[1]
+    payload: Optional[dict] = None
+    try:
+        async with httpx.AsyncClient(timeout=BOOK_TIMEOUT) as client:
+            resp = await client.get(f"{BASE_URL}/markets/{ticker}/orderbook", params={"depth": 1})
+            resp.raise_for_status()
+            data = resp.json()
+            payload = data if isinstance(data, dict) else None
+    except (httpx.HTTPError, asyncio.TimeoutError, ValueError) as exc:
+        logger.debug("kalshi: orderbook fetch failed for %s: %s", ticker, exc)
+    _book_cache[ticker] = (time.monotonic(), payload)
+    return payload
+
+
+def attach_depth(entry: MoneylineOdds, tob: TopOfBook, side: str) -> None:
+    """Write microprice/depth/spread onto `entry` from one team market's book.
+
+    `side` is the team the book belongs to. Buying that side lifts its yes
+    ask (depth = ask_size·ask); buying the other side is buying NO here,
+    which hits the yes bid (depth = bid_size·(1 − bid)).
+    """
+    bid, ask, bid_size, ask_size = tob
+    micro = microprice(bid, ask, bid_size, ask_size)
+    own_depth = ask_size * ask
+    other_depth = bid_size * (1.0 - bid)
+    if side == "home":
+        entry.microprice_home = micro
+        entry.home_depth_usd, entry.away_depth_usd = own_depth, other_depth
+    else:
+        entry.microprice_home = 1.0 - micro
+        entry.home_depth_usd, entry.away_depth_usd = other_depth, own_depth
+    entry.spread_pts = (ask - bid) * 100.0
 
 
 # ---------------------------------------------------------------------------
@@ -282,10 +381,10 @@ def _sides_for(event: KalshiEvent, game: Game) -> Optional[dict[str, float]]:
     return sides or None
 
 
-def match_game(game: Game, events: list[KalshiEvent], now: datetime) -> Optional[MoneylineOdds]:
+def _match_event(game: Game, events: list[KalshiEvent]) -> Optional[tuple[KalshiEvent, dict[str, float]]]:
     """Exactly-one-event matching on Eastern game date (+ start time if known)."""
     game_date_et = game.start_time.astimezone(_EASTERN).date()
-    hits: list[dict[str, float]] = []
+    hits: list[tuple[KalshiEvent, dict[str, float]]] = []
     for event in events:
         if event.game_date is not None and event.game_date != game_date_et:
             continue
@@ -293,7 +392,7 @@ def match_game(game: Game, events: list[KalshiEvent], now: datetime) -> Optional
             continue
         sides = _sides_for(event, game)
         if sides is not None:
-            hits.append(sides)
+            hits.append((event, sides))
     if len(hits) != 1:
         if len(hits) > 1:
             logger.debug(
@@ -301,7 +400,25 @@ def match_game(game: Game, events: list[KalshiEvent], now: datetime) -> Optional
                 game.away, game.home, len(hits),
             )
         return None
-    sides = hits[0]
+    return hits[0]
+
+
+def _side_tickers(event: KalshiEvent, game: Game) -> dict[str, str]:
+    """{"home"/"away": market ticker} for the teams this event prices."""
+    out: dict[str, str] = {}
+    for team, ticker in event.tickers.items():
+        side = pick_side(team, game)
+        if side is not None and side not in out:
+            out[side] = ticker
+    return out
+
+
+def match_game(game: Game, events: list[KalshiEvent], now: datetime) -> Optional[MoneylineOdds]:
+    """The matched event's moneyline, or None (see _match_event)."""
+    matched = _match_event(game, events)
+    if matched is None:
+        return None
+    sides = matched[1]
     home_prob, away_prob = sides.get("home"), sides.get("away")
     if (
         home_prob is not None
@@ -336,6 +453,7 @@ class KalshiProvider(OddsProvider):
             return {}
         now = datetime.now(timezone.utc)
         result: dict[str, list[MoneylineOdds]] = {}
+        wants: list[tuple[MoneylineOdds, dict[str, str]]] = []
         for game in games:
             if game.completed:
                 continue
@@ -346,7 +464,34 @@ class KalshiProvider(OddsProvider):
                 continue
             if entry is not None:
                 result[game.id] = [entry]
+                matched = _match_event(game, events)
+                if matched is not None:
+                    wants.append((entry, _side_tickers(matched[0], game)))
+        await _attach_books(wants)
         return result
+
+
+BOOK_CONCURRENCY = 5
+
+
+async def _attach_books(wants: list[tuple[MoneylineOdds, dict[str, str]]]) -> None:
+    """Best-effort depth from ONE team market per game (home first), 5 at a time."""
+    if not wants:
+        return
+    gate = asyncio.Semaphore(BOOK_CONCURRENCY)
+
+    async def one(entry: MoneylineOdds, tickers: dict[str, str]) -> None:
+        for side in ("home", "away"):
+            ticker = tickers.get(side)
+            if not ticker:
+                continue
+            async with gate:
+                tob = top_of_book(await _fetch_orderbook(ticker))
+            if tob is not None:
+                attach_depth(entry, tob, side)
+                return
+
+    await asyncio.gather(*(one(*w) for w in wants), return_exceptions=True)
 
 
 def build_provider() -> KalshiProvider:

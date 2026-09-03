@@ -6,6 +6,7 @@ import { bookAbbrev, fmtAmerican, fmtPct } from '../oddsmath'
 import { edgeSideName, fmtKick, matchLabel } from '../cardview'
 import { NO_VALUE_SPORTS } from '../picks'
 import BookLink from './BookLink'
+import BoostEvaluator from './BoostEvaluator'
 import { Badge, Card, Empty, Page, Section, StatTile } from './common'
 import { cls } from '../utils/format'
 
@@ -100,6 +101,16 @@ export default function ValuePage({ boards, demo, apiUp, onJump }: Props) {
     return all
   }, [boards])
 
+  // True arbs are model-free, so every board counts — including the sports
+  // whose model is gated off the scanner above.
+  const arbs = useMemo(
+    () =>
+      SPORTS.flatMap((sport) => (boards[sport] ?? []).filter((c) => c.arb)).sort(
+        (a, b) => (b.arb?.net_margin_pct ?? 0) - (a.arb?.net_margin_pct ?? 0),
+      ),
+    [boards],
+  )
+
   const sorted = useMemo(() => {
     const val = (e: Entry): number => {
       switch (sort) {
@@ -138,7 +149,7 @@ export default function ValuePage({ boards, demo, apiUp, onJump }: Props) {
   return (
     <Page
       title="Value"
-      subtitle="Every positive-EV edge across all nine boards — model vs vig-free market."
+      subtitle="Every sportsbook price that sits at least a point under the exchange fair — the reference that led DraftKings' close 64% of the time. Not the model."
       actions={
         <>
           {demo && <Badge tone="gradient">DEMO</Badge>}
@@ -166,6 +177,74 @@ export default function ValuePage({ boards, demo, apiUp, onJump }: Props) {
       </Section>
 
       <Section
+        title="Boost evaluator · sharp fair"
+        description="Score an odds boost or a profit-boost token against the exchange fair price — Kalshi first, then Polymarket, the reference that led DraftKings' close 64% of the time. No model involved: a boost is the book handing out a price above fair, and this is where recreational bettors actually get paid. TRACK logs it to MY BETS at the effective price."
+      >
+        <BoostEvaluator boards={boards} demo={demo} />
+      </Section>
+
+      <Section
+        title="True arbs · model-free"
+        description="Every side of a game bought at the best price across DraftKings, Polymarket and Kalshi for less than $1 of payout, net of exchange taker fees. No forecast involved — the only edge on this page that does not depend on the model being right. Rare, small, and gone in minutes."
+      >
+        {arbs.length === 0 ? (
+          <div className="rounded-2xl border border-dashed border-white/10 bg-black/20 px-6 py-5 text-center">
+            <div className="text-sm font-semibold text-white">No locked-in positions right now</div>
+            <p className="mx-auto mt-1.5 max-w-lg text-xs text-krypt-muted">
+              Checked on every odds poll. Sightings are logged to the store even when you are not looking.
+            </p>
+          </div>
+        ) : (
+          <Card padded={false} className="overflow-hidden">
+            <div className="overflow-x-auto">
+              <table className="w-full border-collapse text-left">
+                <thead>
+                  <tr className="border-b border-white/10 bg-white/[0.02]">
+                    <th className={TH}>Sport</th>
+                    <th className={TH}>Matchup</th>
+                    <th className={TH}>Legs · stake split</th>
+                    <th className={cls(TH, 'text-right')}>Gross</th>
+                    <th className={cls(TH, 'text-right')}>Locked · net of fees</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {arbs.map((card) => {
+                    const arb = card.arb as NonNullable<GameCard['arb']>
+                    return (
+                      <tr
+                        key={card.game.id}
+                        onClick={() => onJump(card.game.sport, card.game.id)}
+                        className="cursor-pointer border-b border-white/5 transition hover:bg-white/[0.03]"
+                      >
+                        <td className={cls(TD, 'font-mono text-[10px] uppercase text-krypt-muted')}>
+                          {SPORT_TAG[card.game.sport]}
+                        </td>
+                        <td className={cls(TD, 'text-xs text-white')}>{matchLabel(card)}</td>
+                        <td className={cls(TD, 'font-mono text-[10px] text-white/80')}>
+                          {arb.legs
+                            .map(
+                              (l) =>
+                                `${l.side === 'home' ? card.game.home : l.side === 'away' ? card.game.away : 'DRAW'} ${fmtAmerican(l.price)} @ ${bookAbbrev(l.book)} · ${Math.round(l.stake_fraction * 100)}%`,
+                            )
+                            .join('  /  ')}
+                        </td>
+                        <td className={cls(TD, 'text-right font-mono text-[11px] text-krypt-muted')}>
+                          +{arb.margin_pct.toFixed(2)}%
+                        </td>
+                        <td className={cls(TD, 'text-right font-mono text-[11px] font-semibold text-amber-200')}>
+                          +{arb.net_margin_pct.toFixed(2)}%
+                        </td>
+                      </tr>
+                    )
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </Card>
+        )}
+      </Section>
+
+      <Section
         title="Edge scanner"
         description="Sorted by EV — click a row to jump to the game card on its board."
       >
@@ -186,8 +265,8 @@ export default function ValuePage({ boards, demo, apiUp, onJump }: Props) {
                     <th className={TH}>Side</th>
                     <th className={TH}>Book</th>
                     <SortHeader label="Price" col="price" sort={sort} dir={dir} onSort={onSort} right />
-                    <th className={TH} title="Model win probability vs market-implied probability (vig removed)">
-                      Model / Mkt
+                    <th className={TH} title="The exchange fair probability the edge is priced against vs the book's own vig-removed probability">
+                      Fair / Book
                     </th>
                     <SortHeader
                       label="EV"
@@ -196,7 +275,7 @@ export default function ValuePage({ boards, demo, apiUp, onJump }: Props) {
                       dir={dir}
                       onSort={onSort}
                       right
-                      help="EV = expected value: average profit per $1 bet if the model probability is right"
+                      help="EV = expected value: average profit per $1 bet if the exchange fair is right"
                     />
                     <SortHeader
                       label="Kelly"
@@ -243,7 +322,7 @@ export default function ValuePage({ boards, demo, apiUp, onJump }: Props) {
                           {fmtAmerican(e.edge.price)}
                         </td>
                         <td className={TD}>
-                          <DualBar model={e.edge.model_prob} market={e.edge.market_prob} />
+                          <DualBar model={e.edge.fair_prob ?? e.edge.model_prob} market={e.edge.market_prob} />
                         </td>
                         <td className={cls(TD, 'text-right font-mono text-[11px] font-semibold text-emerald-300')}>
                           +{fmtPct(e.edge.ev_per_dollar)}%

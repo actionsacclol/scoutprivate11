@@ -20,8 +20,12 @@ export type PickTier = 'STRONG' | 'LEAN' | 'MODEL'
 export type PickKind = 'value' | 'model'
 export type PickSide = 'home' | 'away' | 'draw'
 
-/** EV threshold (per $1) separating STRONG from LEAN value picks. */
-export const STRONG_EV = 0.04
+/** A value pick is a SPORTSBOOK price that beats the sharp fair (Kalshi, else
+ * Polymarket) by at least this many probability points — measured 2026-09-02
+ * as the only replicating signal (+2.1% closing-line value; the model's own
+ * disagreement with the market carries none). STRONG = Kalshi-led, LEAN =
+ * Polymarket-led. Mirrored in backend store/picks.py, which computes edges. */
+export const MIN_GAP_PTS = 1.0
 /** EV above this is a model artifact (fallback probs vs a longshot price),
  * never real market inefficiency — mirrored in backend store/picks.py. */
 export const MAX_PLAUSIBLE_EV = 0.4
@@ -30,10 +34,13 @@ export const MAX_PLAUSIBLE_EV = 0.4
  * huge edge against a liquid market means the MODEL is wrong. Mirrored in
  * backend store/picks.py. */
 export const SUSPECT_EV = 0.15
-/** Sports whose model has measured NEGATIVE alpha vs the market (tennis:
- * −18% walk-forward ROI, −13u live, CLV ≈ 0). Never given a value tier —
- * MODEL picks only. Mirrored in backend store/picks.py. */
-export const NO_VALUE_SPORTS: ReadonlySet<Sport> = new Set(['tennis'] as Sport[])
+/** Sports whose model has measured NEGATIVE alpha vs the market. Never given
+ * a value tier — MODEL picks only. Mirrored in backend store/picks.py.
+ *   tennis: −18% walk-forward ROI, −13u live, CLV ≈ 0.
+ *   soccer: STRONG −11% walk-forward vs closing lines (n=2,129, CI below
+ *   zero); live value picks −4% with same-book CLV −0.8%, and the edge
+ *   ranker returns the same ROI at every cap (2026-09-02). */
+export const NO_VALUE_SPORTS: ReadonlySet<Sport> = new Set(['tennis', 'soccer'] as Sport[])
 
 export interface Pick {
   card: GameCard
@@ -53,10 +60,18 @@ export interface Pick {
   ev: number | null
   /** Full-Kelly stake fraction (value picks only). */
   kelly: number | null
+  /** The MODEL's own probability of the side — context, not the verdict. */
   modelProb: number
-  /** Vig-removed market probability (value picks only). */
+  /** The book's vig-removed probability at the pick's price (value picks only). */
   marketProb: number | null
-  /** Model fair line in American odds — the EV=0 price for this side. */
+  /** The sharp fair the value edge is priced against (value picks), or the
+   *  displayed forecast when it is the market (model picks). */
+  fairProb: number | null
+  /** Which exchange set that fair ('kalshi' | 'polymarket'), or null. */
+  refBook: string | null
+  /** The headline probability shown for the side: the fair, else the forecast. */
+  prob: number
+  /** Fair line in American odds — the EV=0 price for this side at `prob`. */
   fairPrice: number
   /** Worst acceptable price: anything BETTER than this is +EV. === fairPrice. */
   minAcceptable: number
@@ -91,20 +106,31 @@ function isMoneylineSide(side: Edge['side']): side is PickSide {
  * Model pick: the argmax-probability side, priced at the model fair line.
  */
 export function derivePick(card: GameCard): Pick | null {
-  const { game, prediction, edges } = card
+  const { game, prediction, edges, forecast } = card
   if (game.completed) return null
   if (!prediction) return null
+  const sideProbs: Record<PickSide, number | null> = {
+    home: prediction.home_win_prob,
+    away: prediction.away_win_prob,
+    draw: prediction.draw_prob,
+  }
 
-  // ---- value pick: best moneyline edge across all books -------------------
+  // ---- value pick: best sharp-fair edge across the sportsbooks ------------
   const mlEdges = NO_VALUE_SPORTS.has(game.sport)
     ? []
     : edges.filter(
-        (e) => isMoneylineSide(e.side) && e.ev_per_dollar <= MAX_PLAUSIBLE_EV,
+        (e) =>
+          isMoneylineSide(e.side) &&
+          e.ev_per_dollar <= MAX_PLAUSIBLE_EV &&
+          e.fair_prob !== null &&
+          e.fair_prob !== undefined,
       )
   if (mlEdges.length > 0) {
     const best = mlEdges.reduce((a, b) => (b.ev_per_dollar > a.ev_per_dollar ? b : a))
     const side = best.side as PickSide
-    const fair = fairLine(best.model_prob)
+    const fairProb = best.fair_prob as number
+    const fair = fairLine(fairProb)
+    const strong = best.ref_book === 'kalshi' && best.ev_per_dollar <= SUSPECT_EV
     return {
       card,
       sport: game.sport,
@@ -118,24 +144,29 @@ export function derivePick(card: GameCard): Pick | null {
       kelly: best.kelly_fraction,
       modelProb: best.model_prob,
       marketProb: best.market_prob,
+      fairProb,
+      refBook: best.ref_book ?? null,
+      prob: fairProb,
       fairPrice: fair,
       minAcceptable: fair,
-      tier:
-        best.ev_per_dollar >= STRONG_EV && best.ev_per_dollar <= SUSPECT_EV
-          ? 'STRONG'
-          : 'LEAN',
+      tier: strong ? 'STRONG' : 'LEAN',
       confidence: prediction.confidence,
     }
   }
 
-  // ---- model pick: argmax probability, no book attached --------------------
-  const probs: Array<[PickSide, number]> = [
-    ['home', prediction.home_win_prob],
-    ['away', prediction.away_win_prob],
-  ]
-  if (prediction.draw_prob !== null) probs.push(['draw', prediction.draw_prob])
+  // ---- model pick: the displayed forecast's favourite, no book attached ---
+  const shown: Record<PickSide, number | null> = forecast
+    ? { home: forecast.home, away: forecast.away, draw: forecast.draw }
+    : sideProbs
+  const ref = forecast && forecast.kind === 'market' ? forecast.source : null
+  const probs: Array<[PickSide, number]> = []
+  for (const s of ['home', 'away', 'draw'] as PickSide[]) {
+    const p = shown[s]
+    if (p !== null && p !== undefined) probs.push([s, p])
+  }
   const [side, prob] = probs.reduce((a, b) => (b[1] > a[1] ? b : a))
   const fair = fairLine(prob)
+  const modelProb = sideProbs[side] ?? prob
   return {
     card,
     sport: game.sport,
@@ -147,8 +178,11 @@ export function derivePick(card: GameCard): Pick | null {
     price: null,
     ev: null,
     kelly: null,
-    modelProb: prob,
+    modelProb,
     marketProb: null,
+    fairProb: ref ? prob : null,
+    refBook: ref,
+    prob,
     fairPrice: fair,
     minAcceptable: fair,
     tier: 'MODEL',

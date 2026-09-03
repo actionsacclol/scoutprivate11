@@ -66,6 +66,38 @@ arm64 and x64 are separate dmgs, so there is nothing for them to install by
 mistake. To restore, add the job back to the matrix in `release.yml` (the
 comment at the top of the file has the exact block).
 
+## Copy-paste deploys (several GitHub accounts)
+
+The tree is deployed by copying the working folder over another checkout in
+Explorer, then committing there. That works, and the build is set up so it
+keeps working, but know what a copy does and doesn't carry:
+
+1. Copy the whole folder over the other checkout (skip `.git` — the other
+   checkout's `.git` is the one that points at the other account; skip
+   `node_modules`, `backend/.venv` and `backend/dist-py` too, they are huge
+   and rebuilt anyway). Everything git ignores (`data/`, `logs/`, `reference/`,
+   `.env`) is ignored on the other side by the same `.gitignore`.
+2. In the other checkout: `git add -A`, commit, push. The version in
+   `package.json` triggers the release exactly as described above.
+
+**A copy never deletes.** A module removed here stays behind there as a stale
+file. Two things make that harmless:
+
+- `tsconfig.json` / `tsconfig.node.json` typecheck from the real entry points
+  (`src/main.tsx`, `electron/main.ts`, `electron/preload.ts`) instead of whole
+  directories, so a file nobody imports is a file nobody checks — the same set
+  Vite bundles. (Verified 2026-09-03 by copying the 0.3.2 tree over a 0.3.1
+  clone: the stale Telegram module broke `include: ["electron"]` and passes
+  entry-based.) New global `.d.ts` files must be added to the `files` list.
+- Python only imports what it imports; a stale module under `kryptscout/` is
+  dead weight in the bundle, nothing more.
+
+The one thing that can still bite: a **deleted test file** under
+`backend/tests/` — pytest collects the directory, so a stale test that
+exercises an API that changed will fail CI. When deleting a test file, leave
+an empty stub with a comment for one release, or delete it by hand on the
+other side.
+
 ## Two macOS traps (both hit on the first run — don't reintroduce them)
 
 **1. Never set `identity: null` in `build.mac`.** It disables code signing

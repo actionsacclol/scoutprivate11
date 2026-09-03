@@ -33,6 +33,27 @@ export function removeVig(prices: number[]): number[] {
   return raw.map((q) => q / total)
 }
 
+/** Vig-removed probabilities by the POWER method (each raw implied
+ *  probability raised to the k that makes them sum to 1). Proportional devig
+ *  hands longshots more probability than they deserve; this is the
+ *  conservative reference. Mirrors core/oddsmath.remove_vig_power. */
+export function removeVigPower(prices: number[]): number[] {
+  const raw = prices.map(impliedProb)
+  if (raw.length === 0 || raw.some((r) => !(r > 0 && r < 1))) return removeVig(prices)
+  let lo = 0.05
+  let hi = 20
+  for (let i = 0; i < 60; i++) {
+    const k = (lo + hi) / 2
+    const sum = raw.reduce((a, r) => a + Math.pow(r, k), 0)
+    if (sum > 1) lo = k
+    else hi = k
+  }
+  const k = (lo + hi) / 2
+  const out = raw.map((r) => Math.pow(r, k))
+  const total = out.reduce((a, b) => a + b, 0)
+  return out.map((v) => v / total)
+}
+
 /** Expected profit per $1 staked given model probability and offered price. */
 export function expectedValue(modelProb: number, price: number): number {
   return modelProb * payout(price) - (1 - modelProb)

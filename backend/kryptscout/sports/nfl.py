@@ -66,6 +66,7 @@ from xgboost import XGBClassifier
 from kryptscout.config import DATA_DIR, MODELS_DIR, RAW_DIR
 from kryptscout.core import modelio
 from kryptscout.core.elo import EloBook, EloConfig
+from kryptscout.core.calibrate import temper
 from kryptscout.core.oddsmath import remove_vig
 from kryptscout.core.schemas import Game, Prediction, Sport
 from kryptscout.datasources import espn, weather
@@ -85,6 +86,7 @@ VALIDATE_FROM_SEASON = 2024  # held out; every knob/tune uses earlier seasons on
 ROLLING_WINDOW = 10  # games of points for/against feeding score predictions
 HOME_POINTS_EDGE = 1.25  # points shifted home-ward in predicted scores
 LEAGUE_AVG_POINTS = 22.0  # fallback before a team has rolling history
+CALIBRATION_TEMPERATURE = 0.84  # see predict(); 1.0 disables
 
 # Starting-QB adjustment. Coarse grid (K_q 2-12, span 8-20) tuned on
 # 2020-2023: log loss 0.6438 -> 0.6422 (QB only). The tune surface is flat
@@ -806,6 +808,11 @@ class NflEngine(SportEngine):
                 # No pickle or no schedule row (preseason handled above):
                 # degrade to the pure Elo path.
                 p_home = p_elo
+            if not self._is_preseason(game):
+                # Calibration audit 2026-09-02 (2018-26 log, n=2,230): slope
+                # 0.86, favourites +2.8 pts; logit scale 0.84 on the served
+                # number. Preseason is already damped 60% toward a coin flip.
+                p_home = temper(p_home, CALIBRATION_TEMPERATURE)
             home_score = (
                 self._avg(game.home, idx=0) + self._avg(game.away, idx=1)
             ) / 2.0 + HOME_POINTS_EDGE
@@ -815,6 +822,10 @@ class NflEngine(SportEngine):
             mult = _weather_total_multiplier(await self._weather_for(game))
             home_score *= mult
             away_score *= mult
+            # A team with no scoring history would price at the league-average
+            # placeholder — a constant, not a forecast. The board printed UNDER
+            # edges against exactly that (WNBA, 2026-09-02). Emit no total.
+            scored = bool(self.rolling.get(game.home)) and bool(self.rolling.get(game.away))
             predictions.append(
                 Prediction(
                     game_id=game.id,
@@ -823,9 +834,9 @@ class NflEngine(SportEngine):
                     generated_at=now,
                     home_win_prob=p_home,
                     away_win_prob=1.0 - p_home,
-                    predicted_home_score=round(home_score, 1),
-                    predicted_away_score=round(away_score, 1),
-                    predicted_total=round(home_score + away_score, 1),
+                    predicted_home_score=round(home_score, 1) if scored else None,
+                    predicted_away_score=round(away_score, 1) if scored else None,
+                    predicted_total=round(home_score + away_score, 1) if scored else None,
                     confidence=abs(p_home - 0.5) * 2.0,
                 )
             )

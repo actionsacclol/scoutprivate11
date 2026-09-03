@@ -13,8 +13,8 @@
  * blocked in the UI. Cross-game legs (different games, even same day/league)
  * are close enough to independent for moneyline purposes.
  */
-import type { GameCard, Sport } from './types'
-import { bestPrice, fairLine, payout } from './oddsmath'
+import type { GameCard, MoneylineOdds, Sport } from './types'
+import { bestPrice, fairLine, payout, removeVigPower } from './oddsmath'
 
 export const MIN_LEGS = 2
 /** No practical leg cap — stack as deep as you dare; the math (a product)
@@ -40,10 +40,40 @@ export interface Leg {
   kickoff: string
   /** Model win probability for this side. */
   modelProb: number
+  /**
+   * Vig-free MARKET probability for this side (power devig of a full-market
+   * quote, the best-priced book's own when it prices every side). This is
+   * the headline "win chance": the model has measured zero information
+   * beyond the market, so the model number is context, not the verdict.
+   */
+  marketProb: number | null
   /** Best (highest-payout) live American price across quoted books, if any. */
   bestPrice: LegPrice | null
   /** Model fair line for this side in American odds (EV = 0 price). */
   fairAmerican: number
+}
+
+/** Vig-free probability of `side` from a full-market quote: the best-priced
+ *  book first, then any other book that prices every side. Null when no
+ *  book covers the whole market (a two-way exchange book on a 3-way match). */
+export function marketProbFor(
+  odds: MoneylineOdds[],
+  side: LegSide,
+  threeWay: boolean,
+  preferBook: string | null,
+): number | null {
+  const keys: Array<'home_ml' | 'away_ml' | 'draw_ml'> = threeWay
+    ? ['home_ml', 'away_ml', 'draw_ml']
+    : ['home_ml', 'away_ml']
+  const idx = keys.indexOf(ML_KEY[side])
+  if (idx < 0) return null
+  const full = odds.filter((q) => keys.every((k) => q[k] !== null && q[k] !== undefined))
+  const ordered = preferBook
+    ? [...full.filter((q) => q.book === preferBook), ...full.filter((q) => q.book !== preferBook)]
+    : full
+  const quote = ordered[0]
+  if (!quote) return null
+  return removeVigPower(keys.map((k) => quote[k] as number))[idx]
 }
 
 const ML_KEY: Record<LegSide, 'home_ml' | 'away_ml' | 'draw_ml'> = {
@@ -87,6 +117,7 @@ export function buildLeg(card: GameCard, side: LegSide): Leg | null {
     side === 'home' ? game.away : side === 'away' ? game.home : `${game.away} / ${game.home}`
 
   const bp = bestPrice(odds, ML_KEY[side])
+  const threeWay = prediction.draw_prob !== null && prediction.draw_prob !== undefined
   return {
     gameId: game.id,
     sport: game.sport,
@@ -95,6 +126,7 @@ export function buildLeg(card: GameCard, side: LegSide): Leg | null {
     opponent,
     kickoff: game.start_time,
     modelProb: prob,
+    marketProb: marketProbFor(odds, side, threeWay, bp ? bp.book : null),
     bestPrice: bp ? { book: bp.book, american: bp.price } : null,
     fairAmerican: fairLine(prob),
   }
@@ -150,6 +182,22 @@ export interface ParlayMath {
   kelly: number | null
   /** Kelly / 4 — the number we actually show. */
   quarterKelly: number | null
+  /**
+   * MARKET-ANCHORED verdict. Product of the legs' vig-free market
+   * probabilities (null when any leg lacks a full-market quote); the fair
+   * price that implies; and the payout shortfall vs it. Backtested
+   * 2026-09-02: model-fair verdicts stamped 87–100% of auto-generated slips
+   * +EV and those slips lost 30–50% of stake, while the market-implied hit
+   * rate tracked reality in every policy. So the market number is the
+   * headline and the model number is context.
+   */
+  combinedMarketProb: number | null
+  marketFairDecimal: number | null
+  marketFairAmerican: number | null
+  /** 1 - offeredDecimal / marketFairDecimal: the books' compounded vig. */
+  marketDrag: number | null
+  /** Legs with no full-market quote (market verdict unavailable). */
+  unmarketedLegs: number
 }
 
 /**
@@ -192,6 +240,19 @@ export function parlayMath(legs: Leg[]): ParlayMath | null {
     quarterKelly = kelly / 4
   }
 
+  const unmarketedLegs = legs.filter((l) => l.marketProb === null).length
+  let combinedMarketProb: number | null = null
+  let marketFairDecimal: number | null = null
+  let marketFairAmerican: number | null = null
+  let marketDrag: number | null = null
+  if (unmarketedLegs === 0) {
+    combinedMarketProb = 1
+    for (const l of legs) combinedMarketProb *= l.marketProb as number
+    marketFairDecimal = 1 / combinedMarketProb
+    marketFairAmerican = americanFromDecimal(marketFairDecimal)
+    if (offeredDecimal !== null) marketDrag = 1 - offeredDecimal / marketFairDecimal
+  }
+
   return {
     legCount: legs.length,
     combinedModelProb,
@@ -206,6 +267,11 @@ export function parlayMath(legs: Leg[]): ParlayMath | null {
     vigDrag,
     kelly,
     quarterKelly,
+    combinedMarketProb,
+    marketFairDecimal,
+    marketFairAmerican,
+    marketDrag,
+    unmarketedLegs,
   }
 }
 

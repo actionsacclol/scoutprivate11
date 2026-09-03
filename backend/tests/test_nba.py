@@ -128,7 +128,7 @@ def test_predict_unknown_teams_falls_back_to_league_average(tmp_path) -> None:
     pred = asyncio.run(engine.predict([game("Ghost A", "Ghost B")]))[0]
     # Equal 1500 ratings: only home advantage separates the sides.
     assert 0.5 < pred.home_win_prob < 0.7
-    assert pred.predicted_total == 2 * LEAGUE_AVG_POINTS
+    assert pred.predicted_total is None  # no scoring history: no placeholder total (2026-09-02)
 
 
 def test_preseason_allstar_and_unfinished_games_are_skipped(tmp_path) -> None:
@@ -159,7 +159,7 @@ def test_season_rollover_regresses_ratings(tmp_path) -> None:
     assert _season_key(date(2025, 6, 10)) != _season_key(date(2025, 8, 1))
     engine._process_day(date(2025, 8, 1), {"events": []})  # crosses Aug 1
     rating_after = engine.elo.get("Boston Sharks")
-    expected = 1500.0 + 0.75 * (rating_before - 1500.0)
+    expected = 1500.0 + 0.5 * (rating_before - 1500.0)  # season_carry, retuned 2026-09-02
     assert abs(rating_after - expected) < 1e-9
     # Same-season day changes must not regress again.
     engine._process_day(date(2025, 8, 2), {"events": []})
@@ -266,7 +266,7 @@ def test_training_calibration_and_shipping(tmp_path) -> None:
     assert engine._model_stale()
 
 
-def test_deleted_pickle_is_stale_even_with_a_fresh_bundle_in_memory(tmp_path) -> None:
+def test_deleted_pickle_is_stale_even_with_a_fresh_bundle_in_memory(tmp_path, monkeypatch) -> None:
     """RETRAIN deletes the pickle, then calls refresh_data() on the SAME
     loaded engine — so staleness has to look at the disk, not just memory.
     Otherwise the force-retrain is a pure delete and the artifact stays gone
@@ -276,6 +276,10 @@ def test_deleted_pickle_is_stale_even_with_a_fresh_bundle_in_memory(tmp_path) ->
     engine.train_model()
     assert engine.model_path.exists() and not engine._model_stale()
 
+    async def no_games(self, client, day):  # the replay runs to yesterday: no ESPN in tests
+        return {"events": []}
+
+    monkeypatch.setattr(type(engine), "_day_json", no_games)
     engine.model_path.unlink()  # what refresh_sport(force_retrain=True) does
 
     assert engine._model_stale()
@@ -346,3 +350,40 @@ def test_legacy_state_without_feature_log_forces_full_replay(tmp_path) -> None:
     assert reloaded.last_processed is None  # ignored -> replay from scratch
     assert reloaded.backtest == []
     assert reloaded.feature_log == []
+
+
+def test_refresh_runs_through_yesterday_with_no_history_cap(tmp_path, monkeypatch) -> None:
+    """A hard HISTORY_END once froze the engine at the 2025-26 Finals: no day
+    was ever processed again, the state file was never rewritten, and the
+    next season would never have been ingested. The replay must always run
+    through yesterday (empty off-season days included) and persist."""
+    from datetime import datetime, timezone
+    engine = make_engine(tmp_path)
+    engine.last_processed = date(2026, 6, 30)
+    fetched: list[date] = []
+
+    async def fake_day_json(self, client, day):
+        fetched.append(day)
+        return {"events": []}
+
+    monkeypatch.setattr(type(engine), "_day_json", fake_day_json)
+    monkeypatch.setattr(type(engine), "_model_stale", lambda self: False)
+    asyncio.run(engine.refresh_data())
+    yesterday = datetime.now(timezone.utc).date() - timedelta(days=1)
+    assert fetched and fetched[0] == date(2026, 7, 1) and fetched[-1] == yesterday
+    assert engine.last_processed == yesterday
+    assert (tmp_path / "state.json").exists()  # rewritten even with no games
+    reloaded = make_engine(tmp_path)
+    assert reloaded.last_processed == yesterday
+
+
+def test_state_replayed_under_old_elo_constants_is_discarded(tmp_path) -> None:
+    import json
+    engine = make_engine(tmp_path)
+    rig_history(engine, n_days=6)
+    engine._save_state()
+    old = json.loads((tmp_path / "state.json").read_text(encoding="utf-8"))
+    old["version"] = 3  # pre-retune ratings
+    (tmp_path / "state.json").write_text(json.dumps(old), encoding="utf-8")
+    reloaded = make_engine(tmp_path)
+    assert reloaded.last_processed is None and reloaded.elo.ratings == {}

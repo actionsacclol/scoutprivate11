@@ -45,7 +45,7 @@ Don't want to run an unsigned binary? Fair. [Build it from source](#build-from-s
 ## 60-second tour
 
 - **DASHBOARD** — the landing page: today's slate, top pick spotlight, your record, system status. One screen that answers "what should I look at right now?"
-- **PICKS** — one recommended bet per game: the highest-EV edge when live odds exist, the model's side when they don't, tiered STRONG/LEAN, with line shopping across books.
+- **PICKS** — one recommended bet per game. A VALUE pick is a sportsbook price that sits at least a point under the exchange fair (Kalshi, else Polymarket) — STRONG when Kalshi set the fair, LEAN when Polymarket did; the model's own number is shown as context, never as the reason. When no book beats the fair, the pick is the displayed forecast's favourite, tier MODEL, no price. Measured 2026-09-02: the model's disagreement with the market carries no information; the exchange lead is the one signal that replicates (the book's close moves toward the pick by about 1.75 points, under the vig — a signal, not a profit).
 - **TRACK** — the button on every pick card (and on a finished parlay slip). One tap logs the bet at your default stake and the best available price.
 - **TRACKER** — two records side by side. **MY BETS**: your bets and parlays, graded automatically when games settle — *your* record with receipts. **BOT PICKS**: every +EV pick the bot has ever recommended at a flat 1u, pending and graded, so you can see the whole bot's P&L — not just the picks you tailed.
 - **AUTO-BET** — connect a Polymarket wallet and let the bot place its own picks (dry-run first, hard caps, off by default).
@@ -65,10 +65,10 @@ Backtest accuracy is the argmax hit rate on held-out seasons, replayed with stri
 | WNBA   | wnba-elo-v1 | 66.3% | Elo · expansion-aware |
 | Tennis | tennis-elo-v1 | 63.8% | Surface-blended Elo (ATP/WTA) |
 | NFL    | nfl-xgb-v3 | 67.5% | Elo + QB + XGBoost blend |
-| NCAAF  | ncaaf-elo-v1 | 71.2% | Elo · college tuned |
-| NCAAB  | ncaab-elo-v1 | 72.3% | Elo · college tuned |
+| NCAAF  | ncaaf-kalman-v2 | 75.9% | Kalman margin filter · blowouts count |
+| NCAAB  | ncaab-kalman-v2 | 72.0% | Kalman margin filter · D1 only |
 | MLB    | mlb-elo-v3 | 55.5% | Elo + pitcher EWMA |
-| NHL    | nhl-elo-v1 | 53.6% | Elo + Poisson goals |
+| NHL    | nhl-elo-v1 · nhl-xg-v2 with MoneyPuck | 53.6% · 57.5% | Elo + Poisson goals · xG/PDO logistic when the file is present |
 | Soccer | soccer-poisson-v2 | 48.9% | Dixon-Coles-lite · 3-way · 11 leagues |
 
 Now the part every other tool buries: **the closing line still beats us.** In backtests, the devigged closing line beats every v1 baseline above on log loss (NFL held-out example: our blend hits 67.5% accuracy, the closing line 68.4%). A model that can't approach closing-line log loss has no betting edge, whatever its raw accuracy — 71% in NCAAF mostly means college football has a lot of blowouts. Beating the close is the v2 target, and the built-in **CLV tracking measures the gap** on every captured pick instead of pretending it isn't there.
@@ -86,6 +86,7 @@ More house rules:
 - **Nine sports, one contract** — every engine implements `upcoming_games()`, `predict()`, `refresh_data()`, so the API and UI are sport-agnostic.
 - **Model fair lines vs live markets** — vig-removed market probability vs model probability, EV per dollar, Kelly stake fraction; the value board surfaces the top edges across all sports.
 - **Free odds stack** — ESPN lines + Polymarket + Kalshi merge into one line-shopped odds table. No key needed. The Odds API is an optional add-on (adds tennis odds and more books).
+- **Boost evaluator** — type what a book is offering (a boosted price, or a % profit-boost token on a normal line) and score it against the exchange fair price: effective price, EV per dollar, quarter-Kelly, PLAY / PASS. No model involved — the models can't beat a liquid line, but a boost is the book handing out a price above fair, and that is where recreational bettors actually get paid. One tap tracks it.
 - **Parlay truth-teller** — stack as many moneyline legs as you dare; the slip is priced two ways (books' combined price vs the model's fair price) with an honest verdict about the gap. Correlated same-game legs are blocked. Fully-priced slips are trackable: one tap logs the parlay to your record, where it grades leg-by-leg (a lost leg loses the slip, pushed legs drop out of the payout).
 - **Your tracked P&L** — TRACK any pick or parlay, it grades automatically at settlement at your default stake (set it once under SETTINGS). And the bot tracks itself: the TRACKER's BOT PICKS tab is its complete value-pick record at flat 1u — the same number the dashboard reports, with no delete button.
 - **Model accountability built in** — accuracy, log loss, ROI, and CLV per sport on the PERFORMANCE page; per-engine consoles and retrains on MODELS.
@@ -166,6 +167,7 @@ Krypt Scout downloads data at runtime, caches it locally, and never redistribute
 | ESPN public JSON APIs | Schedules, results, injuries, ESPN lines (all sports) | Unofficial public endpoints, no key; not affiliated |
 | MLB Stats API (statsapi.mlb.com) | MLB schedules/results | Free public API, MLB Advanced Media terms |
 | NHL API (api-web.nhle.com) | NHL schedules/results | Free public API |
+| MoneyPuck.com (optional) | NHL expected goals per team-game — powers `nhl-xg-v2` when you drop `all_teams.csv` under `data/raw/nhl/moneypuck/` | Free for non-commercial use with credit; automated pulls need MoneyPuck's approval, so the app never fetches or ships it |
 | nflverse (games.csv) | NFL history incl. closing lines for backtests | Open data, MIT-licensed tooling — credit nflverse |
 | football-data.co.uk | Soccer results + closing odds (10 of 11 leagues) | Free for personal use; downloaded per-user, never shipped |
 | TennisMyLife (TML) | ATP match history | MIT |

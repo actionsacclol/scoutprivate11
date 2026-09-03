@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import hmac
+import json
 import logging
 import math
 import os
@@ -21,6 +22,11 @@ from pydantic import BaseModel, Field, field_validator
 from kryptscout import config, license as license_mod, logsetup
 from kryptscout.autobet import engine as autobet_engine
 from kryptscout.autobet import polymarket_auth
+from kryptscout.core import arb as arb_mod
+from kryptscout.core import fair as fair_mod
+from kryptscout.core import forecast as forecast_mod
+from kryptscout.core import lean as lean_mod
+from kryptscout.core import sgp as sgp_mod
 from kryptscout.core import totals as totals_mod
 from kryptscout.core.schemas import Edge, GameCard, MoneylineOdds, Prediction, Sport
 from kryptscout.datasources import injuries as injuries_source
@@ -70,6 +76,8 @@ def _load_engines() -> None:
     Each module in kryptscout.sports exposes build_engine(); a sport whose
     module fails to import (e.g. missing data on first run) is skipped so the
     rest of the board still serves.
+
+    Runs on a worker thread — see _start_engine_load for why.
     """
     import importlib
     import logging
@@ -79,10 +87,68 @@ def _load_engines() -> None:
             module = importlib.import_module(f"kryptscout.sports.{name}")
             engines.register(module.build_engine())
         except Exception as exc:  # noqa: BLE001
-            logging.getLogger("kryptscout").warning("engine %s unavailable: %s", name, exc)
+            # exc_info: the message alone is useless for the imports that only
+            # fail inside a frozen bundle on one platform. A bare
+            # "'NoneType' object has no attribute 'replace'" from a mac build
+            # cost us a release to chase; the traceback names the file.
+            logging.getLogger("kryptscout").warning(
+                "engine %s unavailable: %s", name, exc, exc_info=True
+            )
 
 
-app = FastAPI(title="Krypt Scout", version="0.1.0", on_startup=[_log_startup, _load_engines])
+# Engine registration is the single most expensive thing this process does:
+# importing the sports modules pulls numpy/pandas/sklearn/scipy/xgboost, which
+# on a cold disk takes ~25-35s (measured on macOS arm64, first launch after
+# install). While a uvicorn startup handler is running NOTHING is served — not
+# even /api/health — so doing this inline made the Electron supervisor's
+# startup health probe time out and SIGKILL a backend that was working fine,
+# restarting into an even colder start. Load on a worker thread instead: the
+# app is serving within milliseconds and the engine-backed endpoints await
+# _engines_ready below. Nothing else in the process touches the model stack.
+_engines_ready = asyncio.Event()
+_engine_load_task: asyncio.Task | None = None
+
+# How long an engine-backed request waits for the warm-up before giving up.
+# Comfortably above the worst measured cold load; a breach means the import
+# is genuinely wedged, not slow.
+ENGINE_WARMUP_TIMEOUT_S = 180.0
+
+
+async def _start_engine_load() -> None:
+    global _engine_load_task
+
+    async def _run() -> None:
+        try:
+            await asyncio.to_thread(_load_engines)
+        finally:
+            # Set even on failure: a wedged load must not hang every request
+            # until the timeout. _load_engines already swallows per-sport
+            # errors, so reaching here means the registry is as full as it
+            # will get.
+            _engines_ready.set()
+
+    # Held in a module global: a bare create_task() reference is weak, and a
+    # garbage-collected task cancels the load silently.
+    _engine_load_task = asyncio.create_task(_run())
+
+
+async def _await_engines() -> None:
+    """Block until the sports registry is populated. 503 if the load is stuck."""
+    if _engines_ready.is_set():
+        return
+    try:
+        await asyncio.wait_for(_engines_ready.wait(), ENGINE_WARMUP_TIMEOUT_S)
+    except asyncio.TimeoutError:
+        raise HTTPException(
+            503, "sport engines are still loading", headers={"Retry-After": "10"}
+        )
+
+
+app = FastAPI(
+    title="Krypt Scout",
+    version="0.1.0",
+    on_startup=[_log_startup, _start_engine_load],
+)
 
 # App-wide license gate. Krypt Scout is licensed software: without an active
 # license the API serves nothing but health + the license endpoints themselves,
@@ -211,6 +277,7 @@ app.add_middleware(
 
 @app.get("/api/sports")
 async def sports() -> list[dict]:
+    await _await_engines()
     return [
         {"sport": e.sport.value, "model": e.model_name}
         for e in engines.all_engines()
@@ -220,6 +287,7 @@ async def sports() -> list[dict]:
 @app.get("/api/board/{sport}", response_model=list[GameCard])
 async def board(sport: Sport, with_odds: bool = True) -> list[GameCard]:
     """The main terminal board for one sport: slate + predictions + edges."""
+    await _await_engines()
     try:
         engine = engines.get_engine(sport)
     except KeyError:
@@ -250,9 +318,17 @@ async def board(sport: Sport, with_odds: bool = True) -> list[GameCard]:
         # No-information predictions (tennis unknown players etc.) adopt the
         # devigged market consensus instead of showing a fake 50/50.
         pred = picks_mod.apply_market_fallback(predictions.get(game.id), odds)
-        edges = _compute_edges(game.id, sport, pred, odds, game.start_time) if pred else []
-        card = GameCard(game=game, prediction=pred, odds=odds, edges=edges)
+        # The sharp fair comes first: value edges are priced against it.
+        fair = fair_mod.sharp_fair(game.id, sport, odds, game.start_time)
+        edges = _compute_edges(game.id, sport, pred, odds, game.start_time, fair) if pred else []
+        card = GameCard(game=game, prediction=pred, odds=odds, edges=edges, fair=fair)
         card.totals_edges = totals_mod.totals_edges(card)
+        # Model-free signals: a locked-in cross-venue position, and the
+        # exchange-lead reference. Neither touches picks or autobet.
+        card.arb = arb_mod.find_arb(game.id, sport, odds, game.start_time)
+        card.lean = lean_mod.find_lean(game.id, sport, odds, game.start_time)
+        card.sgp = sgp_mod.sgp_fair(card)
+        card.forecast = forecast_mod.display_forecast(card)
         cards.append(card)
 
     try:
@@ -268,9 +344,10 @@ def _compute_edges(
     pred: Prediction,
     odds_list,
     starts_at: datetime | None = None,
+    fair=None,
 ) -> list[Edge]:
     """Shared with the capture job — see store.picks.compute_edges."""
-    return picks_mod.compute_edges(game_id, sport, pred, odds_list, starts_at)
+    return picks_mod.compute_edges(game_id, sport, pred, odds_list, starts_at, fair)
 
 
 @app.get("/api/injuries/{sport}", response_model=list[InjuryReport])
@@ -346,7 +423,52 @@ async def clv(sport: Sport | None = None, since: date | None = None) -> dict:
     base = tracker.clv(sport=sport, since=since)
     tiers = tracker.clv_by_tier(sport=sport, since=since)
     endpoints = tracker.clv_vs_close(sport=sport, since=since)
-    return _json_safe({**base, **tiers, "vs_close": endpoints})
+    lean = tracker.lean_clv(sport=sport, since=since)
+    return _json_safe({**base, **tiers, "vs_close": endpoints, "lean": lean})
+
+
+@app.get("/api/benchmark")
+async def benchmark(sport: Sport | None = None, since: date | None = None) -> dict:
+    """Scout vs ESPN's predictor vs the market — tracker.espn_benchmark()."""
+    return _json_safe(tracker.espn_benchmark(sport=sport, since=since))
+
+
+@app.get("/api/trackers")
+async def trackers() -> dict:
+    """Schedule-shaped trackers vs the market — tracker.context_trackers()."""
+    return _json_safe(tracker.context_trackers())
+
+
+@app.get("/api/lean")
+async def lean(sport: Sport | None = None, since: date | None = None) -> dict:
+    """Same-book CLV of the exchange-lead reference — tracker.lean_clv()."""
+    return _json_safe(tracker.lean_clv(sport=sport, since=since))
+
+
+@app.get("/api/arbs")
+async def arbs(limit: int = 50) -> dict:
+    """Every true-arb sighting logged by the board/capture, newest first."""
+    conn = db.connect()
+    try:
+        rows = db.rows(
+            conn,
+            """
+            SELECT a.game_id, a.sport, a.seen_at, a.legs, a.margin_pct,
+                   a.net_margin_pct, g.home, g.away, g.start_time
+            FROM arb_sightings a LEFT JOIN games g ON g.game_id = a.game_id
+            ORDER BY a.seen_at DESC LIMIT ?
+            """,
+            (max(1, min(limit, 500)),),
+        )
+        total = conn.execute("SELECT COUNT(*) FROM arb_sightings").fetchone()[0]
+    finally:
+        conn.close()
+    for row in rows:
+        try:
+            row["legs"] = json.loads(row["legs"])
+        except (TypeError, ValueError):
+            row["legs"] = []
+    return _json_safe({"n": total, "recent": rows})
 
 
 @app.get("/api/movement/{game_id}")
@@ -547,6 +669,7 @@ async def models() -> dict:
       backtest  static walk-forward metrics persisted in the state json
                 (see jobs.refresh.backtest_metadata), or null
     """
+    await _await_engines()
     overall = tracker.performance()["overall"]
     rows = []
     for engine in engines.all_engines():
@@ -587,6 +710,7 @@ async def backtest_all() -> dict:
     store.backtest.report for the per-sport envelope (kind log/summary/none,
     calibration curve + confidence sweep on "log" sports).
     """
+    await _await_engines()
     reports = [
         backtest_store.report(engine.sport, model=engine.model_name)
         for engine in engines.all_engines()
@@ -597,6 +721,7 @@ async def backtest_all() -> dict:
 @app.get("/api/backtest/{sport}")
 async def backtest_one(sport: Sport) -> dict:
     """One sport's model-skill backtest — store.backtest.report passthrough."""
+    await _await_engines()
     engine = next((e for e in engines.all_engines() if e.sport == sport), None)
     model = engine.model_name if engine is not None else None
     return _json_safe(backtest_store.report(sport, model=model))
@@ -1036,4 +1161,12 @@ async def license_heartbeat() -> dict:
 
 @app.get("/api/health")
 async def health() -> dict:
-    return {"ok": True, "time": datetime.now(timezone.utc).isoformat()}
+    # Answers immediately, warm or cold: enginesReady distinguishes "serving,
+    # still importing the model stack" from "fully up". Never awaits the
+    # warm-up — this is the probe the supervisor kills the process over.
+    return {
+        "ok": True,
+        "time": datetime.now(timezone.utc).isoformat(),
+        "enginesReady": _engines_ready.is_set(),
+        "sports": len(engines.all_engines()),
+    }
