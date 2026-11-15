@@ -170,7 +170,11 @@ jobs:
         include:
           - os: windows-latest
             label: windows-x64
-          - os: macos-14
+          # macos-15 is Apple Silicon (the Intel image is macos-15-intel).
+          # macos-14 was retired by GitHub on 2026-11-02: a job that asks for
+          # it never starts and reports "The configuration
+          # macos-14-arm64-us-default is not supported".
+          - os: macos-15
             label: macos-arm64
           - os: ubuntu-latest
             label: linux-x64

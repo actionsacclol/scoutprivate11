@@ -2,8 +2,8 @@
 
 ## Unreleased
 
-- **Release build: Linux and Windows runners** (FIX): the first v0.3.3 run
-  failed on both. Linux: the packaging hook that flips the Electron fuses
+- **Release build on all three runners** (FIX): the first v0.3.3 run
+  failed on all three runners. Linux: the packaging hook that flips the Electron fuses
   looked for a binary called "Krypt Scout", but electron-builder names the
   Linux binary `krypt-scout`; the hook now asks the packager for the name
   (checked by packaging the Linux folder locally). Windows: the tests died
@@ -11,7 +11,10 @@
   had failed and `py:setup` reported success anyway. In CI a failed install
   now fails that step, and the build uses the Python that
   `actions/setup-python` installed (3.11) instead of `py -3`, which picks
-  the newest Python on the runner image.
+  the newest Python on the runner image. macOS: the job never started
+  ("The configuration macos-14-arm64-us-default is not supported") because
+  GitHub retired the macos-14 image on 2026-11-02; the job now runs on
+  macos-15, which is also Apple Silicon.
 - **"Setup did not finish … (fetch failed)" on a new install** (FIX): the
   scheduler asked the backend for the first results download with `fetch`,
   which gives up when no answer has arrived after 300 seconds, whatever
