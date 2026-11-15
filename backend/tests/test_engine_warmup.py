@@ -1,7 +1,7 @@
 """Engine warm-up must never block /api/health.
 
-Importing the sports modules pulls numpy/pandas/sklearn/scipy/xgboost, ~25-35s
-cold on a fresh macOS install. Doing it in a uvicorn startup handler meant
+Importing the sports modules pulled numpy/pandas/sklearn/scipy/xgboost, ~25-35s
+cold on a fresh macOS install (the last three are gone since November 2026). Doing it in a uvicorn startup handler meant
 NOTHING was served until it finished — including the health probe the Electron
 supervisor uses to decide the backend is dead. It SIGKILLed a backend that was
 merely slow, respawned into a colder cache, and never converged: an install
@@ -81,7 +81,7 @@ def test_load_engines_logs_a_traceback_for_a_broken_sport(monkeypatch, caplog):
     """A frozen-bundle import failure is only diagnosable with the stack.
 
     The mac builds logged a bare "'NoneType' object has no attribute 'replace'"
-    with no frame, for the two sports that import xgboost — unactionable from a
+    with no frame, for the two sports that imported xgboost — unactionable from a
     user's log export.
     """
     import importlib

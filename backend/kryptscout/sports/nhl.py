@@ -1,4 +1,38 @@
-"""NHL engine — xG-rated win probabilities (v2) over an Elo core (v1).
+"""NHL engine — Elo + rest + shot share (v3), over an Elo core (v1).
+
+v3 (PROPOSED 2026-11-14, audit in the models-nhl scratch directory): the
+served probability is a 5-coefficient logistic on the team Elo's log-odds,
+a back-to-back flag per side (from the schedule) and the home-minus-away
+EWMA of shots-on-goal differential (from the gamecenter boxscores this
+engine already caches). Free NHL API data only. Coefficients fitted on
+regular seasons 2019-2025 (n=8,510) and shipped as constants; walk-forward
+(fit on seasons before S, score S, 2021-2026, n=6,872, true results):
+0.6588 vs the live Elo's 0.6664, −0.0076 [−0.0105, −0.0046]; vs a
+recalibrated Elo −0.0068 [−0.0092, −0.0043]; vs the live xG model on
+2021-2025 −0.0081 [−0.0116, −0.0045]. Against the market it is still
+behind: 2026-27 games with a Kalshi quote 15+ minutes before the drop
+(n=117) 0.6512 vs 0.6463, and it carries no information beyond the price
+(coefficient −0.00, z 0.0). A better standalone number, not a betting edge.
+
+Three defects fixed with it:
+* SEASONS was the literal ("20242025", "20252026"), so from October 2026
+  the engine ingested no 2026-27 game: every served number through
+  2026-11-14 came from June 2026 state (158 of 158 stored rows reproduce
+  from the frozen state file to 2e-16). Seasons are now derived from the
+  date.
+* The xG fit labelled every shootout game a home loss (MoneyPuck's
+  goalsFor omits the shootout goal, so those rows are tied): training
+  home-win rate 0.501 vs the true 0.539, even-strength home probability
+  0.506. Tied rows are now dropped from the fit.
+* The xG path served whatever the dropped file last contained, with no
+  staleness check. Served from a season-old file it loses 0.0145
+  [0.0103, 0.0189] to the plain live Elo from day 48 of a season on
+  (2019-2025, n=6,236). It now needs a file no older than
+  XG_MAX_STALE_DAYS and is OFF by default (XG_ENABLED): on true results
+  with a warm Elo the live xG model is +0.0014 [−0.0011, +0.0039] against
+  the Elo as shipped and −0.0011 [−0.0036, +0.0016] with the label fix,
+  and adds −0.0001 on top of v3. The September −0.0076 was against this
+  engine's cold-start Elo log (every team at 1500 in October 2024).
 
 v2 (2026-09-02): when MoneyPuck's team game-by-game file is present under
 RAW_DIR/nhl/moneypuck/all_teams.csv, each team carries EWMAs of per-game
@@ -70,9 +104,13 @@ from kryptscout.sports.base import SportEngine
 
 NHL_API = "https://api-web.nhle.com/v1/club-schedule-season/{abbrev}/{season}"
 BOX_API = "https://api-web.nhle.com/v1/gamecenter/{game_id}/boxscore"
-# Two seasons only: sweeps showed 2022-24 burn-in worsens 2025-26 log loss
-# (0.693 vs 0.686) — at K=6 the stale Coyotes-era signal outweighs the burn-in.
-SEASONS: tuple[str, ...] = ("20242025", "20252026")
+# The current season plus the two before it, derived from the date (see
+# _seasons). This was the literal ("20242025", "20252026") until 2026-11:
+# once 2025-26 became "past" in August nothing was ever fetched again, and
+# the engine served June 2026 ratings through the first six weeks of 2026-27.
+# Window length is not a tuning knob: 2-season vs full-history burn-in differ
+# by −0.0003 [−0.0012, +0.0006] on 2024-2026 (n=2,936).
+SEASON_WINDOW = 3
 RAW_NHL_DIR = RAW_DIR / "nhl"
 STATE_PATH = DATA_DIR / "nhl_state.json"
 ROLLING_WINDOW = 20
@@ -110,6 +148,32 @@ GOALIE_K = 500.0  # tune-season best-in-grid; still loses to k=0 (see above)
 GOALIE_SPAN = 40  # EWMA span in starts (alpha ~0.049)
 GOALIE_ADJ_CAP = 50.0  # Elo points on the game-level goalie difference
 LEAGUE_AVG_SAVE_PCT = 0.900  # NHL league save% has sat at ~.900 since 2023-24
+
+# ------------------------------------------------------------ context (v3)
+# P(home) = σ(w0 + w1·logit(elo) + w2·b2b_home + w3·b2b_away + w4·sog_diff)
+#   elo       the team Elo's pre-game home probability (unchanged v1 replay)
+#   b2b_*     1 when that side also played the previous calendar day. Raw
+#             2018-2026: home wins 53.1% with neither side on a back-to-back
+#             (n=7,487), 44.5% when only the home side is (n=508), 59.8% when
+#             only the visitor is (n=1,548).
+#   sog_diff  home-minus-away EWMA (span 25 games, 0.6 season carry) of
+#             shots-on-goal differential per game, from the cached boxscores.
+# Nothing here is trained at runtime: the five weights were fitted once
+# (ridge logistic, λ=1) on regular seasons 2019-2025 and are refit by hand
+# each off-season with the audit's s10_candidates.py. They were stable across
+# the six walk-forward fits (elo 0.89-1.11, b2b_home −0.28..−0.46, b2b_away
+# +0.16..+0.33, sog 0.034-0.042). No logit scale: held-out slope 0.94.
+# Tried and NOT kept (all walk-forward, same games): goal-difference EWMA
+# (+0.0000), goalie save% EWMA with the last starter (+0.0000) or the actual
+# starter (−0.0000), MoneyPuck xG on top (−0.0001), an Elo knob retune (160
+# grid points; the tune-window best, K8/carry .8, is +0.0007 [−0.0022,
+# +0.0036] held out).
+CTX_MODEL_NAME = "nhl-elo-ctx-v3"
+CTX_ENABLED = True
+CTX_WEIGHTS = (-0.00193, 0.89205, -0.33697, 0.33158, 0.04207)
+CTX_SOG_SPAN = 25
+CTX_SEASON_CARRY = 0.6
+CTX_MIN_GAMES = 5  # both teams need this many shot-counted games
 
 BOX_CONCURRENCY = 8  # simultaneous boxscore requests during backfill
 BOX_RETRIES = 3
@@ -179,6 +243,12 @@ XG_MIN_TRAIN_ROWS = 100
 XG_RIDGE = 1.0
 XG_LOGIT_SCALE = 0.88  # test-slope 0.88: the fit is slightly overconfident
 XG_FEATURES = ("xg_diff", "xg5_diff", "g_diff", "sh_diff", "sv_diff")
+# OFF: see the module docstring. With the label fix the live xG model is
+# −0.0011 [−0.0036, +0.0016] against a warm Elo (2019-2025, n=8,428) and
+# +0.0054 [+0.0023, +0.0085] against v3; it needs a licence and a hand-fed
+# 126 MB file to stay fresh. The machinery stays for re-testing.
+XG_ENABLED = False
+XG_MAX_STALE_DAYS = 10  # in season, the file's last game must be this recent
 # MoneyPuck used dotted codes for four franchises through 2020-21.
 MONEYPUCK_ALIASES = {"L.A": "LAK", "N.J": "NJD", "S.J": "SJS", "T.B": "TBL"}
 
@@ -288,6 +358,9 @@ def xg_replay(games: list[XgGame]) -> tuple[dict[str, dict], list[dict]]:
         rows.append({
             "season": g.season, "date": g.date, "home": g.home, "away": g.away,
             "home_won": g.goals_home > g.goals_away, "n_min": min(h["n"], a["n"]),
+            # MoneyPuck's goalsFor omits the shootout goal: a tied row is a
+            # shootout game whose winner this file does not say.
+            "tied": g.goals_home == g.goals_away,
             "xg_diff": (h["xgf"] - h["xga"]) - (a["xgf"] - a["xga"]),
             "xg5_diff": (h["xgf5"] - h["xga5"]) - (a["xgf5"] - a["xga5"]),
             "g_diff": (h["gf"] - h["ga"]) - (a["gf"] - a["ga"]),
@@ -312,8 +385,17 @@ def xg_replay(games: list[XgGame]) -> tuple[dict[str, dict], list[dict]]:
 
 
 def fit_xg_logit(rows: list[dict], upto_season: int) -> list[float] | None:
-    """Ridge logistic on seasons strictly before `upto_season`; None when thin."""
-    train = [r for r in rows if XG_MIN_TRAIN_SEASON <= r["season"] < upto_season and r["n_min"] >= XG_MIN_GAMES]
+    """Ridge logistic on seasons strictly before `upto_season`; None when thin.
+
+    Shootout games (tied in the file) are left out: counting them as home
+    losses, as this did until 2026-11, put the training home-win rate at
+    0.501 against a true 0.539 and the fitted even-strength home probability
+    at 0.506 (0.548 without them).
+    """
+    train = [
+        r for r in rows
+        if XG_MIN_TRAIN_SEASON <= r["season"] < upto_season and r["n_min"] >= XG_MIN_GAMES and not r.get("tied")
+    ]
     if len(train) < XG_MIN_TRAIN_ROWS:
         return None
     X = np.column_stack([np.ones(len(train))] + [np.array([r[f] for r in train], float) for f in XG_FEATURES])
@@ -364,6 +446,8 @@ class GameRecord:
     away_score: int
     home_goalie: GoalieStart | None = None  # None until a boxscore is cached
     away_goalie: GoalieStart | None = None
+    home_sog: int | None = None  # shots on goal, from the same boxscore
+    away_sog: int | None = None
 
     @property
     def home_won(self) -> bool:
@@ -374,6 +458,64 @@ def _current_season_end_year(today: date | None = None) -> int:
     """NHL seasons run Oct-Jun; from August we consider the next season current."""
     today = today or date.today()
     return today.year + 1 if today.month >= 8 else today.year
+
+
+def _seasons(today: date | None = None) -> tuple[str, ...]:
+    """The current season and the SEASON_WINDOW-1 before it, oldest first."""
+    end = _current_season_end_year(today)
+    return tuple(f"{y - 1}{y}" for y in range(end - SEASON_WINDOW + 1, end + 1))
+
+
+# -- context model (v3) ---------------------------------------------------------
+
+
+def _fresh_shots() -> dict:
+    return {"sog": 0.0, "n": 0}
+
+
+def _is_back_to_back(prev_date: str | None, game_date: str) -> bool:
+    """True when `prev_date` is the calendar day before `game_date` (YYYY-MM-DD)."""
+    if not prev_date:
+        return False
+    try:
+        return (date.fromisoformat(game_date[:10]) - date.fromisoformat(prev_date[:10])).days == 1
+    except ValueError:
+        return False
+
+
+def ctx_prob(elo_prob: float, b2b_home: bool, b2b_away: bool, sog_diff: float) -> float:
+    """The v3 probability from the Elo's own number plus rest and shot share."""
+    w0, w1, w2, w3, w4 = CTX_WEIGHTS
+    q = min(1.0 - 1e-6, max(1e-6, elo_prob))
+    z = w0 + w1 * math.log(q / (1.0 - q)) + w2 * float(b2b_home) + w3 * float(b2b_away) + w4 * sog_diff
+    return 1.0 / (1.0 + math.exp(-z))
+
+
+def _ctx_ready(shots: dict[str, dict], home: str, away: str) -> bool:
+    h, a = shots.get(home), shots.get(away)
+    return bool(h and a and h["n"] >= CTX_MIN_GAMES and a["n"] >= CTX_MIN_GAMES)
+
+
+def schedule_dates(payloads: Iterable[dict]) -> dict[str, set[str]]:
+    """Every regular-season/playoff date on each team's schedule, played or not.
+
+    Read from the same club-schedule JSONs as the results. A back-to-back is
+    a fact of the schedule, so an upcoming game is flagged from this even
+    when last night's result has not been ingested yet (the current-season
+    files refresh once a day).
+    """
+    dates: dict[str, set[str]] = defaultdict(set)
+    for payload in payloads:
+        for raw in payload.get("games", []):
+            if raw.get("gameType") not in (2, 3):
+                continue
+            day = str(raw.get("gameDate", ""))[:10]
+            for side in ("homeTeam", "awayTeam"):
+                ab = (raw.get(side) or {}).get("abbrev", "")
+                team = TEAM_NAMES.get(ab) or HISTORICAL_NAMES.get(ab)
+                if team and day:
+                    dates[team].add(day)
+    return dates
 
 
 def _is_past_season(season: str, today: date | None = None) -> bool:
@@ -478,9 +620,20 @@ def attach_goalies(records: list[GameRecord], box_dir: Path) -> list[GameRecord]
                 rec,
                 home_goalie=starting_goalie(box, "homeTeam"),
                 away_goalie=starting_goalie(box, "awayTeam"),
+                home_sog=_team_sog(box, "homeTeam"),
+                away_sog=_team_sog(box, "awayTeam"),
             )
         )
     return out
+
+
+def _team_sog(boxscore: dict, side: str) -> int | None:
+    """One side's shots on goal from a gamecenter boxscore; None when absent."""
+    value = (boxscore.get(side) or {}).get("sog")
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
 
 
 def _goalie_value(goalies: GoalieBook, goalie_id) -> float:
@@ -548,6 +701,9 @@ def replay(
     k_goalie: float | None = None,
     goalie_span: int = GOALIE_SPAN,
     log: list | None = None,
+    shots: dict[str, dict] | None = None,
+    last_played: dict[str, str] | None = None,
+    use_ctx: bool | None = None,
 ) -> tuple[int | None, list[tuple[float, float, GameRecord]]]:
     """Run records through Elo + rolling goals in order, mutating book/rolling.
 
@@ -561,6 +717,13 @@ def replay(
     strictly *prior* starts — this game's save% enters the EWMA only after
     the game is scored — and team Elo updates never see the goalie overlay,
     so team ratings are identical to a goalie-less replay.
+
+    shots/last_played (mutated in place too) carry the v3 context: each
+    team's EWMA of shots-on-goal differential and the date of its last game.
+    With use_ctx (default CTX_ENABLED) the logged/evaluated probability is
+    ctx_prob() over the Elo number once both teams have CTX_MIN_GAMES
+    shot-counted games, and the plain Elo number before that. Team Elo
+    updates never see it.
     """
     if goalies is None:
         goalies = {}
@@ -568,11 +731,21 @@ def replay(
         team_goalie = {}
     if k_goalie is None:
         k_goalie = GOALIE_K if GOALIE_ADJ_ENABLED else 0.0
+    if shots is None:
+        shots = {}
+    if last_played is None:
+        last_played = {}
+    if use_ctx is None:
+        use_ctx = CTX_ENABLED
+    sog_alpha = 2.0 / (CTX_SOG_SPAN + 1.0)
     evals: list[tuple[float, float, GameRecord]] = []
     current = last_season
     for r in records:
         if current is not None and r.season > current:
             book.new_season()
+            for entry in shots.values():
+                entry["sog"] *= CTX_SEASON_CARRY
+            last_played.clear()  # the summer is not a back-to-back
         current = r.season
         if log is not None or (eval_season is not None and r.season == eval_season):
             gdiff = _goalie_diff(
@@ -582,6 +755,13 @@ def replay(
                 k_goalie,
             )
             prob = _expected_home_prob(book, r.home, r.away, gdiff)
+            if use_ctx and _ctx_ready(shots, r.home, r.away):
+                prob = ctx_prob(
+                    prob,
+                    _is_back_to_back(last_played.get(r.home), r.date),
+                    _is_back_to_back(last_played.get(r.away), r.date),
+                    shots[r.home]["sog"] - shots[r.away]["sog"],
+                )
             if log is not None:
                 # 5-field walk-forward row — pre-update prob, team names for
                 # the dollar-ROI price join (store/roibacktest.py).
@@ -601,6 +781,14 @@ def replay(
             _record_goalie_start(goalies, start, goalie_span)
             if start is not None:
                 team_goalie[team] = str(start.id)
+        if r.home_sog is not None and r.away_sog is not None:
+            margin = float(r.home_sog - r.away_sog)
+            for team, value in ((r.home, margin), (r.away, -margin)):
+                entry = shots.setdefault(team, _fresh_shots())
+                entry["sog"] += sog_alpha * (value - entry["sog"])
+                entry["n"] += 1
+        last_played[r.home] = r.date
+        last_played[r.away] = r.date
     return current, evals
 
 
@@ -655,12 +843,38 @@ class NhlEngine(SportEngine):
 
     @property
     def model_name(self) -> str:  # type: ignore[override]
-        return XG_MODEL_NAME if self._xg_weights else ELO_MODEL_NAME
+        if self._xg_serving():
+            return XG_MODEL_NAME
+        return CTX_MODEL_NAME if CTX_ENABLED else ELO_MODEL_NAME
+
+    def _xg_serving(self) -> bool:
+        """The xG path prices games only when enabled AND its file is current.
+
+        Current = the file's last game is within XG_MAX_STALE_DAYS of the
+        newest result this engine has replayed from the NHL API. A file left
+        over from last season fails that from the second week of October.
+        """
+        if not (XG_ENABLED and self._xg_weights and self._xg_last_date):
+            return False
+        if not self._latest_result:
+            return True
+        try:
+            gap = (date.fromisoformat(self._latest_result) - date.fromisoformat(self._xg_last_date)).days
+        except ValueError:
+            return False
+        return gap <= XG_MAX_STALE_DAYS
 
     def __init__(self, state_path: Path = STATE_PATH, raw_dir: Path = RAW_NHL_DIR):
         self._state_path = state_path
         self._raw_dir = raw_dir
         self._box_dir = raw_dir / "box"
+        # Context path (v3): shots-on-goal EWMAs, last game date per team,
+        # and every scheduled date per team (for upcoming back-to-backs).
+        self._shots: dict[str, dict] = {}
+        self._last_played: dict[str, str] = {}
+        self._team_dates: dict[str, set[str]] = {}
+        self._latest_result: str | None = None  # newest replayed game date
+        self._xg_last_date: str | None = None  # newest game in the MoneyPuck file
         # xG path (v2): team EWMAs + fitted weights, present only when the
         # MoneyPuck file has been dropped in. See _refresh_xg.
         self._xg_state: dict[str, dict] = {}
@@ -685,7 +899,9 @@ class NhlEngine(SportEngine):
         """Fetch/refresh raw schedules + boxscores, replay unseen games, persist."""
         self._ensure_loaded()
         await self._fetch_raw()
-        records = self._load_records(with_goalies=False)
+        payloads = self._load_payloads()
+        self._team_dates = schedule_dates(payloads)
+        records = games_from_payloads(payloads)
         await self._fetch_boxscores([r.id for r in records])
         records = attach_goalies(records, self._box_dir)
         new = [r for r in records if r.id not in self._processed]
@@ -697,12 +913,17 @@ class NhlEngine(SportEngine):
             goalies=self._goalies,
             team_goalie=self._team_goalie,
             log=self._backtest_log,
+            shots=self._shots,
+            last_played=self._last_played,
         )
         self._processed.update(r.id for r in new)
-        try:
-            self._refresh_xg()
-        except Exception:  # noqa: BLE001 — the v1 engine must never depend on the v2 file
-            logging.getLogger("kryptscout").exception("nhl: xG refresh failed; serving Elo")
+        if new:
+            self._latest_result = max([self._latest_result or ""] + [r.date for r in new])
+        if XG_ENABLED:
+            try:
+                self._refresh_xg()
+            except Exception:  # noqa: BLE001 — the engine must never depend on the v2 file
+                logging.getLogger("kryptscout").exception("nhl: xG refresh failed; serving without it")
         self._save_state()
 
     def _refresh_xg(self) -> bool:
@@ -726,7 +947,9 @@ class NhlEngine(SportEngine):
         weights = fit_xg_logit(rows, upto_season=season) or fit_xg_logit(rows, upto_season=season + 1)
         if weights is None:
             return False
-        scored = [r for r in rows if r["season"] == season and r["n_min"] >= XG_MIN_GAMES]
+        # Shootout games carry no winner in this file (see fit_xg_logit), so
+        # the walk-forward score here is over the games it can label.
+        scored = [r for r in rows if r["season"] == season and r["n_min"] >= XG_MIN_GAMES and not r.get("tied")]
         metrics: dict = {"season": season, "games": len(scored), "fitted_on_seasons_before": season}
         if scored:
             probs = [temper(xg_prob(weights, r), XG_LOGIT_SCALE) for r in scored]
@@ -736,6 +959,7 @@ class NhlEngine(SportEngine):
             metrics["accuracy"] = sum((p >= 0.5) == r["home_won"] for p, r in zip(probs, scored)) / len(scored)
         self._xg_state, self._xg_weights, self._xg_season = state, weights, season
         self._xg_mtime, self._xg_metrics = mtime, metrics
+        self._xg_last_date = games[-1].date
         return True
 
     async def _fetch_boxscores(self, game_ids: list[int]) -> None:
@@ -797,7 +1021,7 @@ class NhlEngine(SportEngine):
         self._raw_dir.mkdir(parents=True, exist_ok=True)
         now = time.time()
         async with httpx.AsyncClient(timeout=30) as client:
-            for season in SEASONS:
+            for season in _seasons():
                 for abbrev in TEAM_NAMES:
                     path = self._raw_path(abbrev, season)
                     if path.exists():
@@ -819,11 +1043,17 @@ class NhlEngine(SportEngine):
     def _raw_path(self, abbrev: str, season: str) -> Path:
         return self._raw_dir / f"{abbrev}_{season}.json"
 
-    def _load_records(self, with_goalies: bool = True) -> list[GameRecord]:
+    def _load_payloads(self) -> list[dict]:
         payloads = []
         for path in sorted(self._raw_dir.glob("*.json")):
-            payloads.append(json.loads(path.read_text(encoding="utf-8")))
-        records = games_from_payloads(payloads)
+            try:
+                payloads.append(json.loads(path.read_text(encoding="utf-8")))
+            except (json.JSONDecodeError, OSError):
+                continue  # a half-written cache file is refetched next refresh
+        return payloads
+
+    def _load_records(self, with_goalies: bool = True) -> list[GameRecord]:
+        records = games_from_payloads(self._load_payloads())
         if with_goalies:
             records = attach_goalies(records, self._box_dir)
         return records
@@ -837,11 +1067,14 @@ class NhlEngine(SportEngine):
         if not self._state_path.exists():
             return
         state = json.loads(self._state_path.read_text(encoding="utf-8"))
-        if "goalies" not in state or "backtest" not in state:
-            # Pre-goalie (v1) or pre-log (v2) state: ignore it so the next
-            # refresh replays everything from the local caches and rebuilds
-            # both goalie ratings and the walk-forward log.
+        if "goalies" not in state or "backtest" not in state or "shots" not in state:
+            # Pre-goalie (v1), pre-log (v2) or pre-context (v3) state: ignore
+            # it so the next refresh replays everything from the local caches
+            # and rebuilds goalie ratings, shot EWMAs and the walk-forward log.
             return
+        self._shots = {t: dict(v) for t, v in state["shots"].items()}
+        self._last_played = dict(state.get("last_played") or {})
+        self._latest_result = state.get("latest_result")
         self._book.ratings = {t: float(r) for t, r in state["ratings"].items()}
         self._rolling = _new_rolling()
         for team, window in state["rolling"].items():
@@ -858,6 +1091,7 @@ class NhlEngine(SportEngine):
             self._xg_season = xg.get("season")
             self._xg_mtime = xg.get("mtime")
             self._xg_metrics = dict(xg.get("metrics") or {})
+            self._xg_last_date = xg.get("last_date")
 
     def _save_state(self) -> None:
         state = {
@@ -870,12 +1104,16 @@ class NhlEngine(SportEngine):
             "team_goalie": self._team_goalie,
             "processed_ids": sorted(self._processed),
             "backtest": self._backtest_log,
+            "shots": self._shots,
+            "last_played": self._last_played,
+            "latest_result": self._latest_result,
             "xg": {
                 "state": self._xg_state,
                 "weights": self._xg_weights,
                 "season": self._xg_season,
                 "mtime": self._xg_mtime,
                 "metrics": self._xg_metrics,
+                "last_date": self._xg_last_date,
             },
         }
         self._state_path.write_text(json.dumps(state), encoding="utf-8")
@@ -902,12 +1140,29 @@ class NhlEngine(SportEngine):
             self._goalies, self._team_goalie.get(home), self._team_goalie.get(away)
         )
 
+    def _played_day_before(self, team: str, day: date) -> bool:
+        """Is `team` on the second night of a back-to-back on `day` (Eastern)?
+
+        Read from the schedule (every dated game, played or not) so it holds
+        before last night's result is ingested; falls back to the replay's
+        last game date when the schedule cache is empty.
+        """
+        yesterday = date.fromordinal(day.toordinal() - 1).isoformat()
+        dates = self._team_dates.get(team)
+        if dates:
+            return yesterday in dates
+        return self._last_played.get(team, "")[:10] == yesterday
+
     async def predict(self, games: list[Game]) -> list[Prediction]:
         self._ensure_loaded()
         now = datetime.now(timezone.utc)
         predictions: list[Prediction] = []
+        xg_live = self._xg_serving()
+        if CTX_ENABLED and not self._team_dates:
+            # Served from saved state before the first refresh of this run.
+            self._team_dates = schedule_dates(self._load_payloads())
         for game in games:
-            feats = xg_features(self._xg_state, game.home, game.away) if self._xg_weights else None
+            feats = xg_features(self._xg_state, game.home, game.away) if xg_live else None
             if feats is not None:
                 home_prob = temper(xg_prob(self._xg_weights, feats), XG_LOGIT_SCALE)
                 model = XG_MODEL_NAME
@@ -919,6 +1174,15 @@ class NhlEngine(SportEngine):
                     self._slate_goalie_diff(game.home, game.away),
                 )
                 model = ELO_MODEL_NAME
+                if CTX_ENABLED and _ctx_ready(self._shots, game.home, game.away):
+                    day = game.start_time.astimezone(espn._EASTERN).date()
+                    home_prob = ctx_prob(
+                        home_prob,
+                        self._played_day_before(game.home, day),
+                        self._played_day_before(game.away, day),
+                        self._shots[game.home]["sog"] - self._shots[game.away]["sog"],
+                    )
+                    model = CTX_MODEL_NAME
             goals_home, goals_away = _predicted_goals(
                 self._rolling, game.home, game.away
             )
@@ -950,12 +1214,16 @@ class NhlEngine(SportEngine):
         eval_season: int = VALIDATE_SEASON,
         k_goalie: float | None = None,
         goalie_span: int = GOALIE_SPAN,
+        use_ctx: bool = False,
+        regular_only: bool = False,
     ) -> dict[str, float]:
         """Fresh in-memory replay of all cached games, scoring eval_season.
 
         Uses pre-update probabilities only (no leakage; goalie ratings are
         built strictly from prior starts); does not touch the persisted
-        engine state. k_goalie=0.0 scores the pure-Elo baseline.
+        engine state. k_goalie=0.0 scores the pure-Elo baseline; use_ctx
+        scores the v3 context model over that Elo. Note the first cached
+        season is a cold start (every team at 1500) for both.
         """
         records = self._load_records()
         book = EloBook(config=ELO_CONFIG)
@@ -966,7 +1234,10 @@ class NhlEngine(SportEngine):
             eval_season=eval_season,
             k_goalie=k_goalie,
             goalie_span=goalie_span,
+            use_ctx=use_ctx,
         )
+        if regular_only:
+            evals = [e for e in evals if e[2].game_type == 2]
         return _score_evals(evals)
 
 
@@ -985,13 +1256,26 @@ async def _main() -> None:
     await engine.refresh_data()
     print(f"  ratings tracked: {len(engine._book.ratings)} teams, "
           f"{len(engine._goalies)} goalies")
-    if engine._xg_weights:
+    print(f"  seasons in the window: {', '.join(_seasons())}; newest replayed result: {engine._latest_result}")
+    if engine._xg_serving():
         m = engine._xg_metrics
         print(f"  xG path active (nhl-xg-v2): season {m.get('season')} walk-forward "
               f"n={m.get('games')} log loss {m.get('log_loss', float('nan')):.4f} "
               f"acc {m.get('accuracy', float('nan')):.3f}")
+    elif XG_ENABLED:
+        print(f"  xG path NOT serving: file missing or stale (its last game {engine._xg_last_date})")
     else:
-        print("  xG path inactive: drop MoneyPuck's all_teams.csv under raw/nhl/moneypuck/ to enable")
+        print("  xG path off (XG_ENABLED = False)")
+
+    print("\n  context model v3 vs the Elo it sits on (regular season, pre-update, this code):")
+    for season in sorted({int(s) for s in _seasons()}):
+        elo_m = engine.backtest(eval_season=season, k_goalie=0.0, regular_only=True)
+        ctx_m = engine.backtest(eval_season=season, k_goalie=0.0, use_ctx=True, regular_only=True)
+        if not elo_m.get("games"):
+            continue
+        print(f"    {season}: Elo {elo_m['log_loss']:.4f}  v3 {ctx_m['log_loss']:.4f}  "
+              f"({ctx_m['log_loss'] - elo_m['log_loss']:+.4f}, {elo_m['games']} games; "
+              f"acc {elo_m['accuracy']:.3f} -> {ctx_m['accuracy']:.3f})")
 
     print(f"\n  goalie tune on {TUNE_SEASON} (log loss; baseline k=0):")
     baseline_tune = engine.backtest(eval_season=TUNE_SEASON, k_goalie=0.0)

@@ -261,3 +261,68 @@ def test_weather_naive_start_time_treated_as_utc(monkeypatch) -> None:
     )
     assert wx is not None
     assert wx.temp_c == 24.0  # snapped to the 18:00 slot
+
+
+# ------------------------------------------------------------ forecast cache
+
+
+def test_forecast_is_fetched_once_per_venue_and_day(monkeypatch) -> None:
+    """The board is rebuilt every refresh; the forecast must not be re-fetched
+    for every game on every build."""
+    calls = []
+
+    async def fake_forecast(lat, lon, start_date, end_date):
+        calls.append((lat, lon, start_date))
+        return OPEN_METEO_PAYLOAD
+
+    monkeypatch.setattr(weather_mod, "_fetch_forecast", fake_forecast)
+    start = datetime(2026, 7, 10, 19, 40, tzinfo=timezone.utc)
+    first = asyncio.run(weather_mod.game_weather(Sport.MLB, "Chicago Cubs", start))
+    second = asyncio.run(weather_mod.game_weather(Sport.MLB, "Chicago Cubs", start))
+    assert first == second and first is not None
+    assert len(calls) == 1
+    # A different venue is its own key.
+    asyncio.run(weather_mod.game_weather(Sport.MLB, "Boston Red Sox", start))
+    assert len(calls) == 2
+
+
+def test_forecast_cache_expires(monkeypatch) -> None:
+    calls = []
+
+    async def fake_forecast(lat, lon, start_date, end_date):
+        calls.append(start_date)
+        return OPEN_METEO_PAYLOAD
+
+    clock = [1_000.0]
+    monkeypatch.setattr(weather_mod, "_fetch_forecast", fake_forecast)
+    monkeypatch.setattr(weather_mod.time, "monotonic", lambda: clock[0])
+    start = datetime(2026, 7, 10, 19, 40, tzinfo=timezone.utc)
+    asyncio.run(weather_mod.game_weather(Sport.MLB, "Chicago Cubs", start))
+    clock[0] += weather_mod.FORECAST_TTL_S - 1
+    asyncio.run(weather_mod.game_weather(Sport.MLB, "Chicago Cubs", start))
+    assert len(calls) == 1
+    clock[0] += 2
+    asyncio.run(weather_mod.game_weather(Sport.MLB, "Chicago Cubs", start))
+    assert len(calls) == 2
+
+
+def test_failed_forecast_is_not_cached(monkeypatch) -> None:
+    """A venue whose forecast failed once must be retried on the next build,
+    not served "no weather" for half an hour."""
+    attempts = []
+
+    async def flaky(lat, lon, start_date, end_date):
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise RuntimeError("open-meteo timed out")
+        return OPEN_METEO_PAYLOAD
+
+    monkeypatch.setattr(weather_mod, "_fetch_forecast", flaky)
+    start = datetime(2026, 7, 10, 19, 40, tzinfo=timezone.utc)
+    try:
+        first = asyncio.run(weather_mod.game_weather(Sport.MLB, "Chicago Cubs", start))
+    except RuntimeError:
+        first = None
+    assert first is None
+    second = asyncio.run(weather_mod.game_weather(Sport.MLB, "Chicago Cubs", start))
+    assert second is not None and len(attempts) == 2

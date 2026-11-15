@@ -140,7 +140,7 @@ class Prediction(BaseModel):
 
     game_id: str
     sport: Sport
-    model: str  # engine identifier, e.g. "nba-xgb-v1"
+    model: str  # engine identifier, e.g. "nba-elo-v1"
     generated_at: datetime
     home_win_prob: float = Field(ge=0.0, le=1.0)
     away_win_prob: float = Field(ge=0.0, le=1.0)

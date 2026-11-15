@@ -33,7 +33,7 @@ import { cls, openExternal } from '../utils/format'
 /** Start-to-finish setup walkthrough (registering + connecting Scout). */
 const GUIDE_URL = 'https://www.youtube.com/watch?v=kmSmzH6Aixs'
 
-const STEP_LABELS = ['Get Polymarket', 'How you read', 'Get the picks']
+const STEP_LABELS = ['Where to bet', 'How you read', 'Get the picks']
 
 /**
  * Set the live UI mode via the SAME mechanism the TitleBar uses: the
@@ -172,11 +172,14 @@ export default function Onboarding() {
         <div className="mt-5 min-h-[280px]">
           {step === 0 && (
             <div className="animate-fade-in">
-              <h2 className="text-lg font-bold leading-tight text-white">Get on Polymarket</h2>
+              <h2 className="text-lg font-bold leading-tight text-white">
+                You are set up. Want somewhere to bet?
+              </h2>
               <p className="mt-1 text-sm leading-relaxed text-krypt-muted">
-                Scout prices every game against Polymarket — the sharpest vig-free odds on the
-                board — and it&apos;s the one market the bot can bet automatically. One account
-                unlocks everything.
+                Scout already works — nothing else to install or sign up for. It prices every
+                game against the exchanges (Polymarket and Kalshi). If you want to bet there,
+                or let auto-bet place for you, a Polymarket account is the quickest way in.
+                This step is optional.
               </p>
               <div className="mt-4 space-y-2">
                 <button
@@ -219,7 +222,7 @@ export default function Onboarding() {
                 </button>
               </div>
               <p className="mt-3 text-[10px] uppercase tracking-wider text-krypt-muted/60">
-                Already on Polymarket? Hit NEXT. Signup link is a referral · 18+/21+ where legal.
+                Have an account, or just looking? Hit NEXT. Signup link is a referral · 18+/21+ where legal.
               </p>
             </div>
           )}

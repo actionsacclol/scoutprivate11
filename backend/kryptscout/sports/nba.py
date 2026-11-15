@@ -1,26 +1,23 @@
-"""NBA engine — Elo core with a gradient-boosted overlay (v2).
+"""NBA engine — Elo with margin-of-victory scaling (nba-elo-v1).
 
-The v1 Elo baseline is unchanged: standard Elo (K=20, margin-of-victory
-scaling, +100 rating points of home advantage) replayed over every completed
-NBA game since October 2024, plus rolling last-15 scoring for totals. Raw
-daily scoreboards are cached under RAW_DIR/nba/ and the replayed state
-persists to DATA_DIR/nba_state.json so refresh_data() stays incremental.
+Standard Elo (K=12, margin-of-victory scaling, +40 rating points of home
+advantage, half-carry between seasons) replayed over every completed NBA
+game since October 2024, plus a back-to-back overlay (a side that played
+yesterday gives up B2B_ELO points; ratings never see it) and rolling last-15
+scoring for totals. Raw daily
+scoreboards are cached under RAW_DIR/nba/ and the replayed state persists to
+DATA_DIR/nba_state.json so refresh_data() stays incremental.
 
-v2 adds a small walk-forward-honest XGBoost classifier over strictly
-pre-game features logged during the replay (all rows home-perspective):
-elo_diff, each side's rolling last-15 PF/PA, the rolling net-rating diff,
-rest days and back-to-back flags (derived from each team's previous game
-date), and games-played-this-season per side (early-season noise indicator).
-
-Training is chronological: fit on 2024-25 plus the first half of 2025-26
-(the tail of the fit set is held out for early stopping and Platt
-calibration), validate on the untouched second half of 2025-26. Elo, the
-calibrated XGB, and a 50-50 blend are compared on validation log loss and
-the winner ships; a logistic-regression fallback (elo_diff + rest features)
-is reported alongside. The bundle pickles to MODELS_DIR and refresh_data()
-retrains it when missing or older than 7 days. When the pickle is absent or
-the model gated off (Elo won), predict() uses the pure Elo path and
-model_name stays "nba-elo-v1"; otherwise it reports "nba-xgb-v2".
+There is no trained model here. A v2 overlay (an XGBoost classifier over
+Elo, rolling scoring, rest and games-played features — `nba-xgb-v2`) was
+built and retired in November 2026. It retrained weekly and was allowed to
+serve only when it beat Elo on held-out games, and it never earned that: the
+last bundle it wrote (2026-11-05, validated on 719 games from 2026-01-30)
+scored log loss 0.608 against Elo's 0.567, the 50/50 blend 0.583, and gated
+itself off — as the July bundle had (0.623 vs 0.579, n=658). Every install
+was already serving `nba-elo-v1`. What the overlay cost was certain: the
+xgboost and scikit-learn runtimes in every installer, a version-stamped
+pickle under MODELS_DIR, and the heaviest import of the cold start.
 """
 from __future__ import annotations
 
@@ -28,21 +25,14 @@ import asyncio
 import json
 import logging
 import math
-import pickle
 from collections import deque
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterator, Optional
 
 import httpx
-import numpy as np
-from sklearn.linear_model import LogisticRegression
-from sklearn.pipeline import make_pipeline
-from sklearn.preprocessing import StandardScaler
-from xgboost import XGBClassifier
 
-from kryptscout.config import DATA_DIR, MODELS_DIR, RAW_DIR
-from kryptscout.core import modelio
+from kryptscout.config import DATA_DIR, RAW_DIR
 from kryptscout.core.elo import EloBook, EloConfig
 from kryptscout.core.schemas import Game, Prediction, Sport
 from kryptscout.datasources import espn
@@ -60,15 +50,18 @@ HISTORY_START = date(2024, 10, 1)  # 2024-25 season (preseason filtered out)
 # refresh ever rewrote the state, the Engine Room showed it stale all
 # summer, and the 2026-27 season would never have been ingested.
 SEASON_BOUNDARY_MONTH = 8  # Aug 1 splits NBA seasons (off-season midpoint)
-CURRENT_SEASON_START = date(2025, 8, 1)  # 2025-26 portion, for backtest metrics
 ROLLING_WINDOW = 15  # games in the rolling points-for/against averages
 LEAGUE_AVG_POINTS = 113.0  # fallback before a team has any scoring history
 CHECKPOINT_EVERY_DAYS = 30  # persist state periodically during long backfills
 # v3 added team names to backtest rows (dollar-ROI join). v4 (2026-09-02):
 # the Elo retune (K 20→12, home 100→60, carry 0.75→0.5) changes how every
 # rating is accumulated, so a state replayed under the old constants must be
-# discarded and rebuilt from the cached scoreboards.
-STATE_VERSION = 4
+# discarded and rebuilt from the cached scoreboards. Dropping the v2 feature
+# log (November 2026) did NOT bump this: a v4 file's ratings are exactly what
+# this engine computes, and its extra keys are simply ignored on load.
+# v5 (2026-11): home advantage 60 -> 40 changes every rating update, and the
+# state gains each team's last game day for the back-to-back overlay.
+STATE_VERSION = 5
 
 # Retuned 2026-09-02 on the engine's own archive (walk-forward, held out
 # from 2026-01): K 20 → 12, home advantage 100 → 60, season carry 0.75 → 0.5
@@ -79,38 +72,33 @@ STATE_VERSION = 4
 # now ~2 pts UNDER-stated), so no logit scale is applied here — the retune
 # alone fixed the calibration. Two seasons of data behind it; retune again
 # when a third exists.
+#
+# Home advantage 60 -> 40 (2026-11, three seasons): at 60 the engine stated
+# 57.5% home wins against 53.6 / 55.5 / 52.5% played, +3.0 pts [+1.3, +4.7]
+# pooled over 2,514 games. Walk-forward the log-loss change is inside the
+# noise (2025-26: -0.0007 [-0.0035, +0.0020]; 2026-27 to date: -0.0042
+# [-0.0117, +0.0038]); this is a bias fix, not a forecast gain. K and carry
+# were re-checked on the same grid and stay.
 ELO_CONFIG = EloConfig(
     k=12.0,
-    home_advantage=60.0,
+    home_advantage=40.0,
     mov_scaling=True,
     season_carry=0.5,
 )
 
-MODEL_NAME_V1 = "nba-elo-v1"
-MODEL_NAME_V2 = "nba-xgb-v2"
+# Back-to-back overlay: Elo points taken from a side that played the day
+# before. Home sides on a back-to-back (opponent rested) won 9.6 pts
+# [4.0, 15.0] less often than Elo said (n=276); the closing line was within
+# 2.4 pts on the same games. Worth -0.0003 / -0.0012 log loss on the two
+# held-out seasons on top of the home-advantage change — not significant on
+# its own, kept small. 0 disables it.
+B2B_ELO = 25.0
+# US game day from a UTC tip-off: NBA games tip 12:00-22:30 Eastern, which is
+# 16:00-03:30 UTC; six hours back lands on the Eastern date in both DST
+# regimes without needing a timezone database in the frozen bundle.
+GAME_DAY_UTC_OFFSET = timedelta(hours=6)
 
-# Pre-game feature columns, home-perspective (home flag implicit).
-FEATURE_NAMES = [
-    "elo_diff",  # raw rating gap, no HFA — the model learns the home edge
-    "home_pf",  # rolling last-15 points for/against, both sides
-    "home_pa",
-    "away_pf",
-    "away_pa",
-    "net_rating_diff",  # (home PF-PA) minus (away PF-PA), rolling
-    "home_rest",  # days since previous game, capped at REST_CAP
-    "away_rest",
-    "home_b2b",  # back-to-back flag (rest == 1)
-    "away_b2b",
-    "home_gp",  # games played this season (early-season noise indicator)
-    "away_gp",
-]
-LOGREG_COLS = [0, 6, 7, 8, 9]  # elo_diff + rest/back-to-back fallback features
-REST_CAP = 7  # rest saturates here; also the first-game-of-season sentinel
-MODEL_MAX_AGE_DAYS = 7  # refresh_data() retrains a pickle older than this
-PROB_FLOOR = 0.02  # calibrated probabilities clipped away from 0/1
-TRAIN_TAIL_FRACTION = 0.15  # of fit set: early stopping + Platt calibration
-MIN_TRAINING_GAMES = 300  # total replayed games required before training
-MIN_CURRENT_GAMES = 100  # current-season games required for a real val split
+MODEL_NAME = "nba-elo-v1"
 
 
 def _season_key(day: date) -> int:
@@ -118,70 +106,32 @@ def _season_key(day: date) -> int:
     return day.year if day.month >= SEASON_BOUNDARY_MONTH else day.year - 1
 
 
-def _clip(p: np.ndarray) -> np.ndarray:
-    return np.clip(p, PROB_FLOOR, 1.0 - PROB_FLOOR)
-
-
-def _logit(p: np.ndarray) -> np.ndarray:
-    return np.log(p / (1.0 - p))
-
-
-def _fit_platt(raw: np.ndarray, y: np.ndarray) -> Optional[tuple[float, float]]:
-    """Platt scaling on the model's log-odds; None if the slice is one-class."""
-    if len(np.unique(y)) < 2:
-        return None
-    z = _logit(_clip(raw)).reshape(-1, 1)
-    lr = LogisticRegression(C=1e6, max_iter=1000).fit(z, y)
-    return float(lr.coef_[0][0]), float(lr.intercept_[0])
-
-
-def _apply_platt(raw: np.ndarray, platt: Optional[tuple[float, float]]) -> np.ndarray:
-    if platt is None:
-        return _clip(raw)
-    a, b = platt
-    return _clip(1.0 / (1.0 + np.exp(-(a * _logit(_clip(raw)) + b))))
-
-
-def _acc_ll(p: np.ndarray, y: np.ndarray) -> dict[str, float]:
-    q = np.clip(p, 1e-12, 1.0 - 1e-12)
-    return {
-        "games": int(len(y)),
-        "accuracy": float(np.mean((q >= 0.5) == (y == 1))),
-        "log_loss": float(-np.mean(y * np.log(q) + (1 - y) * np.log(1.0 - q))),
-    }
+def _season_start(day: date) -> date:
+    """First day of the season `day` falls in (the Aug 1 boundary)."""
+    return date(_season_key(day), SEASON_BOUNDARY_MONTH, 1)
 
 
 class NbaEngine(SportEngine):
     sport = Sport.NBA
+    model_name = MODEL_NAME
 
     def __init__(
         self,
         state_path: Path | None = None,
         raw_dir: Path | None = None,
-        model_path: Path | None = None,
     ) -> None:
         self.state_path = state_path or DATA_DIR / "nba_state.json"
         self.raw_dir = raw_dir or RAW_DIR / "nba"
-        self.model_path = model_path or MODELS_DIR / "nba_xgb_v2.pkl"
         self.elo = EloBook(config=ELO_CONFIG)
         self.points_for: dict[str, deque[float]] = {}
         self.points_against: dict[str, deque[float]] = {}
-        self.last_game: dict[str, str] = {}  # team -> iso date of previous game
-        self.games_played: dict[str, int] = {}  # team -> games this season
         self.last_processed: Optional[date] = None
-        # One row per replayed game: (iso date, pre-game P(home win), home won)
-        self.backtest: list[tuple[str, float, int]] = []
-        # Parallel to backtest: the pre-game FEATURE_NAMES vector per game.
-        self.feature_log: list[list[float]] = []
-        self._model: Optional[dict] = None  # trained bundle (see train_model)
+        # Each team's most recent game day (ISO) — the back-to-back overlay.
+        self.last_game: dict[str, str] = {}
+        # One row per replayed game: (iso date, pre-game P(home win), home
+        # won, home, away) — the walk-forward log the backtest pages read.
+        self.backtest: list[tuple[str, float, int, str, str]] = []
         self._load_state()
-        self._load_model()
-
-    @property
-    def model_name(self) -> str:
-        if self._model and self._model.get("mode") in ("xgb", "blend"):
-            return MODEL_NAME_V2
-        return MODEL_NAME_V1
 
     # ------------------------------------------------------------- engine API
 
@@ -190,15 +140,11 @@ class NbaEngine(SportEngine):
 
     async def predict(self, games: list[Game]) -> list[Prediction]:
         now = datetime.now(timezone.utc)
-        mode = self._model.get("mode") if self._model else "elo"
         predictions: list[Prediction] = []
         for game in games:
-            elo_prob = self.elo.expected(game.home, game.away)
-            home_prob = elo_prob
-            if mode in ("xgb", "blend"):
-                row = self._feature_row(self._slate_date(game), game.home, game.away)
-                ml_prob = float(self._model_prob(np.asarray([row]))[0])
-                home_prob = 0.5 * (ml_prob + elo_prob) if mode == "blend" else ml_prob
+            home_prob = self._home_prob(
+                game.home, game.away, (game.start_time - GAME_DAY_UTC_OFFSET).date()
+            )
             home_score = (
                 self._avg(self.points_for, game.home)
                 + self._avg(self.points_against, game.away)
@@ -236,7 +182,7 @@ class NbaEngine(SportEngine):
         return predictions
 
     async def refresh_data(self) -> None:
-        """Backfill/extend the ESPN results cache, replay it, retrain if stale.
+        """Backfill/extend the ESPN results cache and replay it.
 
         Incremental: resumes the day after `last_processed` and only touches
         days whose games are guaranteed final (strictly before today, UTC).
@@ -247,22 +193,21 @@ class NbaEngine(SportEngine):
             else HISTORY_START
         )
         end = datetime.now(timezone.utc).date() - timedelta(days=1)
-        if start <= end:
-            self.raw_dir.mkdir(parents=True, exist_ok=True)
-            since_checkpoint = 0
-            async with httpx.AsyncClient(timeout=30) as client:
-                day = start
-                while day <= end:
-                    payload = await self._day_json(client, day)
-                    self._process_day(day, payload)
-                    since_checkpoint += 1
-                    if since_checkpoint >= CHECKPOINT_EVERY_DAYS:
-                        self._save_state()
-                        since_checkpoint = 0
-                    day += timedelta(days=1)
-            self._save_state()
-        if self._model_stale():
-            self.train_model()
+        if start > end:
+            return
+        self.raw_dir.mkdir(parents=True, exist_ok=True)
+        since_checkpoint = 0
+        async with httpx.AsyncClient(timeout=30) as client:
+            day = start
+            while day <= end:
+                payload = await self._day_json(client, day)
+                self._process_day(day, payload)
+                since_checkpoint += 1
+                if since_checkpoint >= CHECKPOINT_EVERY_DAYS:
+                    self._save_state()
+                    since_checkpoint = 0
+                day += timedelta(days=1)
+        self._save_state()
 
     # ------------------------------------------------------------ replay core
 
@@ -273,8 +218,6 @@ class NbaEngine(SportEngine):
             and _season_key(day) != _season_key(self.last_processed)
         ):
             self.elo.new_season()
-            self.last_game.clear()  # rest/games-played are per-season signals
-            self.games_played.clear()
         for home, away, home_score, away_score in self._completed_games(payload):
             self._replay_game(day, home, away, home_score, away_score)
         self.last_processed = day
@@ -282,13 +225,12 @@ class NbaEngine(SportEngine):
     def _replay_game(
         self, day: date, home: str, away: str, home_score: int, away_score: int
     ) -> None:
-        """One historical result: log prob + features first, then update state."""
-        prob = self.elo.expected(home, away)
+        """One historical result: log the pre-game prob first, then update."""
+        prob = self._home_prob(home, away, day)
         home_won = home_score > away_score
         # 5-field rows: team names let the dollar-ROI backtest join this log
         # against backfilled Polymarket prices (store/roibacktest.py).
         self.backtest.append((day.isoformat(), prob, int(home_won), home, away))
-        self.feature_log.append(self._feature_row(day, home, away))
         self.elo.update(home, away, home_won, margin=abs(home_score - away_score))
         for team, scored, allowed in (
             (home, home_score, away_score),
@@ -297,7 +239,20 @@ class NbaEngine(SportEngine):
             self._rolling(self.points_for, team).append(float(scored))
             self._rolling(self.points_against, team).append(float(allowed))
             self.last_game[team] = day.isoformat()
-            self.games_played[team] = self.games_played.get(team, 0) + 1
+
+    def _played_yesterday(self, team: str, day: date) -> bool:
+        last = self.last_game.get(team)
+        return bool(last) and (day - date.fromisoformat(last)).days == 1
+
+    def _home_prob(self, home: str, away: str, day: date) -> float:
+        """Elo P(home) with the back-to-back overlay; ratings never see it."""
+        diff = self.elo.get(home) + self.elo.config.home_advantage - self.elo.get(away)
+        if B2B_ELO:
+            if self._played_yesterday(home, day):
+                diff -= B2B_ELO
+            if self._played_yesterday(away, day):
+                diff += B2B_ELO
+        return 1.0 / (1.0 + 10.0 ** (-diff / 400.0))
 
     @staticmethod
     def _completed_games(payload: dict) -> Iterator[tuple[str, str, int, int]]:
@@ -348,59 +303,7 @@ class NbaEngine(SportEngine):
             return payload
         raise RuntimeError(f"ESPN scoreboard unavailable for {day} after retries")
 
-    # --------------------------------------------------------------- features
-
-    def _feature_row(self, day: date, home: str, away: str) -> list[float]:
-        """Strictly pre-game FEATURE_NAMES vector, home-perspective.
-
-        Uses only state accumulated before `day`'s result, so the same
-        function serves both the replay log and live predict(). Unknown
-        teams get league-average scoring, the REST_CAP rest sentinel, and
-        zero games played.
-        """
-        home_pf = self._avg(self.points_for, home)
-        home_pa = self._avg(self.points_against, home)
-        away_pf = self._avg(self.points_for, away)
-        away_pa = self._avg(self.points_against, away)
-        home_rest = self._rest_days(home, day)
-        away_rest = self._rest_days(away, day)
-        return [
-            self.elo.get(home) - self.elo.get(away),
-            home_pf,
-            home_pa,
-            away_pf,
-            away_pa,
-            (home_pf - home_pa) - (away_pf - away_pa),
-            float(home_rest),
-            float(away_rest),
-            float(home_rest == 1),
-            float(away_rest == 1),
-            float(self.games_played.get(home, 0)),
-            float(self.games_played.get(away, 0)),
-        ]
-
-    def _rest_days(self, team: str, day: date) -> int:
-        """Days since the team's previous game, capped at REST_CAP.
-
-        A team with no previous game this season gets the cap (fully
-        rested), which doubles as the unknown-team sentinel.
-        """
-        last = self.last_game.get(team)
-        if not last:
-            return REST_CAP
-        return min((day - date.fromisoformat(last)).days, REST_CAP)
-
-    @staticmethod
-    def _slate_date(game: Game) -> date:
-        """The US slate date of a game, matching the replay's scoreboard days.
-
-        ESPN day files are keyed by the US (Eastern) date; a 7pm ET tip is
-        already the next day in UTC, so shift 5 hours before taking .date().
-        """
-        start = game.start_time
-        if start.tzinfo is None:
-            start = start.replace(tzinfo=timezone.utc)
-        return (start - timedelta(hours=5)).date()
+    # ---------------------------------------------------------------- rolling
 
     @staticmethod
     def _rolling(table: dict[str, deque[float]], team: str) -> deque[float]:
@@ -414,149 +317,6 @@ class NbaEngine(SportEngine):
         if not values:
             return LEAGUE_AVG_POINTS
         return sum(values) / len(values)
-
-    # ---------------------------------------------------------------- model
-
-    def train_model(self) -> Optional[dict]:
-        """Walk-forward fit; ship the validation log-loss winner.
-
-        Chronology: fit on 2024-25 + the first half of 2025-26 (the fit
-        set's last TRAIN_TAIL_FRACTION reserved for early stopping and Platt
-        calibration), validate on the second half of 2025-26 — never touched
-        by any fit. Elo / calibrated-XGB / 50-50 blend compete on validation
-        log loss; "elo" winning gates the ML path off. A logistic-regression
-        fallback (elo_diff + rest) is evaluated for the report only. The
-        bundle (including the gate-off verdict) pickles to model_path.
-        Returns None when the replay is too short to split honestly.
-        """
-        if len(self.feature_log) != len(self.backtest):
-            return None  # legacy/partial state — needs a full replay first
-        days = [r[0] for r in self.backtest]
-        season_start = CURRENT_SEASON_START.isoformat()
-        current = [i for i, d in enumerate(days) if d >= season_start]
-        if len(days) < MIN_TRAINING_GAMES or len(current) < MIN_CURRENT_GAMES:
-            return None
-        split = current[len(current) // 2]
-        X = np.asarray(self.feature_log, dtype=float)
-        y = np.asarray([r[2] for r in self.backtest], dtype=int)
-        elo_p = np.asarray([r[1] for r in self.backtest], dtype=float)
-        X_train, y_train = X[:split], y[:split]
-        X_val, y_val, elo_val = X[split:], y[split:], elo_p[split:]
-
-        # Tiny, heavily regularized booster — ~2 seasons is very little data.
-        tail = max(20, int(len(X_train) * TRAIN_TAIL_FRACTION))
-        clf = XGBClassifier(
-            n_estimators=200,
-            max_depth=3,
-            learning_rate=0.03,
-            min_child_weight=25,
-            subsample=0.8,
-            colsample_bytree=0.8,
-            reg_lambda=5.0,
-            reg_alpha=1.0,
-            gamma=0.25,
-            monotone_constraints="(" + ",".join(
-                "1" if name == "elo_diff" else "0" for name in FEATURE_NAMES
-            ) + ")",
-            objective="binary:logistic",
-            eval_metric="logloss",
-            early_stopping_rounds=25,
-            n_jobs=2,
-            random_state=7,
-            verbosity=0,
-        )
-        clf.fit(
-            X_train[:-tail],
-            y_train[:-tail],
-            eval_set=[(X_train[-tail:], y_train[-tail:])],
-            verbose=False,
-        )
-        platt = _fit_platt(clf.predict_proba(X_train[-tail:])[:, 1], y_train[-tail:])
-        xgb_val = _apply_platt(clf.predict_proba(X_val)[:, 1], platt)
-
-        logreg = make_pipeline(
-            StandardScaler(), LogisticRegression(max_iter=1000)
-        ).fit(X_train[:, LOGREG_COLS], y_train)
-        logreg_val = _clip(logreg.predict_proba(X_val[:, LOGREG_COLS])[:, 1])
-
-        val = {
-            "elo": _acc_ll(elo_val, y_val),
-            "xgb": _acc_ll(xgb_val, y_val),
-            "blend": _acc_ll(0.5 * (xgb_val + elo_val), y_val),
-            "logreg": _acc_ll(logreg_val, y_val),
-        }
-        mode = min(("elo", "xgb", "blend"), key=lambda m: val[m]["log_loss"])
-        bundle = {
-            "trained_at": datetime.now(timezone.utc).isoformat(),
-            "mode": mode,  # "elo" = gated off, predict() stays on the Elo path
-            "booster": clf,
-            "platt": platt,
-            "feature_names": FEATURE_NAMES,
-            "val": val,
-            "val_range": (days[split], days[-1]),
-        }
-        self._save_model(bundle)
-        self._model = bundle
-        return bundle
-
-    def _model_prob(self, X: np.ndarray) -> np.ndarray:
-        """Calibrated, clipped P(home win) from the shipped booster."""
-        raw = self._model["booster"].predict_proba(X)[:, 1]
-        return _apply_platt(raw, self._model["platt"])
-
-    def _model_stale(self) -> bool:
-        """True when the bundle is missing, unloadable, aged out, OR the
-        pickle is gone from disk.
-
-        The disk check is what makes RETRAIN work: refresh_sport deletes the
-        pickle before calling refresh_data(), but a loaded engine still holds
-        the bundle in memory. Consulting only self._model would report "fresh"
-        and skip the retrain, leaving the artifact deleted until the next
-        backend restart (nfl._model_stale checks the path for the same reason).
-        """
-        if not self.model_path.exists():
-            return True
-        if not self._model:
-            return True
-        try:
-            trained = datetime.fromisoformat(self._model["trained_at"])
-        except (KeyError, TypeError, ValueError):
-            return True
-        return datetime.now(timezone.utc) - trained > timedelta(
-            days=MODEL_MAX_AGE_DAYS
-        )
-
-    def _load_model(self) -> None:
-        if not self.model_path.exists():
-            return
-        try:
-            bundle = pickle.loads(self.model_path.read_bytes())
-        except Exception:  # corrupt/foreign pickle — fall back to Elo
-            return
-        if not (
-            isinstance(bundle, dict)
-            and bundle.get("mode") in ("elo", "xgb", "blend")
-            and bundle.get("feature_names") == FEATURE_NAMES
-        ):
-            return
-        if not modelio.matches(bundle):
-            # Written by a different sklearn/xgboost minor — its predictions
-            # aren't guaranteed to reproduce. Leaving self._model unset falls
-            # back to Elo AND makes _model_stale() True, so refresh_data()
-            # retrains it. See core/modelio.
-            logger.warning(
-                "nba: model pickle was written by a different library stack "
-                "(%s vs %s) — falling back to Elo until it is retrained",
-                bundle.get(modelio.STAMP_KEY), modelio.library_versions(),
-            )
-            return
-        self._model = bundle
-
-    def _save_model(self, bundle: dict) -> None:
-        self.model_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.model_path.with_suffix(".pkl.tmp")
-        tmp.write_bytes(pickle.dumps(modelio.stamp(bundle)))
-        tmp.replace(self.model_path)
 
     # -------------------------------------------------------------- validation
 
@@ -588,7 +348,7 @@ class NbaEngine(SportEngine):
         except (OSError, json.JSONDecodeError):
             return
         if state.get("version") != STATE_VERSION:
-            return  # pre-v2 state lacks the feature log — force a full replay
+            return  # replayed under other Elo constants — force a full replay
         self.elo.ratings = {k: float(v) for k, v in state.get("ratings", {}).items()}
         for attr, key in (
             (self.points_for, "points_for"),
@@ -598,18 +358,12 @@ class NbaEngine(SportEngine):
                 attr[team] = deque(
                     (float(v) for v in values), maxlen=ROLLING_WINDOW
                 )
-        self.last_game = {t: str(d) for t, d in state.get("last_game", {}).items()}
-        self.games_played = {
-            t: int(n) for t, n in state.get("games_played", {}).items()
-        }
         if state.get("last_processed"):
             self.last_processed = date.fromisoformat(state["last_processed"])
+        self.last_game = {k: str(v) for k, v in state.get("last_game", {}).items()}
         self.backtest = [
             (str(r[0]), float(r[1]), int(r[2]), str(r[3]), str(r[4]))
             for r in state.get("backtest", [])
-        ]
-        self.feature_log = [
-            [float(v) for v in row] for row in state.get("features", [])
         ]
 
     def _save_state(self) -> None:
@@ -623,9 +377,7 @@ class NbaEngine(SportEngine):
             "points_for": {t: list(v) for t, v in self.points_for.items()},
             "points_against": {t: list(v) for t, v in self.points_against.items()},
             "last_game": self.last_game,
-            "games_played": self.games_played,
             "backtest": self.backtest,
-            "features": self.feature_log,
         }
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.state_path.with_suffix(".json.tmp")
@@ -642,36 +394,16 @@ if __name__ == "__main__":
     async def _main() -> None:
         engine = build_engine()
         await engine.refresh_data()
-        overall = engine.backtest_metrics()
-        current = engine.backtest_metrics(since=CURRENT_SEASON_START)
         print(f"model: {engine.model_name}")
         print(f"history through: {engine.last_processed}")
         print(f"teams rated: {len(engine.elo.ratings)}")
-        for label, metrics in (("all (2024-26)", overall), ("2025-26", current)):
+        current = _season_start(engine.last_processed or datetime.now(timezone.utc).date())
+        for label, since in (("all", None), (f"since {current}", current)):
+            metrics = engine.backtest_metrics(since=since)
             print(
-                f"{label} (elo): {metrics['games']} games  "
+                f"{label}: {metrics['games']} games  "
                 f"accuracy={metrics['accuracy']:.4f}  "
                 f"log_loss={metrics['log_loss']:.4f}"
             )
-        bundle = engine._model
-        if bundle is None:
-            print("no trained bundle (replay too short) — pure Elo path")
-            return
-        lo, hi = bundle["val_range"]
-        print(f"\nvalidation - second half of 2025-26 ({lo} to {hi}):")
-        print(f"{'model':<8}{'games':>7}{'accuracy':>10}{'log_loss':>10}")
-        for name in ("elo", "xgb", "blend", "logreg"):
-            m = bundle["val"][name]
-            print(
-                f"{name:<8}{m['games']:>7}"
-                f"{m['accuracy']:>10.4f}{m['log_loss']:>10.4f}"
-            )
-        print(f"shipped: {bundle['mode']}  (model_name={engine.model_name})")
-        gains = bundle["booster"].get_booster().get_score(importance_type="gain")
-        top = sorted(
-            ((FEATURE_NAMES[int(k[1:])], v) for k, v in gains.items()),
-            key=lambda kv: -kv[1],
-        )[:6]
-        print("top features by gain: " + ", ".join(f"{n}={v:.1f}" for n, v in top))
 
     asyncio.run(_main())

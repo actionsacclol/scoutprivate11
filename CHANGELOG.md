@@ -2,6 +2,234 @@
 
 ## Unreleased
 
+- **"Setup did not finish … (fetch failed)" on a new install** (FIX): the
+  scheduler asked the backend for the first results download with `fetch`,
+  which gives up when no answer has arrived after 300 seconds, whatever
+  timeout the app sets. The download now takes about 305 seconds on a new
+  install (the NHL engine loads the current season too), so it was reported
+  as failed at exactly five minutes while the backend carried on. Jobs are
+  now sent with `node:http`, which has no such limit, and the refresh cap is
+  15 minutes. Verified on a fresh profile: "9/9 engines · 305s".
+- **The Discord post carries its record** (NEW): every card that is posted
+  is written down (`card_picks`: side, probability shown, cheapest exchange
+  price after fees) and graded from final scores, and each post prints the
+  running result between the picks and the links: "Record: 12–6 (67%) ·
+  +1.4u since Nov 14 · last card (Nov 14) 4–2". One unit a pick at the price
+  a reader could have paid; a pick no exchange listed is staked at its fair
+  price; a soccer draw is a loss; losing days print too. The count starts
+  with the first post sent on this version (nothing is backfilled), a test
+  post shows the line without being recorded, and the settings page preview
+  shows it. `POST /api/picks/card/posted`, `GET /api/picks/card/record`
+  (store/cardrecord.py).
+- **The Discord post no longer takes over the webhook** (CHANGE): the app
+  used to rename each webhook to "Krypt Scout", replace its picture with the
+  Scout mark and post under that name. It now sends neither: the post
+  appears under the name and picture the server's owner gave the webhook. A
+  webhook already renamed by an earlier version stays that way until it is
+  changed in Discord. The closing "Get Krypt Scout — krypt.cc/tools/scout"
+  line is gone too; the post ends with the sign-up links.
+- **One click runs the picks and sends them** (CHANGE): a send used to post
+  from the last capture, up to four hours old. Every send — the Discord
+  page's button, now RUN + SEND NOW, and the daily auto-post — runs the
+  picks job first, so the card is chosen from prices pulled that minute. If
+  the job fails the post still goes out on the picks already recorded.
+- **RUN PICKS button** (NEW): the Picks toolbar can run the picks job on
+  demand — fresh prices for every sport and today's picks recorded — instead
+  of waiting for the next scheduled run. Desktop app only; hidden in demo.
+- **Picks are 50% to 85%, everywhere** (CHANGE): the Picks page, the
+  Dashboard's top pick and the Terminal no longer list a pick outside that
+  band (on 2026-11-14 the Picks page led with 96%, 94% and 93% favourites at
+  -2684, -1584 and -1372). Same rule as the Discord card.
+- **NHL and European soccer were running on last season** (FIX): both engines
+  listed their seasons as literals ending at 2025-26, so no 2026-27 game was
+  ever loaded. Every NHL number since late September came from June's
+  ratings, and the eight European leagues were frozen at May. Both now derive
+  the season window from the date. Soccer also maps the 18 clubs promoted
+  for 2026-27.
+- **NHL model: `nhl-elo-ctx-v3`** (CHANGE): Elo plus back-to-back flags and a
+  shots-on-goal form term. On this season's 312 games its log loss is 0.6452
+  against 0.6655 for what was being served, and on the 117 games with a
+  Kalshi price it is level with the market (+0.005, interval −0.005 to
+  +0.015). The MoneyPuck xG path is off by default: its fit labelled every
+  shootout a home loss, and even corrected it does not beat Elo. The file is
+  no longer read.
+- **Soccer model: `soccer-poisson-v3`** (CHANGE): team strengths are fitted on
+  the goals implied by each game's closing odds where the results feed
+  carries them (MLS keeps goals scored). Held out on Aug–Nov 2026: log loss
+  1.0009 → 0.9891 from reading the current season, then 0.9976 → 0.9841 from
+  the new input on the games with odds. Still behind the market.
+- **College opponents from lower divisions were priced as average teams**
+  (FIX): an FBS team hosting an FCS school, or a D1 basketball team hosting a
+  non-D1 one, was priced as if the visitor were a mid-table peer.
+  `ncaaf-kalman-v3` and `ncaab-kalman-v3` give those opponents a fitted
+  lower-division prior, read D1 membership from the conference id, fix a
+  season roll-over bug in basketball and regress toward the conference mean
+  between seasons. Held-out log loss: football 0.5397 → 0.4793, basketball
+  0.5595 → 0.4883. Also fixed: Charlotte and Troy were filed under two small
+  colleges that share their names in ESPN's directory, so neither matched
+  its rating on the live board.
+- **NFL: the listed starter is the one priced** (FIX): the engine used each
+  team's last starting quarterback even when the schedule file already named
+  someone else for the coming game (8 team-sides on 2026-11-14). It now reads
+  the listed starter and falls back to the last one further out. No
+  constants changed.
+- **NBA, WNBA, tennis retunes** (CHANGE): NBA home advantage 60 → 40 Elo (the
+  home side was overstated by 3.0 points; no log-loss gain claimed) plus a
+  25-point back-to-back penalty. WNBA K 28 → 16, home advantage 80 → 50,
+  carry 0.75 → 0.5, temperature off: 0.6066 → 0.5979 on 2026. Tennis adds
+  Challenger results to the ATP rating pool (0.6302 → 0.6208) and no longer
+  stops at a hard-coded year. Each state file is rebuilt once on first
+  refresh.
+- **Predictions are kept hourly** (CHANGE): one row per game, model and UTC
+  hour before kickoff instead of a single sliding row, so a morning number
+  survives to be scored later. Nothing after kickoff is stored, as before.
+- **A new install rated every team the same** (FIX): the ratings are built
+  from past results, and the job that downloads them only ever ran on a 24 h
+  timer counted from launch. A new install waited a day for it, and anyone
+  who closes the app each night never reached it — their NBA board showed the
+  same 58.5% home probability for every game. It hit updates too: an update
+  that discards an engine's saved state left that sport flat the same way.
+  The refresh now runs at startup whenever it is due (never run, a day old,
+  or last run by a different app version), before the first capture so no
+  picks are recorded off untrained ratings, and the daily cadence is measured
+  from the last success instead of from launch. A first run downloads about
+  five minutes of history in the background (measured: 283 s, all nine
+  sports, app responsive throughout); a strip under the title bar says so
+  and clears itself, or offers TRY AGAIN if a source was unreachable.
+- **Less to look at** (CHANGE): the sidebar's eighteen tabs are grouped —
+  the four everyday pages, then Betting, Research and Connect, with SETTINGS
+  and ABOUT pinned at the bottom. SIMPLE folds Research and Connect until you
+  open them (one click, remembered); PRO shows everything. PICKS no longer
+  heads every game "Recommended bets / TAKE": prices that beat the fair are
+  listed first as "Bets worth taking" (often none, and it says that is
+  normal), and favorites with nothing to bet sit below, marked NO BET.
+- **The Discord post is a short card, not the slate** (CHANGE): with MODEL on,
+  a send posted the first 12 of every favourite recorded — on 2026-11-14 that
+  was "…and 142 more", with games repeated (one row per model that rated
+  them) and every line reading "(fair 0) · ?% to win". It now posts a card of
+  six (PICKS PER POST, 3 to 12): every pick between 50% and 85% to win
+  (value picks included; nothing heavier, no underdogs, and the same rule on
+  the fallback path; a pick one exchange has just over 85% stays when
+  another sells it at 85¢ or under, and that exchange is the bold one),
+  value picks first, then favourites an exchange prices
+  that the app's own model also backs, one per game, at most two from any sport on a card of six, games no engine
+  rates last. That day: 113 games became 6. The ranking is a filter for
+  agreement, not a claim of edge. Each line now carries the opponent, the
+  real win probability and the kickoff in the reader's own time zone. MODEL is
+  on by default for new installs, so there is a post on days with no value
+  pick. Built by `POST /api/picks/card` (odds/compare.py).
+- **Discord picks compare the exchanges** (NEW): under each pick the post
+  lists what Polymarket, Kalshi and Polymarket US charge for that side
+  ("Polymarket 68¢ · Kalshi 67¢ · Polymarket US 68¢"), the cheapest after
+  each exchange's own fee in bold. An exchange that does not list the game is
+  left out; if the card cannot be priced the picks post without it. Needs no
+  account.
+- **Discord post: sign-up links and a legal footer** (CHANGE): every exchange
+  name in the post is that exchange's sign-up (referral) link — the site,
+  never a market page — and every post, even an empty day's, closes with
+  "Free bonus when you sign up: Polymarket · Kalshi · Polymarket US". The
+  three links live in shared/exchange-links.ts, and the app's own buttons
+  (BONUSES, onboarding, AUTO-BET sign-up) now use the same three — they
+  replace the older Polymarket, Kalshi and Polymarket US links. The
+  footer no longer carries the product name: it is the legal line (not
+  advice, age and legality, the links are referral links, 1-800-GAMBLER).
+- **The Discord preview is the real post** (CHANGE): MESSAGE PREVIEW was drawn
+  from the boards on screen and could differ from what was sent (it showed
+  win probabilities the post did not have). It is now built by the sender
+  itself — same recorded picks, same card, same prices — with a REFRESH.
+- **Polymarket US found almost no NBA or NHL games** (FIX): it was searched
+  by the home team's full name, and the exchange titles games "BKN Nets vs.
+  MEM Grizzlies" — "Memphis Grizzlies" returned Memphis college basketball.
+  On 2026-11-14 that found 0 of 5 NBA and 0 of 10 NHL games (NFL was fine).
+  It now searches both nicknames first, and the two schools plus the sport
+  for college games, falling back to full names: 41 of 45 games across five
+  sports, against 18. Auto-bet's Polymarket US prices come from the same
+  lookup, so before this it was pricing little beyond the NFL there.
+- **Replay onboarding in Settings** (CHANGE): SETTINGS → Appearance has
+  REPLAY ONBOARDING and REPLAY TOUR (they were only on ABOUT).
+- **Auto-bet: accounts first** (CHANGE): the AUTO-BET page opens on "Your
+  accounts" — Polymarket, Kalshi and Polymarket US, each with a CONNECT
+  button that opens its key form and a SIGN UP link. The "What it bets" card
+  is folded into one line under the engine switches, and the two dozen rule
+  fields sit behind a RULES line that reads e.g. "$10 a bet · min EV 4% · up
+  to 5 a day" (folded in SIMPLE, open in PRO, your choice remembered).
+  Polymarket US joins the BONUSES page.
+- **First run** (CHANGE): the license screen is three numbered steps with a
+  button to krypt.cc; onboarding opens by saying the app already works and
+  that a Polymarket account is optional; the tour no longer says "nine tabs".
+- **Boards that would not load** (FIX): NBA and NFL — and, less often, the
+  other ESPN sports — came back empty for many users. ESPN rejects
+  `dates=YYYYMMDD-YYYYMMDD` scoreboard ranges from some networks; the schedule
+  fetch now asks one day at a time and catches up from the last cached day.
+  The three odds providers run concurrently under a per-provider timeout
+  instead of in series (one slow venue no longer takes the board past the
+  renderer's deadline), Open-Meteo forecasts are cached per venue and day, the
+  board request has 30 s instead of 8, and a sport whose request failed now
+  says "couldn't load" with the reason and a retry instead of showing "no
+  games scheduled".
+- **xgboost is gone** (CHANGE): the gradient-boosted overlays on NBA and NFL
+  are retired. NBA's last bundle scored log loss 0.608 against 0.567 for the
+  Elo underneath it (719 held-out games) and had already gated itself off;
+  NFL's blend bought 0.0006 log loss over Elo on 2024-25. NBA is
+  `nba-elo-v1`, NFL is `nfl-elo-v2` (Elo + QB adjustment + rest, tempered).
+  All nine engines are now ratings replays; nothing is fitted or pickled.
+  `core/modelio.py` is deleted, `xgboost` / `scikit-learn` leave
+  `requirements.txt`, the macOS `libomp` step leaves CI, and the PyInstaller
+  spec excludes xgboost, sklearn, scipy and duckdb — the backend bundle goes
+  from 406 MB to 189 MB. Leftover `nba_xgb_*.pkl` / `nfl_xgb_*.pkl` are deleted
+  from the models folder at startup. The MODELS page loses its RETRAIN button
+  and "Pickle" cell (there is nothing to retrain); REFRESH is unchanged.
+- **Auto-bet works, on three exchanges** (FIX / NEW): auto-bet read the
+  value picks, and since value picks became sportsbook prices it had nothing
+  it could ever buy. It now has its own rule and needs no AI: each sweep
+  reads the boards and buys a side on Polymarket, Kalshi or Polymarket US
+  when a DIFFERENT exchange's vig-free price says it is worth more after the
+  buying exchange's own fee. Reference Kalshi = "VS KALSHI",
+  reference Polymarket = "VS POLYMARKET" (the one that lets Kalshi itself be
+  bought); both are on by default and each can be switched off. Soccer and
+  tennis are excluded.
+  Kalshi (API key ID + private key, RSA or Ed25519) and Polymarket US (key ID
+  + secret) connect on the AUTO-BET page next to the Polymarket wallet; all
+  three are encrypted at rest. Paper mode needs no account and fills off the
+  real order book. Orders are immediate at a capped limit and sent once: an
+  order that is never answered is held as "check your account" (it keeps the
+  game and the daily slot) instead of being retried, and an accepted order is
+  only counted once the exchange confirms the fill. Kalshi orders can move
+  their own shortfall between your Kalshi cash pools first (switchable). One
+  bet per game across all exchanges. The activity card now says what the last
+  sweep saw: games, prices checked, why each was passed on, and the six
+  prices nearest your floor. The "Validated WNBA" preset and the drift
+  monitor are removed (both described the old model-driven rule). Honest
+  expectation: exchanges usually agree to within a point, so at the default
+  4% floor most sweeps place nothing, and nothing measured says the gap is
+  profit. The Kalshi and Polymarket US live order paths are ported from
+  working bots and covered by tests, but have not yet placed a real order
+  from this app.
+- **Agents can bet, if you switch it on** (NEW): two more MCP tools,
+  `get_bet_prices` (each exchange's live ask, fee and break-even for one
+  game) and `place_bet`. Off by default; AI AGENTS has the switch (off /
+  paper / live), a per-bet cap ($10) and a daily allowance (3). A request
+  over the cap is refused, not trimmed; the price may not exceed what the
+  agent's own stated probability supports after fees, nor reach more than
+  two cents through the best offer; one bet per game shared with the rule
+  engine; your stops halt both. Every bet and refusal is in the page's log.
+- **AI agents (MCP)** (NEW): an MCP server inside the backend, off until
+  switched on from the new AI AGENTS page. Thirteen read / bet-log tools: status, a sport's
+  board, one game in full, recorded picks, the pick record, the engine record,
+  arb sightings, line movement, injuries, the bet log (read, add, remove) and
+  auto-bet status (betting is the separate entry above). One
+  click adds it to Claude Desktop, Claude Code, Cursor, Codex or Windsurf
+  (their own config is edited in place, a timestamped backup is kept, an
+  unreadable file is refused rather than overwritten); VS Code is copy/paste.
+  Clients launch `krypt-scout-backend --mcp`, a stdio relay that finds the
+  running app and reads the access token from the encrypted store, so nothing
+  secret is written into another program's config and the entry survives the
+  backend's port changing every launch. `/mcp` answers loopback only, refuses
+  any request carrying an `Origin` header, requires the token, and is behind
+  the license like the rest of the app. Speaks the handshake revisions
+  (2024-11-05 … 2025-11-25) and the stateless 2026-07-28 one. Connected
+  clients, and every write or refusal, are listed on the page.
+
 - **The "closing-line signal" was the devig** (MEASUREMENT, 2026-09-02): with
   the close backfilled over twice the sample (line_endpoints 431 → 895 games),
   non-soccer exchange picks scored against the DraftKings close read

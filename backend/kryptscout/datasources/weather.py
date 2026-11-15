@@ -17,6 +17,7 @@ Retractable-roof venues DO get a forecast, flagged via `retractable` and a
 """
 from __future__ import annotations
 
+import time
 from datetime import datetime, timedelta, timezone
 
 import httpx
@@ -30,6 +31,38 @@ HOURLY_VARS = (
     "temperature_2m,precipitation_probability,wind_speed_10m,wind_direction_10m"
 )
 FORECAST_HORIZON_DAYS = 16
+# A forecast for a venue and day is reused for this long. The NFL engine asks
+# for one per outdoor game on every board build, and the renderer rebuilds the
+# board every minute: uncached, that was ~14 Open-Meteo round-trips a minute,
+# awaited one after another, inside a request the renderer times out. Hourly
+# forecasts do not move on that scale.
+FORECAST_TTL_S = 30 * 60
+REQUEST_TIMEOUT_S = 8.0
+
+# (lat, lon, start_date, end_date) -> (monotonic fetch time, payload)
+_forecast_cache: dict[tuple[float, float, str, str], tuple[float, dict]] = {}
+
+
+def clear_cache() -> None:
+    """Forget every cached forecast (tests; a manual refresh)."""
+    _forecast_cache.clear()
+
+
+async def _cached_forecast(
+    lat: float, lon: float, start_date: str, end_date: str
+) -> dict:
+    """_fetch_forecast behind a TTL cache. Failures are never cached."""
+    key = (lat, lon, start_date, end_date)
+    now = time.monotonic()
+    hit = _forecast_cache.get(key)
+    if hit is not None and now - hit[0] < FORECAST_TTL_S:
+        return hit[1]
+    payload = await _fetch_forecast(lat, lon, start_date, end_date)
+    if len(_forecast_cache) > 256:  # a season of venues is ~60 keys
+        for stale in [k for k, v in _forecast_cache.items() if now - v[0] >= FORECAST_TTL_S]:
+            del _forecast_cache[stale]
+    _forecast_cache[key] = (now, payload)
+    return payload
 
 
 class GameWeather(BaseModel):
@@ -65,7 +98,7 @@ async def game_weather(
     # can still snap to the closest hour.
     start_date = start_utc.date().isoformat()
     end_date = (start_utc + timedelta(hours=1)).date().isoformat()
-    payload = await _fetch_forecast(venue.lat, venue.lon, start_date, end_date)
+    payload = await _cached_forecast(venue.lat, venue.lon, start_date, end_date)
     hourly = payload.get("hourly", {})
     times: list[str] = hourly.get("time", [])
     if not times:
@@ -116,7 +149,7 @@ async def _fetch_forecast(
         "timezone": "UTC",
         "wind_speed_unit": "kmh",
     }
-    async with httpx.AsyncClient(timeout=30) as client:
+    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_S) as client:
         resp = await client.get(OPEN_METEO_URL, params=params)
         resp.raise_for_status()
         return resp.json()

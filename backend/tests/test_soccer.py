@@ -241,7 +241,8 @@ def test_team_name_map_shape():
     # Monza comeback), plus Championship 24, Eredivisie 18, Primeira Liga 18,
     # Brasileirão 20 and Liga MX 18 (Santos Laguna lives in
     # LEAGUE_NAME_OVERRIDES, see below).
-    assert len(TEAM_NAME_MAP) == 195
+    # ...plus the 18 clubs promoted for 2026-27.
+    assert len(TEAM_NAME_MAP) == 213
     # Mapping must be invertible (no two clubs share an ESPN name).
     assert len(ESPN_TO_FD) == len(TEAM_NAME_MAP)
     assert ESPN_TO_FD["Manchester United"] == "Man United"
@@ -307,7 +308,7 @@ def test_predict_maps_espn_names_and_sums_to_one():
     preds = asyncio.run(engine.predict([_game("Manchester City", "Wolverhampton Wanderers")]))
     assert len(preds) == 1
     p = preds[0]
-    assert p.model == "soccer-poisson-v2"
+    assert p.model == "soccer-poisson-v3"
     assert math.isclose(p.home_win_prob + p.draw_prob + p.away_win_prob, 1.0, rel_tol=1e-9)
     assert p.home_win_prob > p.away_win_prob  # strong home side favored
     assert math.isclose(p.predicted_total, p.predicted_home_score + p.predicted_away_score)

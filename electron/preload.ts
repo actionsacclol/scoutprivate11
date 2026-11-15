@@ -2,8 +2,11 @@ import { contextBridge, ipcRenderer } from 'electron';
 import type {
   BackendInfo,
   DiscordInfo,
+  DiscordPreview,
   LogEntry,
   LogExportResult,
+  McpClientSetup,
+  McpInstallResult,
   SchedulerInfo,
   ScoutApi,
   UpdaterState,
@@ -43,12 +46,19 @@ const api: ScoutApi = {
     sendNow: (): Promise<DiscordInfo> => ipcRenderer.invoke('discord:sendNow'),
     test: (url: string): Promise<{ ok: boolean; error?: string }> =>
       ipcRenderer.invoke('discord:test', url),
+    preview: (): Promise<DiscordPreview> => ipcRenderer.invoke('discord:preview'),
   },
   updater: {
     state: (): Promise<UpdaterState> => ipcRenderer.invoke('updater:state'),
     check: (): Promise<UpdaterState> => ipcRenderer.invoke('updater:check'),
     downloadAndInstall: (): Promise<void> => ipcRenderer.invoke('updater:downloadAndInstall'),
     onState: (cb) => sub<UpdaterState>('updater:state', cb),
+  },
+  mcp: {
+    clients: (): Promise<McpClientSetup[]> => ipcRenderer.invoke('mcp:clients'),
+    install: (id): Promise<McpInstallResult> => ipcRenderer.invoke('mcp:install', id),
+    uninstall: (id): Promise<McpInstallResult> => ipcRenderer.invoke('mcp:uninstall', id),
+    openConfigFolder: (id): Promise<boolean> => ipcRenderer.invoke('mcp:openConfigFolder', id),
   },
   window: {
     minimize: () => ipcRenderer.send('window:minimize'),

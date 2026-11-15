@@ -18,6 +18,7 @@ import argparse
 import asyncio
 import importlib
 import logging
+import time
 
 from kryptscout.core import arb as arb_mod
 from kryptscout.core import fair as fair_mod
@@ -52,8 +53,22 @@ def load_engines() -> None:
             )
 
 
-async def capture_sport(sport: Sport, with_odds: bool) -> dict[str, int]:
-    """Record one sport's board; returns tracker.record_cards() counts."""
+# The cards each sport's last capture built, for the auto-bet sweep that runs
+# right behind it: the sweep prices against exactly what was just recorded
+# instead of fetching every board a second time.
+_recent: dict[Sport, tuple[float, list[GameCard]]] = {}
+
+
+def recent_cards(sport: Sport, max_age_s: float) -> list[GameCard] | None:
+    """The last captured board for a sport, or None when older than max_age_s."""
+    hit = _recent.get(sport)
+    if hit is None or time.monotonic() - hit[0] > max_age_s:
+        return None
+    return hit[1]
+
+
+async def build_cards(sport: Sport, with_odds: bool = True) -> list[GameCard]:
+    """One sport's board, assembled exactly as the terminal shows it."""
     engine = engines.get_engine(sport)
     games = await engine.upcoming_games()
     predictions = {p.game_id: p for p in await engine.predict(games)}
@@ -85,6 +100,14 @@ async def capture_sport(sport: Sport, with_odds: bool) -> dict[str, int]:
         card.sgp = sgp_mod.sgp_fair(card)
         card.forecast = forecast_mod.display_forecast(card)
         cards.append(card)
+    if with_odds:
+        _recent[sport] = (time.monotonic(), cards)
+    return cards
+
+
+async def capture_sport(sport: Sport, with_odds: bool) -> dict[str, int]:
+    """Record one sport's board; returns tracker.record_cards() counts."""
+    cards = await build_cards(sport, with_odds)
     counts = tracker.record_cards(cards)
     # ESPN's predictor, once per game, best-effort: a free third reference
     # for the PERFORMANCE benchmark. Never on the board poll.

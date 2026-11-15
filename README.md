@@ -1,10 +1,10 @@
 # Krypt Scout
 
-> The Bloomberg terminal of sports betting — free.
+> The Bloomberg terminal of sports betting.
 
-Krypt Scout is a free sports-prediction terminal for Windows. It builds its own win probabilities for nine sports — NBA, WNBA, NFL, NCAAF, NCAAB, MLB, NHL, soccer (11 leagues), and tennis — converts them to fair lines, and stacks them against live prices from ESPN, Polymarket, and Kalshi with no API key required. You get graded picks, a parlay builder that tells you the truth about your slip, and a tracker that logs your own bets and grades them automatically when games settle. A Discord sender auto-posts the day's picks. Everything runs locally — your data is a SQLite file on your machine. Free. No ads. No telemetry. No bullshit.
+Krypt Scout is a licensed sports-prediction terminal for Windows (a Krypt Premium tool — it needs a license key from krypt.cc to run). It builds its own win probabilities for nine sports — NBA, WNBA, NFL, NCAAF, NCAAB, MLB, NHL, soccer (11 leagues), and tennis — converts them to fair lines, and stacks them against live prices from ESPN, Polymarket, and Kalshi with no API key required. You get graded picks, a parlay builder that tells you the truth about your slip, and a tracker that logs your own bets and grades them automatically when games settle. A Discord sender auto-posts the day's picks. Everything runs locally — your data is a SQLite file on your machine. No ads. No bullshit.
 
-Part of the **Krypt** free tools suite. See [krypt.cc/tools](https://krypt.cc/tools).
+Part of the **Krypt** tools suite. See [krypt.cc/tools](https://krypt.cc/tools).
 
 **This is not betting advice.** Read [DISCLAIMER.md](./DISCLAIMER.md) before you wager anything.
 
@@ -48,7 +48,7 @@ Don't want to run an unsigned binary? Fair. [Build it from source](#build-from-s
 - **PICKS** — one recommended bet per game. A VALUE pick is a sportsbook price that sits at least a point under the exchange fair (Kalshi, else Polymarket) — STRONG when Kalshi set the fair, LEAN when Polymarket did; the model's own number is shown as context, never as the reason. When no book beats the fair, the pick is the displayed forecast's favourite, tier MODEL, no price. Measured 2026-09-02: the model's disagreement with the market carries no information; the exchange lead is the one signal that replicates (the book's close moves toward the pick by about 1.75 points, under the vig — a signal, not a profit).
 - **TRACK** — the button on every pick card (and on a finished parlay slip). One tap logs the bet at your default stake and the best available price.
 - **TRACKER** — two records side by side. **MY BETS**: your bets and parlays, graded automatically when games settle — *your* record with receipts. **BOT PICKS**: every +EV pick the bot has ever recommended at a flat 1u, pending and graded, so you can see the whole bot's P&L — not just the picks you tailed.
-- **AUTO-BET** — connect a Polymarket wallet and let the bot place its own picks (dry-run first, hard caps, off by default).
+- **AUTO-BET** — buys a team on Polymarket, Kalshi or Polymarket US when another exchange prices it higher after fees. Paper mode needs no account; connect one to go live (hard caps, off by default).
 - **TERMINAL** — the mission-control panel: live wire, value board, model rack, CLV readout. The screen you screenshot.
 
 PRO mode adds the rest: TODAY, BOARDS, PARLAY, VALUE, PERFORMANCE, MODELS, INTEL, DISCORD, BONUSES.
@@ -64,12 +64,12 @@ Backtest accuracy is the argmax hit rate on held-out seasons, replayed with stri
 | NBA    | nba-elo-v1 | 67.8% | Elo · MOV + rolling scoring |
 | WNBA   | wnba-elo-v1 | 66.3% | Elo · expansion-aware |
 | Tennis | tennis-elo-v1 | 63.8% | Surface-blended Elo (ATP/WTA) |
-| NFL    | nfl-xgb-v3 | 67.5% | Elo + QB + XGBoost blend |
-| NCAAF  | ncaaf-kalman-v2 | 75.9% | Kalman margin filter · blowouts count |
-| NCAAB  | ncaab-kalman-v2 | 72.0% | Kalman margin filter · D1 only |
+| NFL    | nfl-elo-v2 | 67.1% | Elo + QB adjustment + rest |
+| NCAAF  | ncaaf-kalman-v3 | 75.9% | Kalman margin filter · lower-division opponents priced as such |
+| NCAAB  | ncaab-kalman-v3 | 72.0% | Kalman margin filter · non-D1 opponents priced as such |
 | MLB    | mlb-elo-v3 | 55.5% | Elo + pitcher EWMA |
-| NHL    | nhl-elo-v1 · nhl-xg-v2 with MoneyPuck | 53.6% · 57.5% | Elo + Poisson goals · xG/PDO logistic when the file is present |
-| Soccer | soccer-poisson-v2 | 48.9% | Dixon-Coles-lite · 3-way · 11 leagues |
+| NHL    | nhl-elo-ctx-v3 | 56.8% | Elo + back-to-back flags + shots-on-goal form · Poisson goals |
+| Soccer | soccer-poisson-v3 | 48.9% | Dixon-Coles-lite fitted on closing-odds-implied goals · 3-way · 11 leagues |
 
 Now the part every other tool buries: **the closing line still beats us.** In backtests, the devigged closing line beats every v1 baseline above on log loss (NFL held-out example: our blend hits 67.5% accuracy, the closing line 68.4%). A model that can't approach closing-line log loss has no betting edge, whatever its raw accuracy — 71% in NCAAF mostly means college football has a lot of blowouts. Beating the close is the v2 target, and the built-in **CLV tracking measures the gap** on every captured pick instead of pretending it isn't there.
 
@@ -89,11 +89,12 @@ More house rules:
 - **Boost evaluator** — type what a book is offering (a boosted price, or a % profit-boost token on a normal line) and score it against the exchange fair price: effective price, EV per dollar, quarter-Kelly, PLAY / PASS. No model involved — the models can't beat a liquid line, but a boost is the book handing out a price above fair, and that is where recreational bettors actually get paid. One tap tracks it.
 - **Parlay truth-teller** — stack as many moneyline legs as you dare; the slip is priced two ways (books' combined price vs the model's fair price) with an honest verdict about the gap. Correlated same-game legs are blocked. Fully-priced slips are trackable: one tap logs the parlay to your record, where it grades leg-by-leg (a lost leg loses the slip, pushed legs drop out of the payout).
 - **Your tracked P&L** — TRACK any pick or parlay, it grades automatically at settlement at your default stake (set it once under SETTINGS). And the bot tracks itself: the TRACKER's BOT PICKS tab is its complete value-pick record at flat 1u — the same number the dashboard reports, with no delete button.
-- **Model accountability built in** — accuracy, log loss, ROI, and CLV per sport on the PERFORMANCE page; per-engine consoles and retrains on MODELS.
+- **Model accountability built in** — accuracy, log loss, ROI, and CLV per sport on the PERFORMANCE page; per-engine consoles and refreshes on MODELS.
+- **AI agents (MCP)** — switch on AI AGENTS and add Claude Desktop, Claude Code, Cursor, Codex or Windsurf in one click. The agent reads the same boards, sharp fair, pick record and bet log you see, and can keep your bet log. Betting is a second switch (off, paper or live) with a per-bet cap and a daily allowance; until you turn it on an agent cannot place a bet. Local only: loopback, an access token, off by default.
 - **Intel** — ESPN injury feeds (all five US leagues), Open-Meteo game weather for outdoor NFL/MLB venues, per-book line movement.
-- **Auto-posting** — Discord webhooks send the day's picks on your schedule.
-- **Auto-betting (Polymarket)** — the AUTO-BET panel: optionally tail the bot's value picks with real orders on the Polymarket CLOB. Fill-and-kill orders at an EV-floor limit price, flat per-pick stakes, one bet per game, daily caps. Ships **disabled + dry-run by default**; your wallet key is encrypted at rest and never leaves your machine except to sign orders. Placed bets grade into your tracker automatically.
-- **All local** — supervised Python backend on localhost, SQLite store in your user directory, zero telemetry.
+- **Auto-posting** — Discord webhooks send a short card of the day's picks on your schedule, each with its price on Polymarket, Kalshi and Polymarket US (the cheapest after fees in bold) and your sign-up links for the three.
+- **Auto-betting (Polymarket, Kalshi, Polymarket US)** — the AUTO-BET panel: rules, no AI needed. Each sweep reads the boards and buys a side on one exchange when a different exchange's vig-free price says it is worth more after that exchange's fee. Immediate orders at an EV-floor limit price, one bet per game across all three, daily caps and stop-losses. Ships **disabled + paper by default** — paper bets fill off the real order book and need no account. Exchanges usually agree to within a point, so expect few bets, and nothing here is a proven edge. Keys are encrypted at rest and never leave your machine except to sign your own orders. Placed bets grade into your tracker automatically.
+- **All local** — supervised Python backend on localhost, SQLite store in your user directory. The only thing the app itself sends off your machine is the license check.
 - **Krypt UI** — dark, dense, monospace. SIMPLE mode if you just want picks; PRO mode if you want the terminal.
 
 ---
@@ -150,8 +151,9 @@ npm run dist        # vite build + electron-builder → release/Krypt Scout-Setu
 
 Notes:
 
-- `py:bundle` builds **--onedir** (not onefile): onefile unpacks the ~300 MB pandas/sklearn/xgboost stack to a temp dir on every launch and can blow the supervisor's 60 s startup-health window; onedir starts in ~3 s. electron-builder ships the folder via `extraResources` and the supervisor launches `krypt-scout-backend.exe --port <port>` from there.
-- The bundle needs `--collect-submodules kryptscout` (engines load via importlib) and `--collect-binaries/--collect-data xgboost`. Do **not** use `--collect-all xgboost` — it drags in `xgboost.testing`, which imports the uninstalled `hypothesis` package and fails the build.
+- `py:bundle` builds **--onedir** (not onefile): onefile unpacks the ~190 MB numpy/pandas stack to a temp dir on every launch and can blow the supervisor's 60 s startup-health window; onedir starts in ~3 s. electron-builder ships the folder via `extraResources` and the supervisor launches `krypt-scout-backend.exe --port <port>` from there.
+- The bundle needs `collect_submodules('kryptscout')` (engines load via importlib). There is no fitted-model stack any more: `xgboost`, `scikit-learn`, `scipy` and `duckdb` are listed in `EXCLUDED_MODULES` in `backend/krypt-scout-backend.spec` so a stray lazy import cannot pull them back in.
+- The same binary is the MCP stdio relay: `krypt-scout-backend --mcp` (what AI AGENTS writes into a client's config).
 - Packaged, the backend reads/writes `data/` and `models/` under `KRYPT_SCOUT_USERDATA` (set by the supervisor to the app's userData dir) — see `backend/kryptscout/config.py`. Without the env var, paths are the repo `data/`/`models/` as in dev.
 - `KRYPT_SCOUT_TEST_PROFILE=<dir>` gives a packaged build an isolated userData dir (own settings/DB **and** single-instance lock), so it can run alongside a dev instance for smoke tests/CI.
 - Silent install/uninstall for testing: `MSYS_NO_PATHCONV=1 "./Krypt Scout-Setup-x.y.z.exe" /S '/D=C:\path'` (quote the /D argument — unquoted backslashes get eaten by Git Bash and NSIS receives a mangled path) and `"Uninstall Krypt Scout.exe" /currentuser /S`.
@@ -167,7 +169,7 @@ Krypt Scout downloads data at runtime, caches it locally, and never redistribute
 | ESPN public JSON APIs | Schedules, results, injuries, ESPN lines (all sports) | Unofficial public endpoints, no key; not affiliated |
 | MLB Stats API (statsapi.mlb.com) | MLB schedules/results | Free public API, MLB Advanced Media terms |
 | NHL API (api-web.nhle.com) | NHL schedules/results | Free public API |
-| MoneyPuck.com (optional) | NHL expected goals per team-game — powers `nhl-xg-v2` when you drop `all_teams.csv` under `data/raw/nhl/moneypuck/` | Free for non-commercial use with credit; automated pulls need MoneyPuck's approval, so the app never fetches or ships it |
+| MoneyPuck.com (optional) | NHL expected goals per team-game — the retired `nhl-xg-v2` path; off by default since `nhl-elo-ctx-v3` (it did not beat Elo on true results), so the file is no longer read | Free for non-commercial use with credit; automated pulls need MoneyPuck's approval, so the app never fetches or ships it |
 | nflverse (games.csv) | NFL history incl. closing lines for backtests | Open data, MIT-licensed tooling — credit nflverse |
 | football-data.co.uk | Soccer results + closing odds (10 of 11 leagues) | Free for personal use; downloaded per-user, never shipped |
 | TennisMyLife (TML) | ATP match history | MIT |
@@ -189,7 +191,7 @@ No. Krypt Scout is a statistics terminal. The models are honest baselines that l
 No. Schedules, results, injuries, weather, and the ESPN/Polymarket/Kalshi odds stack all work with zero keys. An optional free key from the-odds-api.com adds tennis odds and more sportsbooks to the line-shop table.
 
 **Where's my data?**
-Local. Predictions, odds history, your tracked bets, and settings live in SQLite under your Windows user-data directory (`%APPDATA%/krypt-scout` when packaged; the repo `data/` folder in dev). Nothing is uploaded anywhere. No telemetry, no analytics, no account.
+Local. Predictions, odds history, your tracked bets, and settings live in SQLite under your Windows user-data directory (`%APPDATA%/krypt-scout` when packaged; the repo `data/` folder in dev). None of it is uploaded. No analytics. The one thing the app sends is the license check to krypt.cc: your key, a hardware ID and the computer's name, plus a flag if it is running in a virtual machine or under a debugger.
 
 **Why does my antivirus / SmartScreen flag it?**
 The installer is unsigned — Windows treats every unsigned exe from the internet as "unrecognized." That's the whole story. Verify it yourself: the code is all here, `npm run py:bundle && npm run dist` produces the same installer from source. A code-signing cert is on the roadmap.
@@ -225,4 +227,4 @@ MIT. See [LICENSE](./LICENSE). Copyright 2026 Krypt.
 
 ---
 
-**Krypt Scout** is part of the [Krypt](https://krypt.cc) suite of free desktop tools. Questions, bugs, feature requests: [Discord](https://discord.gg/muzFKR657F) or open an issue. Free. No ads. No telemetry. No bullshit.
+**Krypt Scout** is part of the [Krypt](https://krypt.cc) suite of desktop tools. Questions, bugs, feature requests: [Discord](https://discord.gg/muzFKR657F) or open an issue. No ads. No bullshit.

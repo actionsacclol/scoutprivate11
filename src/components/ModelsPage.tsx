@@ -1,14 +1,14 @@
 /**
  * MODELS — the engine room. One console card per prediction engine (9):
- * artifact state (ratings json / model pickle), live-vs-backtest record and a
- * CRT job console that streams the backend's refresh log. FETCH LATEST pulls
- * new results without retraining; RETRAIN nukes the pickle and rebuilds from
- * scratch. Backend runs refreshes serially, so all buttons lock while any
- * engine is in flight. Demo / API-down renders a bundled fabricated payload
+ * artifact state (the ratings json), live-vs-backtest record and a CRT job
+ * console that streams the backend's refresh log. FETCH LATEST pulls new
+ * results and replays them into the ratings — there is nothing to retrain, no
+ * engine fits a model. Backend runs refreshes serially, so all buttons lock
+ * while any engine is in flight. Demo / API-down renders a bundled fabricated payload
  * with the controls disabled.
  */
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
-import { ChevronRight, Download, Flame, Loader2, RefreshCw } from 'lucide-react'
+import { ChevronRight, Download, Loader2, RefreshCw } from 'lucide-react'
 import type { GameCard, Sport } from '../types'
 import { SPORTS, SPORT_TAG } from '../types'
 import type { ModelInfo, ModelLiveRecord, ModelsReport } from '../api'
@@ -51,14 +51,11 @@ function demoModelList(boards: Record<string, GameCard[]>): ModelInfo[] {
   return SPORTS.map((s) => {
     const model = boardModelName(boards, s)
     const updated = new Date(now - DEMO_AGE_H[s] * 3_600_000).toISOString()
-    const hasPickle = model.includes('xgb')
     return {
       sport: s,
       model,
       state: { exists: true, path: `models/${s}_state.json`, size_kb: DEMO_STATE_KB[s], updated_at: updated },
-      pickle: hasPickle
-        ? { exists: true, path: `models/${s}_model.pkl`, size_kb: 157, updated_at: updated }
-        : null,
+      pickle: null,
       live: DEMO_LIVE[s],
       backtest: null,
     }
@@ -94,15 +91,6 @@ function ago(iso: string): string {
 
 function sizeLabel(kb: number): string {
   return kb >= 1024 ? `${(kb / 1024).toFixed(1)}MB` : `${Math.round(kb)}KB`
-}
-
-/** Engine family from the model name — pickle line + retrain copy. */
-function engineKind(model: string): string {
-  const m = model.toLowerCase()
-  if (m.includes('xgb')) return 'XGB'
-  if (m.includes('poisson')) return 'POISSON'
-  if (m.includes('elo')) return 'ELO'
-  return model.split('-')[0]?.toUpperCase() || 'MODEL'
 }
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms))
@@ -170,7 +158,7 @@ function ConsoleWell({
       >
         {lines.length === 0 && (
           <div className="flex-none text-krypt-muted/45">
-            engine console idle — FETCH LATEST or RETRAIN streams the job log here
+            engine console idle — FETCH LATEST streams the job log here
           </div>
         )}
         {lines.slice(-24).map((l) => (
@@ -251,9 +239,8 @@ export default function ModelsPage({ boards, demo, apiUp }: Props) {
 
   // ---- consoles + flight ----------------------------------------------------
   const [consoles, setConsoles] = useState<Partial<Record<Sport, ConsoleState>>>({})
-  const [flight, setFlight] = useState<{ sport: Sport; force: boolean } | null>(null)
+  const [flight, setFlight] = useState<{ sport: Sport } | null>(null)
   const [allRun, setAllRun] = useState<number | null>(null) // index into SPORTS while REFRESH ALL sequences
-  const [armed, setArmed] = useState<Sport | null>(null) // retrain confirm-on-second-click
   const flightRef = useRef(false)
   const aliveRef = useRef(true)
   const lineSeq = useRef(0)
@@ -282,21 +269,15 @@ export default function ModelsPage({ boards, demo, apiUp }: Props) {
   /** Single-engine refresh: open console, POST, then drip the returned log.
    *  Shared verbatim by the per-card buttons and REFRESH ALL. */
   const runOne = useCallback(
-    async (sport: Sport, force: boolean) => {
+    async (sport: Sport) => {
       setConsoles((prev) => {
         const cur = prev[sport] ?? { open: false, lines: [] }
         return { ...prev, [sport]: { ...cur, open: true } }
       })
-      push(
-        sport,
-        force
-          ? '>> retrain requested · force_retrain=true · pickle deleted, full rebuild'
-          : '>> refresh requested · force_retrain=false',
-        'dim',
-      )
+      push(sport, '>> refresh requested', 'dim')
       push(sport, 'dispatched — engines run serially, this can take tens of seconds…', 'dim')
       const t0 = performance.now()
-      const res = await refreshModel(sport, force)
+      const res = await refreshModel(sport)
       if (!aliveRef.current) return
       if (!res) {
         push(
@@ -314,7 +295,7 @@ export default function ModelsPage({ boards, demo, apiUp }: Props) {
       push(
         sport,
         res.ok
-          ? `✓ ok · ${res.seconds.toFixed(1)}s · ${sport} engine ${force ? 'retrained' : 'refreshed'}`
+          ? `✓ ok · ${res.seconds.toFixed(1)}s · ${sport} engine refreshed`
           : `✗ failed after ${res.seconds.toFixed(1)}s — see log above`,
         res.ok ? 'ok' : 'err',
       )
@@ -335,12 +316,12 @@ export default function ModelsPage({ boards, demo, apiUp }: Props) {
   }, [])
 
   const handleSingle = useCallback(
-    async (sport: Sport, force: boolean) => {
+    async (sport: Sport) => {
       if (flightRef.current || !live) return
       flightRef.current = true
-      setFlight({ sport, force })
+      setFlight({ sport })
       try {
-        await runOne(sport, force)
+        await runOne(sport)
       } finally {
         flightRef.current = false
         if (aliveRef.current) setFlight(null)
@@ -358,8 +339,8 @@ export default function ModelsPage({ boards, demo, apiUp }: Props) {
       for (let i = 0; i < SPORTS.length; i++) {
         if (!aliveRef.current) return
         setAllRun(i)
-        setFlight({ sport: SPORTS[i], force: false })
-        await runOne(SPORTS[i], false)
+        setFlight({ sport: SPORTS[i] })
+        await runOne(SPORTS[i])
       }
     } finally {
       flightRef.current = false
@@ -370,21 +351,6 @@ export default function ModelsPage({ boards, demo, apiUp }: Props) {
     }
     await refetch()
   }, [live, runOne, refetch])
-
-  // Retrain arms on first click, fires on the second; auto-disarms after 4s.
-  const onRetrain = (sport: Sport) => {
-    if (armed !== sport) {
-      setArmed(sport)
-      return
-    }
-    setArmed(null)
-    void handleSingle(sport, true)
-  }
-  useEffect(() => {
-    if (!armed) return
-    const t = window.setTimeout(() => setArmed(null), 4000)
-    return () => clearTimeout(t)
-  }, [armed])
 
   // ---- derived --------------------------------------------------------------
   const anyBusy = flight !== null
@@ -429,7 +395,7 @@ export default function ModelsPage({ boards, demo, apiUp }: Props) {
             <button
               onClick={() => void handleAll()}
               disabled={!live || anyBusy}
-              title={disabledTitle ?? 'Refresh every engine in sequence (no retrain)'}
+              title={disabledTitle ?? 'Refresh every engine in sequence'}
               className={cls(
                 btnBase,
                 'border-scout-red/30 bg-scout-red/[0.06] text-scout-red-bright/90 hover:border-scout-red/50 hover:bg-scout-red/10 hover:text-scout-red-bright',
@@ -463,10 +429,8 @@ export default function ModelsPage({ boards, demo, apiUp }: Props) {
           const sport = SPORTS[i]
           const st = statuses[i]
           const acc = backtestAcc(m, sport)
-          const kind = engineKind(m.model)
           const con = consoles[sport] ?? { open: false, lines: [] }
           const isFlight = flight?.sport === sport
-          const armedThis = armed === sport
           const accTone =
             acc >= 55
               ? 'border-emerald-400/30 bg-emerald-500/10 text-emerald-300'
@@ -490,7 +454,7 @@ export default function ModelsPage({ boards, demo, apiUp }: Props) {
                 <span className={cls('h-2 w-2 shrink-0 rounded-full', DOT_CLS[st])} title={DOT_TITLE[st]} />
                 {isFlight && (
                   <span className="font-mono text-[9px] uppercase tracking-widest text-scout-red-bright/80">
-                    {flight?.force ? 'retraining' : 'refreshing'}
+                    refreshing
                   </span>
                 )}
                 <span
@@ -537,50 +501,31 @@ export default function ModelsPage({ boards, demo, apiUp }: Props) {
                     <span className="text-rose-400">missing — run FETCH LATEST</span>
                   )}
                 </StatCell>
-                <StatCell label="Pickle" title={m.pickle?.exists ? m.pickle.path : 'Rating-based engine — no trained binary'}>
-                  {m.pickle?.exists ? (
-                    `${kind} PICKLE · ${sizeLabel(m.pickle.size_kb)}`
-                  ) : (
-                    <span className="text-krypt-muted/70">{kind} — no pickle</span>
-                  )}
+                <StatCell
+                  label="Method"
+                  title="How this engine prices a game. Ratings are replayed from results — nothing is trained."
+                >
+                  {FALLBACK_MODEL_META[sport].note}
                 </StatCell>
               </div>
 
               {/* buttons */}
               <div className="mt-3 flex items-center gap-2">
                 <button
-                  onClick={() => void handleSingle(sport, false)}
+                  onClick={() => void handleSingle(sport)}
                   disabled={!live || anyBusy}
-                  title={disabledTitle ?? 'Pull the latest results and update ratings — no retrain'}
+                  title={disabledTitle ?? 'Pull the latest results and replay them into the ratings'}
                   className={cls(
                     btnBase,
                     'border-white/10 bg-white/[0.03] text-krypt-muted hover:border-white/20 hover:bg-white/5 hover:text-white',
                   )}
                 >
-                  {isFlight && !flight?.force ? (
+                  {isFlight ? (
                     <Loader2 size={10} className="animate-spin" />
                   ) : (
                     <Download size={10} />
                   )}
                   FETCH LATEST
-                </button>
-                <button
-                  onClick={() => onRetrain(sport)}
-                  disabled={!live || anyBusy}
-                  title={disabledTitle ?? 'Deletes the model pickle and retrains from scratch'}
-                  className={cls(
-                    btnBase,
-                    armedThis
-                      ? 'border-scout-red/70 bg-scout-red/20 text-scout-red-bright shadow-scout-glow'
-                      : 'border-scout-red/30 bg-scout-red/[0.06] text-scout-red-bright/80 hover:border-scout-red/50 hover:bg-scout-red/10 hover:text-scout-red-bright',
-                  )}
-                >
-                  {isFlight && flight?.force ? (
-                    <Loader2 size={10} className="animate-spin" />
-                  ) : (
-                    <Flame size={10} />
-                  )}
-                  {armedThis ? 'CONFIRM RETRAIN?' : 'RETRAIN'}
                 </button>
               </div>
 
@@ -604,7 +549,7 @@ export default function ModelsPage({ boards, demo, apiUp }: Props) {
                   sport={sport}
                   lines={con.lines}
                   running={isFlight}
-                  cmd={isFlight ? (flight?.force ? 'retrain --force' : 'refresh --latest') : null}
+                  cmd={isFlight ? 'refresh --latest' : null}
                 />
               )}
             </div>

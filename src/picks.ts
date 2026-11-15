@@ -192,15 +192,27 @@ export function derivePick(card: GameCard): Pick | null {
 
 const TIER_RANK: Record<PickTier, number> = { STRONG: 0, LEAN: 1, MODEL: 2 }
 
+/** A pick is only shown when its win probability is in this band. Over 85%
+ *  (-570 and shorter) the price pays too little for anyone to want the bet;
+ *  under 50% it is an underdog, not a call. The same rule cuts the Discord
+ *  card (backend odds/compare.py CARD_PROB_MIN / CARD_PROB_MAX). */
+export const PICK_PROB_MIN = 0.5
+export const PICK_PROB_MAX = 0.85
+
+export function inPickBand(prob: number): boolean {
+  return prob >= PICK_PROB_MIN && prob <= PICK_PROB_MAX
+}
+
 /**
  * Derive picks for a slate, sorted for display: STRONG by EV desc, then LEAN
  * by EV desc, then MODEL by confidence desc (model probability as tiebreak).
+ * Games whose pick falls outside the 50-85% band produce no pick.
  */
 export function derivePicks(cards: GameCard[]): Pick[] {
   const picks: Pick[] = []
   for (const card of cards) {
     const p = derivePick(card)
-    if (p) picks.push(p)
+    if (p && inPickBand(p.prob)) picks.push(p)
   }
   picks.sort((a, b) => {
     const t = TIER_RANK[a.tier] - TIER_RANK[b.tier]

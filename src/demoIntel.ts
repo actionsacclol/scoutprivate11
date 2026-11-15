@@ -209,14 +209,14 @@ interface PerfSeed {
 
 const PERF_SEEDS: PerfSeed[] = [
   { sport: 'mlb', model: 'mlb-poisson-v1', n: 412, accuracy: 0.578, log_loss: 0.672, brier: 0.481 },
-  { sport: 'nba', model: 'nba-xgb-v1', n: 118, accuracy: 0.644, log_loss: 0.628, brier: 0.442 },
+  { sport: 'nba', model: 'nba-elo-v1', n: 118, accuracy: 0.644, log_loss: 0.628, brier: 0.442 },
   { sport: 'ncaab', model: 'ncaab-elo-v1', n: 74, accuracy: 0.689, log_loss: 0.586, brier: 0.409 },
   { sport: 'ncaaf', model: 'ncaaf-elo-v1', n: 52, accuracy: 0.712, log_loss: 0.549, brier: 0.383 },
   { sport: 'nfl', model: 'nfl-elo-v1', n: 64, accuracy: 0.625, log_loss: 0.651, brier: 0.457 },
   { sport: 'nhl', model: 'nhl-poisson-v2', n: 96, accuracy: 0.594, log_loss: 0.667, brier: 0.474 },
   { sport: 'soccer', model: 'soccer-dixoncoles-v1', n: 143, accuracy: 0.517, log_loss: 1.012, brier: 0.598 },
   { sport: 'tennis', model: 'tennis-elo-v1', n: 207, accuracy: 0.662, log_loss: 0.611, brier: 0.431 },
-  { sport: 'wnba', model: 'wnba-xgb-v1', n: 88, accuracy: 0.636, log_loss: 0.635, brier: 0.448 },
+  { sport: 'wnba', model: 'wnba-elo-v1', n: 88, accuracy: 0.636, log_loss: 0.635, brier: 0.448 },
 ]
 
 function buildDemoPerformance(): PerformanceReport {

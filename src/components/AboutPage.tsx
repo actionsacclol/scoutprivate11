@@ -151,7 +151,7 @@ export default function AboutPage() {
           </div>
           <UpdatesRow />
           <p className="mt-5 max-w-lg text-sm leading-relaxed text-krypt-muted">
-            A free moneyline scouting terminal. Scout builds its own win probabilities for nine
+            A moneyline scouting terminal. Scout builds its own win probabilities for nine
             sports, converts them to fair lines, and scans every book for positive-EV prices — with
             injuries, weather, line movement, Kelly sizing and automatic performance grading (accuracy,
             log loss, CLV) built in.
@@ -227,7 +227,12 @@ export default function AboutPage() {
         </div>
 
         <p className="mt-8 text-center text-xs text-krypt-muted">
-          Free &amp; open source · no ads, no telemetry · MIT license
+          Krypt Premium · licensed software · no ads
+        </p>
+        <p className="mt-2 text-center text-[11px] text-krypt-muted/60">
+          Your picks, bets and settings stay on this machine. The license check sends your key, a
+          hardware ID and this computer&apos;s name to krypt.cc (plus a flag if it is running in a
+          virtual machine or under a debugger) — nothing else leaves it.
         </p>
         <p className="mt-2 text-center text-[11px] text-krypt-muted/60">
           Sportsbook and market links are referral links — Krypt may earn a commission when you
@@ -245,13 +250,10 @@ export default function AboutPage() {
         <p className="mt-2 text-center text-[11px] text-krypt-muted/60">
           Historical order-book data: the{' '}
           <span className="font-mono text-white/60">pmxt</span> public Polymarket archive
-          (CC BY 4.0) — powers the backtest&apos;s real-fill BOOK column. Hockey expected
-          goals: <span className="font-mono text-white/60">MoneyPuck.com</span> — the NHL engine
-          reads its team game file when you drop it in (free for non-commercial use, credit
-          required; never fetched or shipped by the app).
+          (CC BY 4.0) — powers the backtest&apos;s real-fill BOOK column.
         </p>
         <p className="mt-2 text-center text-[11px] text-krypt-muted/60">
-          Part of the <span className="text-krypt-gradient font-semibold">Krypt</span> suite of free
+          Part of the <span className="text-krypt-gradient font-semibold">Krypt</span> suite of
           desktop tools — find the rest at krypt.cc/tools.
         </p>
         <p className="mt-6 text-center text-[10px] uppercase tracking-wider text-krypt-muted/40">

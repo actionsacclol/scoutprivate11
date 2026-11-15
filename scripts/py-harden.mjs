@@ -52,7 +52,7 @@ const HARDEN_MODULES = [
   'kryptscout/autobet/polymarket_auth.py',
   // sports/*.py — the model + feature engineering, one engine per sport. This
   // is the bulk of the modeling edge. Prerequisites handled: the spec now names
-  // numpy/pandas/sklearn/scipy/xgboost in hiddenimports (a compiled .pyd hides
+  // numpy/pandas in hiddenimports (a compiled .pyd hides
   // those imports from PyInstaller), and Nuitka --mode=module resolves the
   // relative `from .base import SportEngine` at runtime (verified: build_engine
   // returns a real SportEngine subclass). base.py stays SOURCE — it's the ABC +

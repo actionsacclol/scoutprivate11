@@ -18,7 +18,7 @@ import type { BackendInfo } from '@shared/types'
  * restart the engine, export the logs.
  */
 
-/** Cold start imports pandas/sklearn/xgboost out of a frozen bundle; on a slow
+/** Cold start imports numpy/pandas out of a frozen bundle; on a slow
  *  disk behind an AV scan that genuinely can take a while. The supervisor's own
  *  startup budget is 60s, so we only cry wolf past it. */
 const STALL_AFTER_MS = 65_000

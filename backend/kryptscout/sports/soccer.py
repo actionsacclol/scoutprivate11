@@ -30,7 +30,6 @@ and printed side by side with the model.
 from __future__ import annotations
 
 import asyncio
-import calendar
 import json
 import logging
 import math
@@ -39,6 +38,7 @@ from datetime import date, datetime, timezone
 from io import StringIO
 
 import httpx
+import numpy as np
 import pandas as pd
 
 from kryptscout.config import DATA_DIR, RAW_DIR
@@ -50,8 +50,24 @@ logger = logging.getLogger("kryptscout.soccer")
 
 CSV_URL = "https://www.football-data.co.uk/mmz4281/{season}/{code}.csv"
 EXTRA_CSV_URL = "https://www.football-data.co.uk/new/{code}.csv"
-SEASONS = ("2324", "2425", "2526")
-CURRENT_SEASON = "2526"
+HISTORY_SEASONS = 3  # finished seasons kept alongside the one in progress
+
+
+def season_codes(today: date | None = None, history: int = HISTORY_SEASONS) -> tuple[str, ...]:
+    """football-data season codes ("2627" = 2026-27): the `history` finished
+    seasons plus the one in progress. European seasons roll over on 1 July.
+
+    This used to be a literal tuple ending at "2526"; from August 2026 the
+    eight European leagues were therefore fitted on nothing later than May
+    2026 and every promoted / relegated club was skipped.
+    """
+    today = today or date.today()
+    start = today.year if today.month >= 7 else today.year - 1
+    return tuple(f"{y % 100:02d}{(y + 1) % 100:02d}" for y in range(start - history, start + 1))
+
+
+SEASONS = season_codes()
+CURRENT_SEASON = SEASONS[-1]
 CURRENT_SEASON_TTL = 24 * 3600  # refresh in-progress caches daily
 EXTRA_MIN_SEASON = 2024  # extra files hold full history; only fit recent years
 
@@ -82,15 +98,36 @@ CACHE_DIR = RAW_DIR / "soccer"
 MLS_CACHE_DIR = CACHE_DIR / "mls"
 STATE_PATH = DATA_DIR / "soccer_state.json"
 
+# One calendar month per request, as `dates=YYYYMM`. The explicit range form
+# (`dates=YYYYMMDD-YYYYMMDD`) stopped working in November 2026 — ESPN answers
+# 400 "Failed to get events endpoint" for every league — and the month form
+# returns the same events.
 MLS_SCOREBOARD_URL = (
-    espn.BASE + "/soccer/usa.1/scoreboard?dates={start}-{end}&limit=400"
+    espn.BASE + "/soccer/usa.1/scoreboard?dates={month}&limit=400"
 )
-MLS_SEASONS = (2025, 2026)
+MLS_SEASONS = (date.today().year - 1, date.today().year)  # rolls with the calendar
 MLS_MONTHS = range(2, 12)  # the MLS regular season runs Feb-Nov
 
 HALF_LIFE_DAYS = 180.0  # exponential decay half-life for match weights
 PRIOR_MATCHES = 3.0  # shrink thin team samples toward league-average strength
 MAX_GOALS = 10  # score grid is 0..MAX_GOALS per side
+
+# Fit input (v3). Where a past match carries closing 1X2 odds, the strengths
+# are fitted on the goal expectations that close implied rather than on the
+# goals scored: one match's score is a very noisy read of how good two sides
+# are, the closing line for that match is not. Walk-forward on 2024-10..2026-06
+# picked a 90-day half-life and a 0.5-match prior for this input (goals keep
+# 180 / 3.0); held out on 2026-08-01..2026-11-09 it cut log loss by 0.014
+# against the goals fit and still trailed the closing market by 0.012.
+# Leagues without odds in their result feed (MLS) keep the goals fit.
+IMPLIED_HALF_LIFE_DAYS = 90.0
+IMPLIED_PRIOR_MATCHES = 0.5
+IMPLIED_MIN_SHARE = 0.5  # share of a league's rows that must carry a close
+CLOSE_ODDS_CANDIDATES = (
+    ("PSCH", "PSCD", "PSCA"),
+    ("AvgCH", "AvgCD", "AvgCA"),
+    ("B365CH", "B365CD", "B365CA"),
+)
 OVER_UNDER_LINE = 2.5
 
 # Closing-odds column triples, in preference order, for the market benchmark.
@@ -140,6 +177,9 @@ TEAM_NAME_MAP: dict[str, str] = {
     "West Ham": "West Ham United",
     "Wolves": "Wolverhampton Wanderers",
     # La Liga (SP1)
+    "La Coruna": "Deportivo",
+    "Malaga": "Málaga",
+    "Santander": "Racing Santander",
     "Alaves": "Alavés",
     "Ath Bilbao": "Athletic Club",
     "Ath Madrid": "Atlético Madrid",
@@ -161,6 +201,9 @@ TEAM_NAME_MAP: dict[str, str] = {
     "Vallecano": "Rayo Vallecano",
     "Villarreal": "Villarreal",
     # Bundesliga (D1)
+    "Elversberg": "SV Elversberg",
+    "Paderborn": "SC Paderborn 07",
+    "Schalke 04": "Schalke 04",
     "Augsburg": "FC Augsburg",
     "Bayern Munich": "Bayern Munich",
     "Dortmund": "Borussia Dortmund",
@@ -186,6 +229,8 @@ TEAM_NAME_MAP: dict[str, str] = {
     "Como": "Como",
     "Cremonese": "Cremonese",
     "Fiorentina": "Fiorentina",
+    "Frosinone": "Frosinone",
+    "Venezia": "Venezia",
     "Genoa": "Genoa",
     "Inter": "Internazionale",
     "Juventus": "Juventus",
@@ -206,6 +251,8 @@ TEAM_NAME_MAP: dict[str, str] = {
     "Auxerre": "AJ Auxerre",
     "Brest": "Brest",
     "Le Havre": "Le Havre AC",
+    "Le Mans": "Le Mans",
+    "Troyes": "Troyes",
     "Lens": "Lens",
     "Lille": "Lille",
     "Lorient": "Lorient",
@@ -222,6 +269,9 @@ TEAM_NAME_MAP: dict[str, str] = {
     "Toulouse": "Toulouse",
     # Championship (E1)
     "Birmingham": "Birmingham City",
+    "Bolton": "Bolton Wanderers",
+    "Cardiff": "Cardiff City",
+    "Lincoln": "Lincoln City",
     "Blackburn": "Blackburn Rovers",
     "Bristol City": "Bristol City",
     "Charlton": "Charlton Athletic",
@@ -247,6 +297,9 @@ TEAM_NAME_MAP: dict[str, str] = {
     "Wrexham": "Wrexham",
     # Eredivisie (N1)
     "AZ Alkmaar": "AZ Alkmaar",
+    "Cambuur": "SC Cambuur",
+    "Den Haag": "ADO Den Haag",
+    "Willem II": "Willem II",
     "Ajax": "Ajax Amsterdam",
     "Excelsior": "Excelsior",
     "Feyenoord": "Feyenoord Rotterdam",
@@ -266,6 +319,8 @@ TEAM_NAME_MAP: dict[str, str] = {
     "Zwolle": "PEC Zwolle",
     # Primeira Liga (P1)
     "AVS": "AVS",
+    "Academico Viseu": "Académico de Viseu",
+    "Maritimo": "Maritimo",
     "Alverca": "Alverca",
     "Arouca": "Arouca",
     "Benfica": "Benfica",
@@ -331,7 +386,7 @@ ESPN_TO_FD: dict[str, str] = {v: k for k, v in TEAM_NAME_MAP.items()}
 # ESPN displayName -> football-data name, consulted per league BEFORE the
 # global inverse map, for names ESPN reuses across leagues.
 LEAGUE_NAME_OVERRIDES: dict[str, dict[str, str]] = {
-    "Liga MX": {"Santos": "Santos Laguna"},
+    "Liga MX": {"Santos": "Santos Laguna", "FC Juárez": "Juarez"},
 }
 
 
@@ -383,6 +438,54 @@ def devig_decimal(*decimal_odds: float) -> list[float]:
     return [r / total for r in raw]
 
 
+_IMPLIED_TABLE: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None
+
+
+def _implied_table() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """(lam_home, lam_away, 3-way probabilities) over a 0.15..4.5 goal grid in
+    0.025 steps, from the same truncated independent-Poisson score grid as
+    :func:`outcome_probs`. Built once (about 30k rows)."""
+    global _IMPLIED_TABLE
+    if _IMPLIED_TABLE is None:
+        axis = np.arange(0.15, 4.5001, 0.025)
+        lam_h, lam_a = (m.ravel() for m in np.meshgrid(axis, axis, indexing="ij"))
+        k = np.arange(MAX_GOALS + 1)
+        log_fact = np.array([math.lgamma(i + 1) for i in k])
+        pmf_h = np.exp(-lam_h[:, None] + k[None, :] * np.log(lam_h[:, None]) - log_fact[None, :])
+        pmf_a = np.exp(-lam_a[:, None] + k[None, :] * np.log(lam_a[:, None]) - log_fact[None, :])
+        grid = pmf_h[:, :, None] * pmf_a[:, None, :]
+        total = grid.sum(axis=(1, 2))
+        home = np.tril(grid, -1).sum(axis=(1, 2))
+        draw = np.einsum("nii->n", grid)
+        away = np.triu(grid, 1).sum(axis=(1, 2))
+        _IMPLIED_TABLE = (lam_h, lam_a, np.stack([home, draw, away], axis=1) / total[:, None])
+    return _IMPLIED_TABLE
+
+
+def implied_goals(odds_h, odds_d, odds_a) -> tuple[np.ndarray, np.ndarray]:
+    """(lam_home, lam_away) whose Poisson 1X2 is nearest the devigged decimal
+    closing odds, per match; NaN where a price is missing or not above 1.0."""
+    raw = np.stack(
+        [np.asarray(pd.to_numeric(pd.Series(o), errors="coerce"), dtype=float) for o in (odds_h, odds_d, odds_a)],
+        axis=1,
+    )
+    ok = np.isfinite(raw).all(axis=1) & (raw > 1.0).all(axis=1)
+    out_h = np.full(len(raw), np.nan)
+    out_a = np.full(len(raw), np.nan)
+    if ok.any():
+        lam_h, lam_a, table = _implied_table()
+        inv = 1.0 / raw[ok]
+        probs = inv / inv.sum(axis=1, keepdims=True)
+        idx = np.where(ok)[0]
+        for start in range(0, len(idx), 256):  # bounded memory
+            chunk = probs[start:start + 256]
+            dist = ((table[None, :, :] - chunk[:, None, :]) ** 2).sum(axis=2)
+            best = dist.argmin(axis=1)
+            out_h[idx[start:start + 256]] = lam_h[best]
+            out_a[idx[start:start + 256]] = lam_a[best]
+    return out_h, out_a
+
+
 # --------------------------------------------------------------------------
 # Fitting
 # --------------------------------------------------------------------------
@@ -396,8 +499,22 @@ def fit_league(df: pd.DataFrame, as_of: datetime) -> dict:
     df = df[df["Date"] <= as_of]
     if df.empty:
         raise ValueError("no matches to fit on")
+    # Market-implied goal expectations stand in for the score wherever the
+    # row has them, provided the league's feed carries closes at all.
+    implied = (
+        {"ImpH", "ImpA"}.issubset(df.columns)
+        and df[["ImpH", "ImpA"]].notna().all(axis=1).mean() >= IMPLIED_MIN_SHARE
+    )
+    if implied:
+        has = df[["ImpH", "ImpA"]].notna().all(axis=1)
+        df = df.assign(
+            FTHG=df["ImpH"].where(has, df["FTHG"]).astype(float),
+            FTAG=df["ImpA"].where(has, df["FTAG"]).astype(float),
+        )
+    half_life = IMPLIED_HALF_LIFE_DAYS if implied else HALF_LIFE_DAYS
+    prior = IMPLIED_PRIOR_MATCHES if implied else PRIOR_MATCHES
     days_ago = (as_of - df["Date"]).dt.days.clip(lower=0)
-    w = 0.5 ** (days_ago / HALF_LIFE_DAYS)
+    w = 0.5 ** (days_ago / half_life)
     w_sum = w.sum()
 
     home_avg = float((w * df["FTHG"]).sum() / w_sum)
@@ -421,10 +538,10 @@ def fit_league(df: pd.DataFrame, as_of: datetime) -> dict:
     for team, tw in weight.items():
         # Shrink toward league average (strength 1.0) with a small prior so
         # newly promoted clubs early in a season don't get wild strengths.
-        denom = (tw + PRIOR_MATCHES) * mu
+        denom = (tw + prior) * mu
         teams[team] = {
-            "attack": (scored[team] + PRIOR_MATCHES * mu) / denom,
-            "defense": (conceded[team] + PRIOR_MATCHES * mu) / denom,
+            "attack": (scored[team] + prior * mu) / denom,
+            "defense": (conceded[team] + prior * mu) / denom,
         }
     return {"home_avg": home_avg, "away_avg": away_avg, "teams": teams}
 
@@ -472,6 +589,8 @@ def _parse_results_csv(text: str) -> pd.DataFrame:
     df.columns = [str(c).lstrip("﻿").strip() for c in df.columns]
     out = df[["Date", "HomeTeam", "AwayTeam", "FTHG", "FTAG", "FTR"]].copy()
     out[["MarketH", "MarketD", "MarketA"]] = _closing_odds(df, MAIN_ODDS_CANDIDATES)
+    close = _closing_odds(df, CLOSE_ODDS_CANDIDATES)
+    out["ImpH"], out["ImpA"] = implied_goals(close["MarketH"], close["MarketD"], close["MarketA"])
     return _finish_results(out)
 
 
@@ -497,6 +616,8 @@ def _parse_extra_csv(text: str, min_season: int = EXTRA_MIN_SEASON) -> pd.DataFr
         }
     )
     out[["MarketH", "MarketD", "MarketA"]] = _closing_odds(df, EXTRA_ODDS_CANDIDATES)
+    # the extra files' candidates are closing prices already
+    out["ImpH"], out["ImpA"] = implied_goals(out["MarketH"], out["MarketD"], out["MarketA"])
     out = _finish_results(out)
     # Res is occasionally blank; the goals are authoritative anyway.
     out["FTR"] = ["H" if h > a else ("A" if a > h else "D") for h, a in zip(out["FTHG"], out["FTAG"])]
@@ -559,15 +680,12 @@ async def _load_mls_results(client: httpx.AsyncClient, force_refresh: bool = Fal
     MLS_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     now = datetime.now(timezone.utc)
     rows: list[dict] = []
-    for year in MLS_SEASONS:
+    for year in (now.year - 1, now.year):
         for month in MLS_MONTHS:
             if (year, month) > (now.year, now.month):
                 continue
             path = MLS_CACHE_DIR / f"{year}{month:02d}.json"
-            url = MLS_SCOREBOARD_URL.format(
-                start=f"{year}{month:02d}01",
-                end=f"{year}{month:02d}{calendar.monthrange(year, month)[1]}",
-            )
+            url = MLS_SCOREBOARD_URL.format(month=f"{year}{month:02d}")
             is_current = (year, month) == (now.year, now.month)
             if not await _refresh_file(client, url, path, mutable=is_current, force=force_refresh):
                 continue
@@ -591,14 +709,19 @@ async def load_results(force_refresh: bool = False) -> dict[str, pd.DataFrame]:
     out: dict[str, pd.DataFrame] = {}
     async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
         frames: dict[str, list[pd.DataFrame]] = {code: [] for code in MAIN_LEAGUES}
-        for season in SEASONS:
+        seasons = season_codes()  # evaluated per refresh: a long-lived process rolls over too
+        for season in seasons:
             for code in MAIN_LEAGUES:
                 path = CACHE_DIR / f"{season}_{code}.csv"
                 url = CSV_URL.format(season=season, code=code)
                 if await _refresh_file(
-                    client, url, path, mutable=season == CURRENT_SEASON, force=force_refresh
+                    client, url, path, mutable=season == seasons[-1], force=force_refresh
                 ):
-                    frames[code].append(_parse_results_csv(path.read_text(encoding="latin-1")))
+                    try:
+                        frames[code].append(_parse_results_csv(path.read_text(encoding="latin-1")))
+                    except (KeyError, ValueError) as exc:
+                        # e.g. the new season's file before its first matchday
+                        logger.warning("unusable season file %s: %s", path.name, exc)
         for code, parts in frames.items():
             if parts:
                 out[code] = (
@@ -624,7 +747,7 @@ async def load_results(force_refresh: bool = False) -> dict[str, pd.DataFrame]:
 
 class SoccerEngine(SportEngine):
     sport = Sport.SOCCER
-    model_name = "soccer-poisson-v2"
+    model_name = "soccer-poisson-v3"
 
     def __init__(self) -> None:
         self._state: dict | None = None

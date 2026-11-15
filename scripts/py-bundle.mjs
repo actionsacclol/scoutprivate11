@@ -7,7 +7,7 @@
 // `--port <port>`.
 //
 // --onedir, not --onefile: onefile has to unpack a ~150MB+ stack
-// (pandas/sklearn/xgboost) to a temp dir on EVERY launch, which can blow
+// (pandas/pyarrow/the signing libraries) to a temp dir on EVERY launch, which can blow
 // through the supervisor's 60s startup-health window on cold disks/AV scans.
 // onedir starts in a few seconds.
 //

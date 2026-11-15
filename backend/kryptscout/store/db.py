@@ -357,6 +357,24 @@ CREATE TABLE IF NOT EXISTS book_observations (
     limit_cents    INTEGER
 );
 
+-- The picks that were actually POSTED on a daily card (store/cardrecord.py).
+-- One row per game, written once when the post goes out and never refreshed,
+-- so the record is graded on what a reader saw: the side, the probability
+-- shown, and the cheapest exchange price after fees at that moment.
+CREATE TABLE IF NOT EXISTS card_picks (
+    game_id   TEXT PRIMARY KEY,
+    sport     TEXT NOT NULL,
+    side      TEXT NOT NULL,
+    team      TEXT NOT NULL,
+    tier      TEXT NOT NULL DEFAULT '',
+    prob      REAL,              -- win probability shown in the post
+    venue     TEXT,              -- cheapest exchange after fees, if any listed it
+    price     REAL,              -- that exchange's share price (0-1)
+    cost      REAL,              -- price plus its taker fee: what a unit is staked at
+    card_date TEXT NOT NULL,     -- the sender's local date, YYYY-MM-DD
+    posted_at TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_pm_markets_sport ON pm_markets (sport, game_start);
 CREATE INDEX IF NOT EXISTS idx_pm_markets_unfetched ON pm_markets (prices_fetched);
 CREATE INDEX IF NOT EXISTS idx_book_obs_sport ON book_observations (sport, at_ts);
@@ -420,7 +438,12 @@ def _migrate(conn: sqlite3.Connection) -> None:
         # from the CLOB trades feed) — FAK partials must not grade as full.
         "auto_bets": [("best_ask_cents", "INTEGER"), ("book_depth", "REAL"),
                       ("fee_rate", "REAL"), ("fill_shares", "INTEGER"),
-                      ("fill_prob", "REAL")],
+                      ("fill_prob", "REAL"),
+                      # Which exchange the order went to (autobet/venues.py).
+                      # NULL = a row from before there was more than one:
+                      # polymarket.com. `ref_book` is the exchange whose fair
+                      # the price was measured against.
+                      ("venue", "TEXT"), ("ref_book", "TEXT")],
     }
     for table, cols in additions.items():
         have = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
@@ -470,6 +493,12 @@ def _aware(dt: datetime) -> datetime:
     return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
 
 
+# One stored prediction per (game, model) per fixed wall-clock bucket of this
+# many minutes. See upsert_prediction: the bucket must not be relative to the
+# stored row, or a steady poll slides a single row forward forever.
+PREDICTION_MIN_GAP_MINUTES = 60.0
+
+
 def upsert_prediction(
     conn: sqlite3.Connection,
     game_id: str,
@@ -484,12 +513,24 @@ def upsert_prediction(
     predicted_total: Optional[float] = None,
     starts_at: Optional[datetime] = None,
 ) -> Optional[bool]:
-    """Record a prediction, deduping within the hour.
+    """Record a prediction, one row per (game, model) per wall-clock hour.
 
-    If a row for the same (game_id, model) exists with generated_at less than
-    one hour away, that row is updated in place (its generated_at moves to the
-    new timestamp) rather than a new row being inserted. Returns True when a
-    new row was created, False when an existing row was refreshed.
+    If a row for the same (game_id, model) already sits in this capture's
+    fixed UTC hour bucket, that row is refreshed in place (its generated_at
+    moves forward to this capture, so each bucket keeps its freshest number)
+    rather than a new row being inserted. Returns True when a new row was
+    created, False when an existing row was refreshed.
+
+    The bucket is anchored to the clock, NOT to the stored row. The earlier
+    "within one hour of the latest row" test ratcheted: under the renderer's
+    60s board poll every write landed inside the window of the row the
+    previous write had just moved, so ONE row slid forward all the way to
+    kickoff and the pre-game series collapsed to a single point stamped at
+    the last poll. Measured on the 2026-11-14 store: of 1,859 completed
+    games with an engine row at least 15 minutes before kickoff, the median
+    game has exactly ONE such row, and 394 have none at or before the 11:00
+    ET post time, so "what did we say this morning" cannot be scored for
+    them. Same defect, same cure as insert_snapshot below.
 
     Pass `starts_at` (the game's kickoff) wherever it is known: a prediction
     generated at or after kickoff is REFUSED and None is returned. Every model
@@ -502,14 +543,20 @@ def upsert_prediction(
     if starts_at is not None and _aware(generated_at) >= _aware(starts_at):
         return None
     ts = iso(generated_at)
+    gap_seconds = PREDICTION_MIN_GAP_MINUTES * 60.0
+    bucket_start = datetime.fromtimestamp(
+        math.floor(_aware(generated_at).timestamp() / gap_seconds) * gap_seconds,
+        tz=timezone.utc,
+    )
+    bucket_end = bucket_start + timedelta(seconds=gap_seconds)
     existing = conn.execute(
         """
         SELECT id FROM predictions
         WHERE game_id = ? AND model = ?
-          AND ABS(julianday(generated_at) - julianday(?)) < 1.0 / 24.0
+          AND generated_at >= ? AND generated_at < ?
         ORDER BY generated_at DESC LIMIT 1
         """,
-        (game_id, model, ts),
+        (game_id, model, iso(bucket_start), iso(bucket_end)),
     ).fetchone()
     values = (
         ts, home_win_prob, away_win_prob, draw_prob,
@@ -1082,19 +1129,24 @@ def insert_auto_bet(
     best_ask_cents: Optional[int] = None,
     book_depth: Optional[float] = None,
     fee_rate: Optional[float] = None,
+    venue: Optional[str] = None,
+    ref_book: Optional[str] = None,
 ) -> int:
-    """Record one autobet attempt (status dry|placed|unmatched|error)."""
+    """Record one autobet attempt (status dry|placed|unmatched|error|unknown).
+
+    `unknown` is an order that was sent and never answered: it may be live on
+    the exchange, so it holds its game like a placed one until a person looks."""
     cur = conn.execute(
         """
         INSERT INTO auto_bets (game_id, sport, side, team, tier, ev, model_prob,
                                condition_id, clob_side, slug, limit_prob, shares,
                                usd, order_id, status, error, created_at,
-                               best_ask_cents, book_depth, fee_rate)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                               best_ask_cents, book_depth, fee_rate, venue, ref_book)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (game_id, sport, side, team, tier, ev, model_prob, condition_id,
          clob_side, slug, limit_prob, shares, usd, order_id, status, error,
-         iso(created_at), best_ask_cents, book_depth, fee_rate),
+         iso(created_at), best_ask_cents, book_depth, fee_rate, venue, ref_book),
     )
     return cur.lastrowid
 

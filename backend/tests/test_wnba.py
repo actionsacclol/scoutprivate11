@@ -162,7 +162,7 @@ def test_season_rollover_regresses_ratings_at_year_boundary(tmp_path) -> None:
     assert _season_key(date(2025, 9, 10)) != _season_key(date(2026, 5, 1))
     engine._process_day(date(2026, 5, 1), {"events": []})  # crosses Jan 1
     rating_after = engine.elo.get("Las Vegas Aces")
-    expected = 1500.0 + 0.75 * (rating_before - 1500.0)
+    expected = 1500.0 + 0.5 * (rating_before - 1500.0)  # ELO_CONFIG.season_carry
     assert abs(rating_after - expected) < 1e-9
     # Same-season day changes must not regress again.
     engine._process_day(date(2026, 5, 2), {"events": []})

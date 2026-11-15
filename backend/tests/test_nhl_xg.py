@@ -95,7 +95,8 @@ def test_fit_recovers_the_direction_and_predicts_the_favourite():
     assert nhl.fit_xg_logit(rng_rows[:3], upto_season=2024) is None  # too thin to fit
 
 
-def test_engine_serves_xg_when_available_and_elo_otherwise(tmp_path):
+def test_engine_serves_xg_when_available_and_elo_otherwise(tmp_path, monkeypatch):
+    monkeypatch.setattr(nhl, "XG_ENABLED", True)  # off by default since v3
     engine = nhl.NhlEngine(state_path=tmp_path / "state.json", raw_dir=tmp_path / "raw")
     game = Game(id="nhl-1", sport=Sport.NHL, league="", start_time=datetime(2026, 10, 8, tzinfo=timezone.utc),
                 home="Toronto Maple Leafs", away="Boston Bruins")
@@ -103,6 +104,7 @@ def test_engine_serves_xg_when_available_and_elo_otherwise(tmp_path):
     assert pred.model == "nhl-elo-v1"
     # Now with an xG state and weights in place.
     engine._xg_weights = [0.05, 1.5, 0.0, 0.0, 0.0, 0.0]
+    engine._xg_last_date = "2026-10-07"  # a current file; a stale one never serves
     engine._xg_state = {
         "Toronto Maple Leafs": {"xgf": 0.6, "xga": -0.4, "xgf5": 0.3, "xga5": -0.2, "gf": 0.3, "ga": -0.3, "sh": 0.0, "sv": 0.0, "n": 20},
         "Boston Bruins": {"xgf": -0.2, "xga": 0.3, "xgf5": -0.1, "xga5": 0.2, "gf": -0.1, "ga": 0.2, "sh": 0.0, "sv": 0.0, "n": 20},
@@ -123,7 +125,8 @@ def test_engine_serves_xg_when_available_and_elo_otherwise(tmp_path):
     assert again._xg_weights == engine._xg_weights and again._xg_state["Toronto Maple Leafs"]["n"] == 20
 
 
-def test_refresh_xg_fits_from_the_file_and_skips_when_absent(tmp_path):
+def test_refresh_xg_fits_from_the_file_and_skips_when_absent(tmp_path, monkeypatch):
+    monkeypatch.setattr(nhl, "XG_ENABLED", True)  # off by default since v3
     engine = nhl.NhlEngine(state_path=tmp_path / "state.json", raw_dir=tmp_path / "raw")
     assert engine._refresh_xg() is False  # no folder, no file: nothing happens
     mp = tmp_path / "raw" / "moneypuck"

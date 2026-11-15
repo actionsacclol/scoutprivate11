@@ -21,6 +21,30 @@ def _licensed(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_cached_forecasts():
+    """datasources.weather caches forecasts per venue and day; a test that
+    fakes one must not be answered with the previous test's."""
+    from kryptscout.datasources import weather
+    weather.clear_cache()
+    yield
+    weather.clear_cache()
+
+
+@pytest.fixture(autouse=True)
+def _scratch_models_dir(tmp_path, monkeypatch):
+    """Point config.MODELS_DIR at a scratch directory.
+
+    api.main deletes the artifacts of retired engines once the registry has
+    loaded (jobs.refresh.purge_retired_artifacts). A test that exercises that
+    path must not reach the developer's real models/ directory.
+    """
+    from kryptscout import config
+    scratch = tmp_path / "_models"
+    scratch.mkdir()
+    monkeypatch.setattr(config, "MODELS_DIR", scratch)
+
+
+@pytest.fixture(autouse=True)
 def _engines_ready():
     """Every test runs as if the sport engines finished loading.
 

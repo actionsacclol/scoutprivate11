@@ -1,4 +1,4 @@
-import { BrowserWindow, app, dialog, ipcMain } from 'electron';
+import { BrowserWindow, app, dialog, ipcMain, shell } from 'electron';
 import {
   appendFileSync,
   existsSync,
@@ -13,10 +13,12 @@ import type {
   DiscordConfig,
   LogEntry,
   LogExportResult,
+  McpInstallResult,
   SchedulerConfig,
   SchedulerJob,
 } from '../shared/types';
 import { discordPicks } from './system/discord-picks';
+import * as mcpClients from './system/mcp-clients';
 import { pythonBackend } from './system/python-backend';
 import { scheduler } from './system/scheduler';
 import * as store from './system/settings-store';
@@ -178,6 +180,39 @@ export function registerIpc(): void {
   );
   ipcMain.handle('discord:sendNow', () => discordPicks.sendNow());
   ipcMain.handle('discord:test', (_e, url: string) => discordPicks.test(String(url)));
+  ipcMain.handle('discord:preview', () => discordPicks.preview());
+
+  // ── AI agents (MCP): connect other programs to this app ──────────
+  // The server itself is the backend's (/mcp, switched from /api/mcp). These
+  // only write — or remove — our launch entry in another program's config.
+  const badClient: McpInstallResult = {
+    ok: false, message: 'Unknown AI client.', files: [], backups: [],
+  };
+  ipcMain.handle('mcp:clients', () => mcpClients.listClients(pythonBackend.relaySpec()));
+  ipcMain.handle('mcp:install', async (_e, id: unknown): Promise<McpInstallResult> => {
+    if (!mcpClients.isClientId(id)) return badClient;
+    const spec = pythonBackend.relaySpec();
+    const result = id === 'claude-code'
+      ? await mcpClients.installClaudeCode(spec)
+      : mcpClients.install(id, spec);
+    appendLog({
+      ts: new Date().toISOString(),
+      level: result.ok ? 'INFO' : 'WARN',
+      source: 'mcp',
+      msg: `connect ${id}: ${result.ok ? 'ok' : 'refused'} — ${result.message}`,
+    });
+    return result;
+  });
+  ipcMain.handle('mcp:uninstall', async (_e, id: unknown): Promise<McpInstallResult> => {
+    if (!mcpClients.isClientId(id)) return badClient;
+    return id === 'claude-code' ? mcpClients.uninstallClaudeCode() : mcpClients.uninstall(id);
+  });
+  ipcMain.handle('mcp:openConfigFolder', async (_e, id: unknown): Promise<boolean> => {
+    if (!mcpClients.isClientId(id)) return false;
+    const folder = mcpClients.configFolder(id);
+    if (!folder || !existsSync(folder)) return false;
+    return (await shell.openPath(folder)) === '';
+  });
 
   // ── auto-updates (scaffolding — 'unconfigured' until publish lands) ─
   ipcMain.handle('updater:state', () => updater.state());

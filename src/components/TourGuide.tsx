@@ -139,7 +139,7 @@ const STEPS: TourStep[] = [
     target: 'autobet',
     label: 'AUTO-BET',
     title: 'The robot',
-    copy: 'Connect Polymarket and Scout can place bets by itself, with limits you set. It stays OFF until you turn it on.',
+    copy: 'Scout can place bets by itself on Polymarket, Kalshi or Polymarket US, with limits you set. Paper mode needs no account. It stays OFF until you turn it on.',
   },
   {
     page: 'perf',
@@ -285,7 +285,7 @@ export default function TourGuide({ onNav }: { onNav: (page: PageId) => void }) 
               <h2 className="text-lg font-bold leading-tight text-white">Want a quick tour?</h2>
             </div>
             <p className="mt-3 text-sm leading-relaxed text-krypt-muted">
-              The nine tabs, plus a piece-by-piece read of one pick card — how to spot a good
+              The main tabs, plus a piece-by-piece read of one pick card — how to spot a good
               bet, how risky it is, and how much to put on. About two minutes.
             </p>
             <div className="mt-5 flex items-center justify-between border-t border-white/5 pt-4">

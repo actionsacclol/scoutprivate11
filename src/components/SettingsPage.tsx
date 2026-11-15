@@ -1,12 +1,12 @@
 import { useCallback, useEffect, useState } from 'react'
-import { Download, KeyRound, Minus, NotebookPen, Play, Plus, RefreshCw, RotateCcw, ScrollText, Timer } from 'lucide-react'
+import { Compass, Download, KeyRound, Minus, NotebookPen, Play, Plus, RefreshCw, RotateCcw, ScrollText, Timer } from 'lucide-react'
 import type { BackendInfo, LogEntry, SchedulerConfig, SchedulerInfo, SchedulerJob } from '@shared/types'
 import type { BoardMap, Sport } from '../types'
 import { SPORTS, SPORT_TAG } from '../types'
 import { Badge, Card, GhostButton, Page, PrimaryButton, Section, Toggle } from './common'
 import { cls } from '../utils/format'
 import { ModeSwitch, type UiMode } from '../uiMode'
-import { MAX_STAKE, MIN_STAKE, clampStake, defaultStake, saveDefaultStake } from '../prefs'
+import { MAX_STAKE, MIN_STAKE, clampStake, defaultStake, resetOnboarding, resetTour, saveDefaultStake } from '../prefs'
 import { activateLicense, deactivateLicense, fetchLicense, type LicenseStatus } from '../api'
 
 /** Krypt Tools license: activate a key (from the Krypt dashboard) on this
@@ -156,6 +156,8 @@ interface Props {
   apiUp: boolean | null
   backend: BackendInfo | null
   sportFetchedAt: Partial<Record<Sport, Date>>
+  /** Sports whose last board request failed, with the reason. */
+  boardErrors: Partial<Record<Sport, string>>
   onToggleDemo: () => void
   onRefreshSport: (s: Sport) => Promise<void>
   mode: UiMode
@@ -169,6 +171,7 @@ export default function SettingsPage({
   apiUp,
   backend,
   sportFetchedAt,
+  boardErrors,
   onToggleDemo,
   onRefreshSport,
   mode,
@@ -348,7 +351,13 @@ export default function SettingsPage({
                     <td className="px-4 py-2 text-right font-mono text-[11px] text-white/80">{cards.length}</td>
                     <td className="px-4 py-2 text-right font-mono text-[11px] text-krypt-muted">{books}</td>
                     <td className="px-4 py-2 text-right font-mono text-[10px] text-krypt-muted">
-                      {fmtClock(sportFetchedAt[s])}
+                      {boardErrors[s] ? (
+                        <span className="text-amber-300" title={`Last request failed: ${boardErrors[s]}`}>
+                          FAILED · {boardErrors[s]}
+                        </span>
+                      ) : (
+                        fmtClock(sportFetchedAt[s])
+                      )}
                     </td>
                     <td className="px-4 py-2 text-right">
                       <button
@@ -751,6 +760,23 @@ export default function SettingsPage({
               </div>
             </div>
             {demo && <Badge tone="gradient">DEMO</Badge>}
+          </div>
+          <div className="mt-4 flex flex-wrap items-center gap-3 border-t border-white/5 pt-4">
+            <div className="min-w-0 flex-1">
+              <div className="text-sm font-semibold text-white">Onboarding</div>
+              <div className="text-xs text-krypt-muted">
+                Run the first-run setup again (where to bet, interface mode, getting the picks),
+                or the tab-by-tab tour. Nothing you have saved is reset.
+              </div>
+            </div>
+            <GhostButton onClick={resetOnboarding} className="!px-3 !py-2 text-xs">
+              <RotateCcw size={12} />
+              Replay onboarding
+            </GhostButton>
+            <GhostButton onClick={resetTour} className="!px-3 !py-2 text-xs">
+              <Compass size={12} />
+              Replay tour
+            </GhostButton>
           </div>
         </Card>
       </Section>

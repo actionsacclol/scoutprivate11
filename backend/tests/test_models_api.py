@@ -236,3 +236,23 @@ def test_jobs_refresh_aggregates_and_isolates_failures(client):
     assert results["mlb"]["ok"] is False  # one failure never sinks the rest
     assert "scoreboard on fire" in results["mlb"]["summary"]
     assert engines.get_engine(Sport.WNBA).refresh_calls == 1
+
+
+# ------------------------------------------------- retired engine artifacts
+
+
+def test_purge_removes_only_retired_artifacts(client) -> None:
+    """The xgboost overlays are gone; their pickles outlive the update in
+    userData and must stop showing up as a "model pickle" on two Elo engines."""
+    from kryptscout.jobs import refresh as refresh_job
+
+    for name in ("nba_xgb_v2.pkl", "nfl_xgb_v3.pkl", "nfl_xgb_v2.pkl"):
+        (config.MODELS_DIR / name).write_bytes(b"x")
+    keep = config.MODELS_DIR / "wnba_other_v1.pkl"
+    keep.write_bytes(b"x")
+
+    assert refresh_job.purge_retired_artifacts() == [
+        "nba_xgb_v2.pkl", "nfl_xgb_v2.pkl", "nfl_xgb_v3.pkl",
+    ]
+    assert sorted(p.name for p in config.MODELS_DIR.iterdir()) == ["wnba_other_v1.pkl"]
+    assert refresh_job.purge_retired_artifacts() == []  # idempotent

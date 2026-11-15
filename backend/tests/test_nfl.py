@@ -1,15 +1,11 @@
-"""No-network unit tests for the NFL engine (v3: XGB over Elo + v2 overlays)."""
+"""No-network unit tests for the NFL engine (nfl-elo-v2: Elo + QB/rest overlays)."""
 from __future__ import annotations
 
 import asyncio
 from collections import deque
 import math
-import os
-import pickle
-import time
 from datetime import datetime, timezone
 
-import numpy as np
 import pandas as pd
 import pytest
 
@@ -22,26 +18,17 @@ from kryptscout.sports.nfl import (
     ABBREV_TO_NAME,
     CURRENT_ABBREVS,
     ELO_CONFIG,
-    FEATURE_COLUMNS,
     PRESEASON_DAMP,
     QB_ADJ_CAP,
     QB_PRIOR_POINTS,
     QB_SPAN,
-    TEMP_SENTINEL,
-    WIND_SENTINEL,
     NflEngine,
-    _calibrated_probs,
     _compute_metrics,
-    _feature_row,
-    _load_model,
-    _model_stale,
     _qb_diff,
     _qb_value,
     _record_qb_start,
     _replay,
     _rest_diff,
-    _save_model,
-    _train_model,
     _upcoming_schedule,
     _weather_total_multiplier,
     build_engine,
@@ -113,10 +100,8 @@ def _wx(wind_kph: float, precip: float = 0.0) -> GameWeather:
 
 
 def _engine(tmp_path) -> NflEngine:
-    """Engine with isolated state and (absent) model pickle — pure Elo path."""
-    return NflEngine(
-        state_path=tmp_path / "nfl_state.json", model_path=tmp_path / "nfl_model.pkl"
-    )
+    """Engine with isolated (absent) state."""
+    return NflEngine(state_path=tmp_path / "nfl_state.json")
 
 
 @pytest.fixture
@@ -202,7 +187,7 @@ def test_replay_moves_ratings_and_tracks_rolling_points():
     assert book.get(kc) > ELO_CONFIG.initial > book.get(den)
     assert list(rolling[kc]) == [(30, 10), (27, 13)]
     assert list(rolling[den]) == [(10, 30), (13, 27)]
-    assert len(feats) == 2  # one leakage-safe feature row per played game
+    assert len(feats) == 2  # one pre-game record per played game
     assert metrics["n_games"] == 2  # 2024+ games feed validation
     assert qbs == {} and team_qb == {}  # no QB ids in the frame
 
@@ -333,44 +318,62 @@ def test_replay_rest_differential_shifts_probability():
 # -- v3 feature rows ----------------------------------------------------------
 
 
-def test_replay_feature_rows_shapes_and_pregame_state():
+def test_replay_records_are_pregame_state():
     df = _frame(
         [
             {"season": 2023, "gameday": "2023-09-10", "home_team": "KC",
              "away_team": "DEN", "home_score": 30, "away_score": 10,
-             "week": 1, "temp": 71.0, "wind": 5.0},
+             "home_moneyline": -180, "away_moneyline": 150},
             {"season": 2023, "gameday": "2023-09-17", "home_team": "DEN",
-             "away_team": "KC", "home_score": 13, "away_score": 27,
-             "week": 2, "div_game": 1, "roof": "dome", "surface": "fieldturf"},
+             "away_team": "KC", "home_score": 13, "away_score": 27},
         ]
     )
-    *_, feats, _ = _replay(df, k_qb=0.0, rest_per_day=0.0)
-    assert len(feats) == 2
-    first, second = feats
-    for f in feats:
-        assert set(FEATURE_COLUMNS) <= set(f)
+    *_, records, _ = _replay(df, k_qb=0.0, rest_per_day=0.0)
+    assert len(records) == 2
+    first, second = records
 
-    # Game 1: fresh book, no history — everything at its cold-start value.
+    # Game 1: fresh book, no history — only home advantage separates them.
+    assert first["season"] == 2023
     assert first["elo_diff"] == pytest.approx(ELO_CONFIG.home_advantage)
     assert first["elo_diff_raw"] == 0.0
-    assert first["home_pf"] == first["away_pf"] == nfl.LEAGUE_AVG_POINTS
-    assert first["week"] == 1.0 and first["is_playoff"] == 0.0
-    assert first["temp"] == 71.0 and first["wind"] == 5.0
-    assert first["roof_outdoors"] == 1.0 and first["roof_dome"] == 0.0
-    assert first["surface_grass"] == 1.0
+    assert first["qb_adj_diff"] == 0.0 and first["rest_diff"] == 0.0
     assert first["p"] == pytest.approx(_p(ELO_CONFIG.home_advantage))
+    assert first["home_won"] is True and first["tie"] is False
+    assert (first["home_ml"], first["away_ml"]) == (-180, 150)
 
-    # Game 2: features reflect exactly one prior game, computed pre-update.
+    # Game 2: reflects exactly one prior game, read before its own update.
     assert second["elo_diff_raw"] < 0.0  # DEN (loser) now rated below KC
-    assert second["home_pf"] == 10.0 and second["home_pa"] == 30.0
-    assert second["away_pf"] == 30.0 and second["away_pa"] == 10.0
-    assert second["div_game"] == 1.0
-    assert second["roof_dome"] == 1.0 and second["roof_outdoors"] == 0.0
-    assert second["surface_grass"] == 0.0
+    assert second["home_ml"] is None and second["away_ml"] is None
 
 
-def test_replay_feature_rows_immune_to_appended_future_games():
-    """Leakage guard: a row's features must not change when later games appear."""
+def test_replay_record_difference_is_the_sum_of_its_parts():
+    """elo_diff is what the probability is read from; its parts must add up."""
+    df = _frame(
+        [
+            {"season": 2023, "gameday": "2023-09-10", "home_team": "KC",
+             "away_team": "DEN", "home_score": 30, "away_score": 10,
+             "home_qb_id": "vet", "away_qb_id": "rook"},
+            {"season": 2023, "gameday": "2023-09-17", "home_team": "KC",
+             "away_team": "DEN", "home_score": 24, "away_score": 20,
+             "home_qb_id": "vet", "away_qb_id": "rook",
+             "home_rest": 10, "away_rest": 6},
+        ]
+    )
+    *_, records, _ = _replay(df)
+    second = records[1]
+    assert second["qb_adj_diff"] > 0.0  # the vet outscored the rookie in game 1
+    assert second["rest_diff"] == pytest.approx(nfl.REST_ELO_PER_DAY * 4)
+    assert second["elo_diff"] == pytest.approx(
+        second["elo_diff_raw"]
+        + ELO_CONFIG.home_advantage
+        + second["qb_adj_diff"]
+        + second["rest_diff"]
+    )
+    assert second["p"] == pytest.approx(_p(second["elo_diff"]))
+
+
+def test_replay_records_immune_to_appended_future_games():
+    """Leakage guard: a game's record must not change when later games appear."""
     base = [
         {"season": 2022, "gameday": f"2022-09-{11 + 7 * i:02d}", "home_team": h,
          "away_team": a, "home_score": s1, "away_score": s2,
@@ -393,37 +396,6 @@ def test_replay_feature_rows_immune_to_appended_future_games():
     assert feats_long[: len(feats_short)] == feats_short
 
 
-def test_feature_row_nan_sentinels_and_unknown_dummies():
-    row = _feature_row(
-        elo_home=1500.0, elo_away=1500.0, hfa=48.0, qb_adj=0.0, rest_adj=0.0,
-        home_pf=22.0, home_pa=22.0, away_pf=22.0, away_pa=22.0,
-        week=None, is_playoff=False, div_game=None,
-        roof=float("nan"), surface=float("nan"),
-        temp=float("nan"), wind=None, season=2024,
-    )
-    assert row["temp"] == TEMP_SENTINEL
-    assert row["wind"] == WIND_SENTINEL
-    assert all(row[f"roof_{r}"] == 0.0 for r in nfl.ROOF_TYPES)  # unknown roof
-    assert row["surface_grass"] == 0.0
-    assert row["week"] == 0.0 and row["div_game"] == 0.0
-
-
-def test_feature_row_playoff_and_surface_variants():
-    row = _feature_row(
-        elo_home=1600.0, elo_away=1500.0, hfa=48.0, qb_adj=10.0, rest_adj=-2.0,
-        home_pf=25.0, home_pa=20.0, away_pf=21.0, away_pa=24.0,
-        week=22, is_playoff=True, div_game=1,
-        roof=" Dome ", surface="grass ",  # games.csv carries stray whitespace/case
-        temp=35.0, wind=12.0, season=2023,
-    )
-    assert row["elo_diff"] == pytest.approx(100 + 48 + 10 - 2)
-    assert row["elo_diff_raw"] == pytest.approx(100.0)
-    assert row["qb_adj_diff"] == 10.0 and row["rest_diff"] == -2.0
-    assert row["is_playoff"] == 1.0 and row["div_game"] == 1.0
-    assert row["roof_dome"] == 1.0
-    assert row["surface_grass"] == 1.0
-
-
 def test_replay_neutral_site_zeroes_home_advantage():
     df = _frame(
         [
@@ -436,104 +408,6 @@ def test_replay_neutral_site_zeroes_home_advantage():
     assert feats[0]["elo_diff"] == 0.0  # fresh book, equal rest, no HFA
     assert feats[0]["p"] == pytest.approx(0.5)
     assert m["elo_log_loss"] == pytest.approx(-math.log(0.5))
-
-
-# -- v3 training / calibration --------------------------------------------------
-
-
-def _synthetic_feats(n_per_season: int = 250, seed: int = 7) -> list[dict]:
-    """Elo-driven synthetic games, seasons 2018-2023 (tail 2022-23 for stopping)."""
-    rng = np.random.default_rng(seed)
-    feats = []
-    for season in range(2018, 2024):
-        for _ in range(n_per_season):
-            gap = float(rng.uniform(-250.0, 250.0))
-            row = _feature_row(
-                elo_home=1500.0 + gap / 2, elo_away=1500.0 - gap / 2,
-                hfa=ELO_CONFIG.home_advantage, qb_adj=0.0, rest_adj=0.0,
-                home_pf=22.0, home_pa=22.0, away_pf=22.0, away_pa=22.0,
-                week=int(rng.integers(1, 19)), is_playoff=False, div_game=0,
-                roof="outdoors", surface="grass", temp=60.0, wind=8.0,
-                season=season,
-            )
-            p_true = _p(row["elo_diff"])
-            row.update(p=p_true, home_won=bool(rng.random() < p_true), tie=False,
-                       home_ml=None, away_ml=None)
-            feats.append(row)
-    return feats
-
-
-_TEST_GRID = ({"max_depth": 3, "learning_rate": 0.1, "min_child_weight": 5},)
-
-
-@pytest.fixture(scope="module")
-def trained_bundle():
-    return _train_model(_synthetic_feats(), grid=_TEST_GRID)
-
-
-def _elo_diff_sweep(diffs) -> list[dict]:
-    """Feature rows varying only elo_diff (raw gap pinned) for monotone checks."""
-    rows = []
-    for d in diffs:
-        row = _feature_row(
-            elo_home=1500.0 + d, elo_away=1500.0, hfa=0.0, qb_adj=0.0, rest_adj=0.0,
-            home_pf=22.0, home_pa=22.0, away_pf=22.0, away_pa=22.0,
-            week=5, is_playoff=False, div_game=0,
-            roof="outdoors", surface="grass", temp=60.0, wind=8.0, season=2023,
-        )
-        row["elo_diff_raw"] = 0.0  # isolate the constrained feature
-        rows.append(row)
-    return rows
-
-
-def test_train_model_bundle_contents_and_search(trained_bundle):
-    assert trained_bundle["feature_columns"] == list(FEATURE_COLUMNS)
-    assert trained_bundle["n_fit"] == 4 * 250  # 2018-2021
-    assert trained_bundle["n_tail"] == 2 * 250  # 2022-2023
-    assert len(trained_bundle["search"]) == len(_TEST_GRID)
-    assert trained_bundle["params"]["tail_log_loss"] == pytest.approx(
-        min(s["tail_log_loss"] for s in trained_bundle["search"])
-    )
-
-
-def test_calibrated_probs_bounded_and_monotone_in_elo_diff(trained_bundle):
-    probs = _calibrated_probs(trained_bundle, _elo_diff_sweep(range(-300, 301, 20)))
-    assert np.all(probs > 0.0) and np.all(probs < 1.0)
-    assert np.all(np.diff(probs) >= -1e-9)  # monotone constraint + Platt survive
-    assert probs[0] < 0.5 < probs[-1]  # and the signal actually moves it
-
-
-def test_calibrated_probs_learn_the_elo_signal(trained_bundle):
-    # On fresh synthetic games the model should land near the generating curve.
-    rows = _elo_diff_sweep([-200.0, 0.0, 200.0])
-    probs = _calibrated_probs(trained_bundle, rows)
-    for prob, diff in zip(probs, (-200.0, 0.0, 200.0)):
-        assert prob == pytest.approx(_p(diff), abs=0.08)
-
-
-def test_model_pickle_roundtrip_and_staleness(tmp_path, trained_bundle):
-    path = tmp_path / "nfl_xgb_v3.pkl"
-    _save_model(trained_bundle, path)
-    loaded = _load_model(path)
-    rows = _elo_diff_sweep([-120.0, 40.0, 260.0])
-    assert np.allclose(
-        _calibrated_probs(loaded, rows), _calibrated_probs(trained_bundle, rows)
-    )
-    assert not _model_stale(path)
-    week_ago = time.time() - nfl.MODEL_MAX_AGE_SECONDS - 60
-    os.utime(path, (week_ago, week_ago))
-    assert _model_stale(path)
-
-
-def test_load_model_missing_corrupt_or_foreign(tmp_path):
-    assert _load_model(tmp_path / "absent.pkl") is None
-    assert _model_stale(tmp_path / "absent.pkl")
-    bad = tmp_path / "bad.pkl"
-    bad.write_bytes(b"this is not a pickle")
-    assert _load_model(bad) is None
-    foreign = tmp_path / "foreign.pkl"
-    foreign.write_bytes(pickle.dumps({"model": object()}))  # missing keys
-    assert _load_model(foreign) is None
 
 
 # -- upcoming schedule --------------------------------------------------------
@@ -557,7 +431,32 @@ def test_upcoming_schedule_maps_unplayed_games_with_feature_context():
         "home_rest": 7, "away_rest": 6, "season": 2026, "week": 1,
         "game_type": "REG", "div_game": 1, "roof": "outdoors",
         "surface": "grass", "temp": None, "wind": None, "neutral": False,
+        "home_qb_id": None, "away_qb_id": None,
     }
+
+
+def test_the_listed_starter_is_priced_not_the_last_one(tmp_path):
+    """games.csv names the expected starter a week or two ahead; a benched or
+    injured quarterback must not keep pricing his team's next game."""
+    engine = _engine(tmp_path)
+    engine.qbs = {
+        "star": {"name": "Star", "ewma": nfl.QB_PRIOR_POINTS + 6.0, "starts": 30},
+        "backup": {"name": "Backup", "ewma": nfl.QB_PRIOR_POINTS, "starts": 0},
+    }
+    engine.team_qb = {"Kansas City Chiefs": "star"}
+    game = _game()
+
+    last_starter, _ = engine._qb_rest_adjustments(game, None)
+    assert last_starter == pytest.approx(nfl.QB_K * 6.0)
+
+    listed = {"home_qb_id": "backup", "away_qb_id": None, "home_rest": 7, "away_rest": 7}
+    with_backup, _ = engine._qb_rest_adjustments(game, listed)
+    assert with_backup == pytest.approx(0.0)
+
+    # Nothing listed yet (games further out): fall back to the last starter.
+    unlisted = {"home_qb_id": None, "away_qb_id": None, "home_rest": 7, "away_rest": 7}
+    fallback, _ = engine._qb_rest_adjustments(game, unlisted)
+    assert fallback == pytest.approx(last_starter)
 
 
 def test_upcoming_schedule_flags_neutral_sites():
@@ -644,52 +543,16 @@ def test_predict_applies_qb_and_rest_adjustments(tmp_path, no_weather):
     assert pred.home_win_prob == pytest.approx(expected)
 
 
-def test_predict_missing_pickle_falls_back_to_elo(tmp_path, no_weather):
-    """No model on disk -> model_bundle is None -> the pure Elo path prices it."""
-    engine = _engine(tmp_path)
-    assert engine.model_bundle is None
-    engine.book.ratings = {"Kansas City Chiefs": 1600.0, "Denver Broncos": 1500.0}
-    when = datetime(2026, 9, 13, 17, tzinfo=timezone.utc)
-    engine.schedule = {  # schedule row exists, so only the pickle is missing
-        "2026-09-13|Kansas City Chiefs|Denver Broncos": {"home_rest": 7, "away_rest": 7}
-    }
-    [pred] = asyncio.run(engine.predict([_game(when=when)]))
-    assert pred.home_win_prob == pytest.approx(_pt(100 + ELO_CONFIG.home_advantage))
-
-
-def test_predict_uses_model_and_blend_for_scheduled_games(tmp_path, no_weather, monkeypatch):
+def test_predict_scheduled_game_is_elo_through_the_temperature(tmp_path, no_weather):
+    """A regular-season game is priced by Elo and nothing else."""
     engine = _engine(tmp_path)
     engine.book.ratings = {"Kansas City Chiefs": 1600.0, "Denver Broncos": 1500.0}
     when = datetime(2026, 9, 13, 17, tzinfo=timezone.utc)
     engine.schedule = {
-        "2026-09-13|Kansas City Chiefs|Denver Broncos": {
-            "home_rest": 7, "away_rest": 7, "season": 2026, "week": 2,
-            "game_type": "REG", "div_game": 1, "roof": "outdoors",
-            "surface": "grass", "temp": None, "wind": None, "neutral": False,
-        }
+        "2026-09-13|Kansas City Chiefs|Denver Broncos": {"home_rest": 7, "away_rest": 7}
     }
-    engine.model_bundle = {"model": object(), "calibrator": object(),
-                           "feature_columns": list(FEATURE_COLUMNS)}
-    seen: dict = {}
-
-    def fake_probs(bundle, rows):
-        seen["rows"] = rows
-        return np.array([0.8])
-
-    monkeypatch.setattr(nfl, "_calibrated_probs", fake_probs)
     [pred] = asyncio.run(engine.predict([_game(when=when)]))
-
-    p_elo = _p(100 + ELO_CONFIG.home_advantage)
-    if nfl.V3_MODE == "blend":
-        expected = nfl.BLEND_ELO_WEIGHT * p_elo + (1 - nfl.BLEND_ELO_WEIGHT) * 0.8
-    else:
-        expected = 0.8
-    assert pred.home_win_prob == pytest.approx(temper(expected, nfl.CALIBRATION_TEMPERATURE))
-    # And the feature row handed to the model matches the training recipe.
-    [row] = seen["rows"]
-    assert row["elo_diff"] == pytest.approx(100 + ELO_CONFIG.home_advantage)
-    assert row["div_game"] == 1.0 and row["week"] == 2.0
-    assert row["temp"] == TEMP_SENTINEL and row["wind"] == WIND_SENTINEL
+    assert pred.home_win_prob == pytest.approx(_pt(100 + ELO_CONFIG.home_advantage))
 
 
 def test_predict_neutral_site_zeroes_home_advantage(tmp_path, no_weather):
@@ -727,23 +590,6 @@ def test_preseason_damping_formula(tmp_path, no_weather):
     assert pred.home_win_prob == pytest.approx(expected)
     # Confidence is derived from the damped probability -> 60% lower too.
     assert pred.confidence == pytest.approx(abs(expected - 0.5) * 2)
-
-
-def test_preseason_never_reaches_the_model(tmp_path, no_weather, monkeypatch):
-    """Even with a bundle loaded, preseason stays on the damped Elo path."""
-    engine = _engine(tmp_path)
-    engine.model_bundle = {"model": object(), "calibrator": object(),
-                           "feature_columns": list(FEATURE_COLUMNS)}
-
-    def explode(bundle, rows):  # pragma: no cover - the point is it never runs
-        raise AssertionError("model must not price preseason games")
-
-    monkeypatch.setattr(nfl, "_calibrated_probs", explode)
-    when = datetime(2026, 8, 15, 23, tzinfo=timezone.utc)
-    [pred] = asyncio.run(engine.predict([_game(when=when)]))
-    assert pred.home_win_prob == pytest.approx(
-        0.5 + PRESEASON_DAMP * (_p(ELO_CONFIG.home_advantage) - 0.5)
-    )
 
 
 def test_preseason_damping_skipped_on_schedule_or_out_of_window(tmp_path, no_weather):
@@ -827,7 +673,7 @@ def test_state_persists_and_reloads(tmp_path):
     engine.metrics = {"elo_accuracy": 0.64}
     engine._save_state()
 
-    reloaded = NflEngine(state_path=path, model_path=tmp_path / "nfl_model.pkl")
+    reloaded = NflEngine(state_path=path)
     assert reloaded.book.get("Buffalo Bills") == pytest.approx(1650.5)
     assert list(reloaded.rolling["Buffalo Bills"]) == [(31, 10)]
     assert reloaded.qbs["00-1"]["ewma"] == pytest.approx(28.4)
@@ -843,4 +689,4 @@ def test_state_persists_and_reloads(tmp_path):
 def test_build_engine_contract():
     engine = build_engine()
     assert engine.sport is Sport.NFL
-    assert engine.model_name == "nfl-xgb-v3"  # V3_MODE gate is on (blend)
+    assert engine.model_name == "nfl-elo-v2"

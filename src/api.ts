@@ -41,16 +41,42 @@ export async function checkHealth(): Promise<boolean> {
   }
 }
 
+/**
+ * How long the renderer waits for one sport's board.
+ *
+ * A board is a live fan-out — the slate from ESPN, then every odds venue, then
+ * an order book per game — and the backend builds all nine at once. The
+ * generic 8s `fetchJSON` budget was shorter than a full NFL or NCAAF board
+ * takes on an ordinary connection (5-6s measured on a fast one), so those
+ * boards were abandoned mid-build and rendered as an empty slate. The backend
+ * caps its own upstream calls (datasources/espn.py REQUEST_TIMEOUT_S,
+ * odds/providers.py PROVIDER_TIMEOUT_S) well inside this.
+ */
+export const BOARD_TIMEOUT_MS = 30_000
+
 /** Fetch one sport's board (throws on failure — callers decide the fallback). */
 export async function fetchBoard(sport: Sport): Promise<GameCard[]> {
-  return fetchJSON<GameCard[]>(`/api/board/${sport}`)
+  return fetchJSON<GameCard[]>(`/api/board/${sport}`, BOARD_TIMEOUT_MS)
+}
+
+/** Why a board request failed, in words a user can act on. */
+export function describeBoardError(err: unknown): string {
+  if (err instanceof DOMException && err.name === 'AbortError') {
+    return `timed out after ${BOARD_TIMEOUT_MS / 1000}s`
+  }
+  const msg = err instanceof Error ? err.message : String(err)
+  if (/^503\b/.test(msg)) return 'the engines are still loading'
+  if (/^50[024]\b/.test(msg)) return 'the data source did not answer'
+  if (/^404\b/.test(msg)) return 'this sport’s engine failed to load'
+  if (/Failed to fetch|NetworkError/i.test(msg)) return 'the backend is not reachable'
+  return msg
 }
 
 /**
  * Resolve once the backend reports its sport engines registered.
  *
  * The backend serves /api/health the moment uvicorn binds, but the board
- * endpoints park until the model stack (numpy/pandas/sklearn/xgboost) finishes
+ * endpoints park until the engines' numeric stack (numpy/pandas) finishes
  * importing — ~25-35s on a cold first launch after a macOS install. Fetching
  * boards before then just burns the 8s request timeout on all nine sports and
  * paints an empty board. Poll the cheap health endpoint instead.
@@ -74,20 +100,32 @@ export async function waitForEngines(timeoutMs = 120_000): Promise<boolean> {
   }
 }
 
-/** Fetch every sport's board in parallel; a failed sport yields an empty board. */
-export async function fetchAllBoards(): Promise<BoardMap> {
+/**
+ * Fetch every sport's board in parallel, reporting each as it lands.
+ *
+ * `onBoard` fires per sport the moment its board arrives, so one slow sport
+ * never holds the other eight off the screen. A sport that fails reports
+ * through `onError` and is ABSENT from the returned map — it used to come back
+ * as an empty board, which the UI could not tell apart from "no games today"
+ * and which wiped a slate that had loaded fine a minute earlier.
+ */
+export async function fetchAllBoards(
+  onBoard?: (sport: Sport, cards: GameCard[]) => void,
+  onError?: (sport: Sport, reason: string) => void,
+): Promise<BoardMap> {
   await waitForEngines()
-  const results = await Promise.all(
-    SPORTS.map(async (sport: Sport): Promise<[Sport, GameCard[]]> => {
+  const map: BoardMap = {}
+  await Promise.all(
+    SPORTS.map(async (sport: Sport) => {
       try {
-        return [sport, await fetchBoard(sport)]
-      } catch {
-        return [sport, []]
+        const cards = await fetchBoard(sport)
+        map[sport] = cards
+        onBoard?.(sport, cards)
+      } catch (err) {
+        onError?.(sport, describeBoardError(err))
       }
     }),
   )
-  const map: BoardMap = {}
-  for (const [sport, cards] of results) map[sport] = cards
   return map
 }
 
@@ -762,8 +800,9 @@ export async function deleteMyBet(id: number): Promise<boolean> {
 }
 
 // -------------------------------------------------------------- autobet feed
-// /api/autobet — Polymarket auto-betting (real money; backend defaults to
-// disabled + dry-run). Wallet key material never appears in any response.
+// /api/autobet — auto-betting on Polymarket, Kalshi and Polymarket US (real
+// money; backend defaults to disabled + dry-run). Wallet and API-key material
+// never appears in any response.
 
 export interface AutobetSettings {
   enabled: boolean
@@ -786,7 +825,18 @@ export interface AutobetSettings {
   min_win_prob: number
   /** Skip picks whose model_prob − market_prob is below this (0..1; 0 = off). */
   min_edge: number
+  /** Which reference to trust: STRONG = Kalshi set the fair, LEAN = Polymarket. */
   tiers: string[]
+  /** Exchanges the engine may buy on (polymarket | kalshi | polymarket_us). */
+  venues: string[]
+  /** Let a live Kalshi order move its own shortfall between the user's
+   *  Kalshi exchange shards. */
+  kalshi_auto_move: boolean
+  /** Bets asked for by a connected AI agent (AI AGENTS page). Separate from
+   *  `enabled` / `dry_run`: off | paper | live, with its own caps. */
+  agent_mode: 'off' | 'paper' | 'live'
+  agent_max_usd: number
+  agent_max_bets_per_day: number
   /** Sport allowlist; empty = every sport. */
   sports: string[]
   /** Rank the eligible slate by edge and spend the daily cap on the top of
@@ -842,7 +892,36 @@ export interface AutobetToday {
   dry: number
   unmatched: number
   errors: number
+  /** Orders sent and never answered — they may be live on the exchange. */
+  unknown?: number
   spent_usd: number
+}
+
+/** One exchange auto-bet can buy on, and whether its account is connected. */
+export interface AutobetVenue {
+  key: 'polymarket' | 'kalshi' | 'polymarket_us'
+  label: string
+  connected: boolean
+  keyPreview: string
+  error?: string | null
+  accountNoun: string
+  /** False when the boards do not quote it (priced from its own book). */
+  onBoard: boolean
+}
+
+/** A price the last sweep looked at, nearest the floor first. */
+export interface AutobetNearMiss {
+  game_id: string
+  sport: string
+  team: string
+  venue: string
+  ref_book: string
+  tier: string
+  ask: number
+  fair_prob: number
+  /** Per $1 staked, after the exchange's fee. */
+  net_ev: number
+  kickoff: string
 }
 
 export interface AutobetSweepSummary {
@@ -852,17 +931,25 @@ export interface AutobetSweepSummary {
   dry: number
   unmatched: number
   errors: number
+  unknown?: number
   dry_run?: boolean
   skipped: Record<string, number>
   pnl?: AutobetPnl
   /** Resolved per-pick stake this sweep (percent mode sizes off balance). */
   stake_usd?: number
+  /** What the sweep had to work with: games in the window, how many another
+   *  exchange prices, and quotes read per venue. */
+  scan?: { games: number; with_reference: number; quotes: Record<string, number> }
+  closest?: AutobetNearMiss[]
+  /** Things done on the way to an order (e.g. funds moved between Kalshi shards). */
+  notes?: string[]
   error?: string
 }
 
 export interface AutobetStatus {
   settings: AutobetSettings
   wallet: AutobetWallet
+  venues?: AutobetVenue[]
   today: AutobetToday
   pnl: AutobetPnl
   /** Which stop currently halts the engine, or null. */
@@ -888,8 +975,12 @@ export interface AutobetAttempt {
   shares: number
   usd: number
   order_id: string | null
-  status: 'dry' | 'placed' | 'unmatched' | 'error'
+  /** 'unknown' = sent, never answered: it may be live on the exchange. */
+  status: 'dry' | 'placed' | 'unmatched' | 'error' | 'unknown'
   error: string | null
+  /** Exchange the order went to, and the one whose fair it was measured against. */
+  venue?: string
+  ref_book?: string | null
   created_at: string
   best_ask_cents: number | null
   book_depth: number | null
@@ -986,6 +1077,44 @@ export async function testAutobetWallet(): Promise<{
 export async function clearAutobetWallet(): Promise<boolean> {
   try {
     await postJSON('/api/autobet/wallet', undefined, 'DELETE')
+    return true
+  } catch {
+    return false
+  }
+}
+
+export interface AutobetVenueCheck {
+  ok?: boolean
+  balance_usd?: number
+  error?: string
+}
+
+/** Save an exchange API key (Kalshi: key ID + private key PEM; Polymarket US:
+ *  key ID + secret). Resolves {error} on failure so the form can say why. */
+export async function saveAutobetVenueKey(
+  venue: 'kalshi' | 'polymarket_us',
+  input: { key_id: string; secret: string },
+): Promise<{ venues?: AutobetVenue[]; check?: AutobetVenueCheck; error?: string }> {
+  try {
+    return await postJSON(`/api/autobet/venues/${venue}/credentials`, input, 'POST', 60_000)
+  } catch (e) {
+    return { error: e instanceof Error ? e.message : 'request failed' }
+  }
+}
+
+export async function testAutobetVenue(
+  venue: 'kalshi' | 'polymarket_us',
+): Promise<AutobetVenueCheck> {
+  try {
+    return await postJSON(`/api/autobet/venues/${venue}/test`, undefined, 'POST', 60_000)
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : 'request failed' }
+  }
+}
+
+export async function clearAutobetVenueKey(venue: 'kalshi' | 'polymarket_us'): Promise<boolean> {
+  try {
+    await postJSON(`/api/autobet/venues/${venue}/credentials`, undefined, 'DELETE')
     return true
   } catch {
     return false
@@ -1096,7 +1225,7 @@ export async function deleteAutobetProfile(name: string): Promise<AutobetStrateg
 // Types live here (the endpoints ship in parallel); every consumer must
 // tolerate null (endpoint absent / backend down) and render a fallback.
 
-/** On-disk artifact snapshot (state json or model pickle). */
+/** On-disk artifact snapshot (an engine's state json). */
 export interface ModelFileStat {
   exists: boolean
   path: string
@@ -1116,6 +1245,8 @@ export interface ModelInfo {
   sport: string
   model: string
   state: ModelFileStat | null
+  /** Always null today: no engine fits or stores a model (the field is kept
+   *  because the endpoint still reports it). */
   pickle: ModelFileStat | null
   live: ModelLiveRecord | null
   /** Engine-specific backtest blob — shape varies per engine, may be null. */
@@ -1144,20 +1275,16 @@ export async function fetchModels(): Promise<ModelsReport | null> {
   }
 }
 
-/** Kick a model data-refresh (or full retrain). Retraining can take tens of
- *  seconds, so the timeout is generous. Resolves null on failure. */
-export async function refreshModel(
-  sport: Sport,
-  forceRetrain: boolean,
-): Promise<ModelRefreshResult | null> {
+/** Kick one engine's data refresh. A first run replays seasons of results
+ *  and can take tens of seconds, so the timeout is generous. Resolves null on
+ *  failure. */
+export async function refreshModel(sport: Sport): Promise<ModelRefreshResult | null> {
   try {
     const ctl = new AbortController()
     const timer = setTimeout(() => ctl.abort(), 180_000)
     try {
       const res = await apiFetch(`/api/models/${sport}/refresh`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ force_retrain: forceRetrain }),
         signal: ctl.signal,
       })
       if (!res.ok) throw new Error(`${res.status} ${res.statusText}`)
@@ -1168,4 +1295,82 @@ export async function refreshModel(
   } catch {
     return null
   }
+}
+
+// ------------------------------------------------------------- AI agents (MCP)
+// The MCP server is the backend's (backend/kryptscout/mcp). These are the
+// renderer's controls for it; connecting a client is window.scout.mcp (it
+// edits other programs' config files, which needs the main process).
+
+export interface McpToolInfo {
+  name: string
+  title: string
+  description: string
+  /** True for the two tools that change the user's bet log. */
+  writes: boolean
+}
+
+export interface McpClientSeen {
+  client: string
+  version?: string | null
+  protocol?: string | null
+  calls: number
+  lastTool?: string
+  firstSeen?: string
+  lastSeen?: string
+  /** Called within the last 15 minutes. */
+  active: boolean
+}
+
+export interface McpAuditRow {
+  at: string
+  client: string
+  tool: string
+  outcome: 'accepted' | 'refused' | 'error'
+  detail: string
+}
+
+export interface McpStatus {
+  enabled: boolean
+  port: number | null
+  url: string | null
+  /** This launch has written the bridge file a client's relay looks for. */
+  bridge: boolean
+  /** e.g. "ks_AbC…wxyz"; null before agent access was ever switched on. */
+  tokenMasked: string | null
+  serverName: string
+  tools: McpToolInfo[]
+  clients: McpClientSeen[]
+  audit: McpAuditRow[]
+}
+
+async function mcpPost(path: string, body?: unknown): Promise<McpStatus | null> {
+  try {
+    const res = await apiFetch(path, {
+      method: 'POST',
+      headers: body === undefined ? undefined : { 'Content-Type': 'application/json' },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    })
+    if (!res.ok) throw new Error(`${res.status} ${res.statusText}`)
+    return (await res.json()) as McpStatus
+  } catch {
+    return null
+  }
+}
+
+/** Agent-access status; null when the backend is down or predates MCP. */
+export async function fetchMcpStatus(): Promise<McpStatus | null> {
+  try {
+    return await fetchJSON<McpStatus>('/api/mcp')
+  } catch {
+    return null
+  }
+}
+
+export function setMcpEnabled(enabled: boolean): Promise<McpStatus | null> {
+  return mcpPost('/api/mcp/settings', { enabled })
+}
+
+export function rotateMcpToken(): Promise<McpStatus | null> {
+  return mcpPost('/api/mcp/token/rotate')
 }

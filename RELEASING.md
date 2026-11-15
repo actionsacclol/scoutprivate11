@@ -121,20 +121,12 @@ false` in the workflow is the correct and sufficient way to build unsigned — i
 stops electron-builder hunting the keychain for a real identity while leaving
 ad-hoc signing intact.
 
-**2. macOS needs `libomp` for xgboost.** The xgboost PyPI wheel links against
-OpenMP, which Apple's toolchain doesn't ship. Without it `import xgboost`
-raises `Library not loaded: @rpath/libomp.dylib`, which takes down the nba/nfl
-engines and therefore the whole backend — pytest and the frozen `--selftest`
-both fail before packaging. Two halves to the fix, and you need both:
-
-- CI runs `brew install libomp` on the macOS runners (build-time).
-- `backend/krypt-scout-backend.spec` copies `libomp.dylib` into the bundle
-  (run-time) so users don't need Homebrew. It checks
-  `/opt/homebrew/opt/libomp/lib` then `/usr/local/opt/libomp/lib`, and prints a
-  loud warning if neither exists rather than silently shipping a broken app.
-
-Polybot's mac build doesn't hit this because it has no model stack — xgboost is
-specific to Krypt Scout.
+**2. (Retired) macOS no longer needs `libomp`.** It was only there for
+xgboost, whose wheel links against OpenMP. The xgboost overlays were removed
+(every engine is a ratings replay now), so the `brew install libomp` CI step
+and the spec's `libomp.dylib` copy are gone. If a compiled model stack ever
+comes back, both halves come back with it: without them `import xgboost` raises
+`Library not loaded: @rpath/libomp.dylib` and takes the whole backend down.
 
 ## These builds are unsigned
 

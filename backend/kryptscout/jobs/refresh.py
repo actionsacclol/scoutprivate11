@@ -1,4 +1,4 @@
-"""Refresh job — pull latest results and retrain/update every sport model.
+"""Refresh job — pull latest results and update every sport engine.
 
 Usage (from the backend directory):
 
@@ -6,9 +6,9 @@ Usage (from the backend directory):
 
 Runs each requested engine's refresh_data() sequentially (default: every
 registered engine), capturing "kryptscout" log output and timing each sport.
---force deletes the sport's MODELS_DIR pickle(s) first so engines with a
-pickle staleness check (nfl, nba today) retrain from scratch instead of
-reusing the cached model.
+--force deletes any MODELS_DIR pickle named after the sport first. No engine
+writes one today (the trained NBA/NFL overlays were retired in November
+2026), so it currently changes nothing; it stays for an engine that does.
 
 The same runner backs POST /api/models/{sport}/refresh (one sport, full log)
 and POST /api/jobs/refresh (all sports — the Electron scheduler's daily
@@ -67,8 +67,31 @@ def state_path(sport: Sport) -> Path:
 
 
 def sport_pickles(sport: Sport) -> list[Path]:
-    """MODELS_DIR pickles belonging to this sport (nfl_xgb_v3.pkl etc.)."""
+    """MODELS_DIR pickles named after this sport — none, for today's engines."""
     return sorted(config.MODELS_DIR.glob(f"{sport.value}*.pkl"))
+
+
+# Artifacts written by engines that no longer exist. MODELS_DIR lives in
+# userData on a packaged build, so these outlive the update that retired the
+# code which read them — and /api/models would go on listing a "model pickle"
+# for two engines that are pure Elo.
+RETIRED_ARTIFACT_GLOBS = ("nba_xgb_*.pkl", "nfl_xgb_*.pkl")
+
+
+def purge_retired_artifacts() -> list[str]:
+    """Delete leftover artifacts of retired engines; return the names removed.
+
+    Best-effort: a file that is locked or already gone is simply skipped.
+    """
+    removed: list[str] = []
+    for pattern in RETIRED_ARTIFACT_GLOBS:
+        for path in sorted(config.MODELS_DIR.glob(pattern)):
+            try:
+                path.unlink()
+            except OSError:
+                continue
+            removed.append(path.name)
+    return removed
 
 
 def file_summary(path: Path) -> dict:
@@ -161,8 +184,8 @@ async def refresh_sport(
 
     Raises KeyError when no engine is registered (the API maps that to 404).
     Engine exceptions never propagate: they come back as ok=False with the
-    traceback tail in `log`. `force_retrain` deletes the sport's MODELS_DIR
-    pickle(s) first, so pickle-staleness checks (nfl, nba) retrain.
+    traceback tail in `log`. `force_retrain` deletes any MODELS_DIR pickle
+    named after the sport first (no engine writes one today).
 
     Log capture attaches a temporary handler to the "kryptscout" logger —
     every engine logs on children of it — raising it to INFO for the
@@ -187,8 +210,8 @@ async def refresh_sport(
     started = time.perf_counter()
     ok = True
     try:
-        # refresh_data() does blocking work between awaits (pandas replays,
-        # xgboost fits), so it runs on its own event loop in a worker thread;
+        # refresh_data() does blocking work between awaits (pandas replays),
+        # so it runs on its own event loop in a worker thread;
         # wait_for caps how long the request can hang on it. (On timeout the
         # thread itself is orphaned, not killed — acceptable as a guard.)
         await asyncio.wait_for(

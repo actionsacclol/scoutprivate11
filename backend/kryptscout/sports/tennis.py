@@ -101,8 +101,21 @@ SURFACES = ("Hard", "Clay", "Grass")
 OVERALL_WEIGHT = 0.7
 SURFACE_WEIGHT = 0.3
 ELO_K = 32.0
-DATA_YEARS = range(2022, 2027)
+DATA_FROM_YEAR = 2022
 BACKTEST_FROM = 20250101  # tourney_date cutoff for validation metrics
+
+
+def data_years(today: Optional[date] = None) -> range:
+    """DATA_FROM_YEAR .. the current calendar year, inclusive.
+
+    This was the literal range(2022, 2027): on 1 January 2027 the engine
+    would have stopped reading new results for both tours.
+    """
+    today = today or datetime.now(timezone.utc).date()
+    return range(DATA_FROM_YEAR, today.year + 1)
+
+
+DATA_YEARS = data_years()
 
 RAW_TENNIS_DIR = RAW_DIR / "tennis"
 STATE_PATH = DATA_DIR / "tennis_state.json"
@@ -111,10 +124,17 @@ CSV_MAX_AGE_S = 24 * 3600  # current-year files only
 # --- ATP results (TennisMyLife, MIT) ---------------------------------------
 TML_YEAR_URL = "https://stats.tennismylife.org/data/{year}.csv"
 TML_ONGOING_URL = "https://stats.tennismylife.org/data/ongoing_tourneys.csv"
+# ATP Challenger results, same source / licence / layout (tourney_level "C").
+# They feed the ratings only: a player arriving at tour level from the
+# Challenger circuit then has a rating built on 2-3x more matches. Held out on
+# 2025-01..2026-11 tour-level matches this cut log loss 0.6302 -> 0.6208.
+TML_CHALLENGER_URL = "https://stats.tennismylife.org/data/{year}_challenger.csv"
+CHALLENGER_LEVEL = "C"
 
 # --- WTA results + closing odds (tennis-data.co.uk) -------------------------
 ODDS_DIR = RAW_TENNIS_DIR / "odds"
-ODDS_YEARS = (2025, 2026)  # ATP odds benchmark only — aligned with BACKTEST_FROM
+# ATP odds benchmark only — aligned with BACKTEST_FROM
+ODDS_YEARS = tuple(y for y in data_years() if y >= BACKTEST_FROM // 10000)
 # ATP lives at /{year}/{year}.xlsx, WTA at /{year}w/{year}.xlsx
 TENNIS_DATA_URL = "http://www.tennis-data.co.uk/{year}{suffix}/{year}.xlsx"
 _ODDS_TOUR_SUFFIX = {"ATP": "", "WTA": "w"}
@@ -397,8 +417,10 @@ async def download_tennis_data(tour: str, years: Iterable[int]) -> list[Path]:
                     resp = await client.get(url)
                     resp.raise_for_status()
                     path.write_bytes(resp.content)
-                except httpx.HTTPError:
-                    pass  # keep whatever cache we have
+                except httpx.HTTPError as exc:
+                    # keep whatever cache we have, but leave a trace: a feed
+                    # that refuses us freezes the ratings without any error
+                    logger.warning("tennis-data download failed (%s): %s", url, exc)
             if path.exists():
                 out.append(path)
     return out
@@ -549,7 +571,15 @@ class TennisEngine(SportEngine):
                 TML_YEAR_URL.format(year=year),
                 year >= current_year,
             )
-            for year in DATA_YEARS
+            for year in data_years()
+        ]
+        targets += [
+            (
+                RAW_TENNIS_DIR / f"tml_{year}_challenger.csv",
+                TML_CHALLENGER_URL.format(year=year),
+                year >= current_year,
+            )
+            for year in data_years()
         ]
         # Finished matches of tournaments still in progress; always volatile.
         targets.append((RAW_TENNIS_DIR / "tml_ongoing.csv", TML_ONGOING_URL, True))
@@ -566,8 +596,8 @@ class TennisEngine(SportEngine):
                         resp = await client.get(url)
                         resp.raise_for_status()
                         path.write_bytes(resp.content)
-                    except httpx.HTTPError:
-                        pass  # keep whatever cache we have
+                    except httpx.HTTPError as exc:
+                        logger.warning("TennisMyLife download failed (%s): %s", url, exc)
                 if path.exists():
                     out.append(path.read_bytes())
         return out
@@ -580,6 +610,7 @@ class TennisEngine(SportEngine):
         frames = []
         cols = [
             "tourney_id",
+            "tourney_level",
             "tourney_date",
             "match_num",
             "surface",
@@ -605,6 +636,14 @@ class TennisEngine(SportEngine):
             matches = matches.drop_duplicates(
                 subset=["tourney_id", "match_num"], keep="first"
             )
+        # Challenger rows move the ratings but are not part of the backtest
+        # (the metrics and the odds benchmark stay tour-level, as before).
+        if "tourney_level" in matches.columns:
+            matches["scored"] = (
+                matches["tourney_level"].astype(str).str.upper() != CHALLENGER_LEVEL
+            )
+        else:
+            matches["scored"] = True
         sort_cols = ["tourney_date"]
         if "match_num" in matches.columns:
             sort_cols.append("match_num")
@@ -638,6 +677,8 @@ class TennisEngine(SportEngine):
                     when = pd.Timestamp(row.Date)
                 except (TypeError, ValueError):
                     continue
+                if when > pd.Timestamp.now() + pd.Timedelta(days=2):
+                    continue  # mistyped date in the feed
                 winner = wta_rating_key(str(row.Winner))
                 loser = wta_rating_key(str(row.Loser))
                 if winner is None or loser is None or winner == loser:
@@ -687,7 +728,7 @@ class TennisEngine(SportEngine):
             except (TypeError, ValueError):
                 skipped += 1
                 continue
-            if tourney_date >= BACKTEST_FROM:
+            if tourney_date >= BACKTEST_FROM and bool(getattr(row, "scored", True)):
                 p = book.match_prob(winner, loser, surface)
                 n += 1
                 correct += p > 0.5
@@ -711,7 +752,7 @@ class TennisEngine(SportEngine):
     async def refresh_data(self) -> None:
         """Download latest results, rebuild ratings from scratch, persist."""
         atp_csvs = await self._download_atp_csvs()
-        wta_paths = await download_tennis_data("WTA", DATA_YEARS)
+        wta_paths = await download_tennis_data("WTA", data_years())
         self.books = {tour: _make_tour_book(tour) for tour in TOURS}
         self.backtest = {
             "ATP": self.replay("ATP", self._load_matches(atp_csvs)),

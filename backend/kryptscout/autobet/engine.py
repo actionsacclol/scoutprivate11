@@ -1,12 +1,29 @@
-"""Polymarket auto-betting engine — tails the bot's own value picks.
+"""Auto-betting engine — buys an exchange price that sits under the sharp fair.
 
-The bot already records a value pick per (game, model) as boards are
-captured (store/picks.py). This engine turns those picks into real CLOB
-orders on Polymarket, using the vendored krypt-polybot trading core
-(polymarket_auth / polymarket_api) for signing and submission and Scout's
-own game↔market matcher (odds/polymarket.resolve_market) to find the
-tradable market — the exact matcher the odds board trusts, so the engine
-can never bet a market the board wouldn't quote.
+WHAT IT BETS. For every upcoming game on the boards, on every exchange the
+user switched on (autobet/venues.py: Polymarket, Kalshi, Polymarket US), it
+asks one question: does this exchange sell a side for less than ANOTHER
+exchange says that side is worth, after this exchange's own fee? The
+reference is the sharp fair (core/fair.py) and it is never the venue's own
+quote — a venue cannot be cheap against itself. Tier STRONG means Kalshi set
+the reference, LEAN means Polymarket did (the same meaning the tiers carry on
+the boards). The candidate is then put through every money rule below.
+
+It needs no forecast and no model: the engines' own probabilities do not beat
+the close (measured, repeatedly) and are not read here.
+
+WHAT TO EXPECT. Exchanges are arbitraged against each other all day, so a gap
+that clears the fee and the EV floor is uncommon and most sweeps place
+nothing; `last_sweep.closest` shows how near the best price came. Crossing
+the spread has measured at roughly minus one to minus three percent on this
+kind of pick. The floor is what stands between that and a bet — dry run is the
+default, and stays the default.
+
+Until 2026-11 this tailed the recorded value picks, which since 2026-09-02
+are SPORTSBOOK prices: every one was skipped as `not_polymarket_priced` and
+the engine placed nothing at all. Order mechanics per venue live behind
+autobet/venues.py; game↔market matching is each venue's own odds-board
+matcher, so the engine can never bet a market the board wouldn't quote.
 
 Money rules (all enforced per sweep):
 
@@ -17,13 +34,10 @@ Money rules (all enforced per sweep):
                  FAK (fill-and-kill) at that cap — they cross whatever the
                  book offers at-or-better and the remainder is killed; a
                  zero fill is a clean skip, never a resting order.
-  model_prob     recovered from the recorded pick itself: the pick stores
-                 its price and EV, and EV = p·d − 1 (d = decimal price), so
-                 p = (1+EV)/d. No re-prediction — the engine bets exactly
-                 what the board showed. Since 2026-09-02 a pick's EV is at
-                 the SHARP FAIR (store/picks), so this is the exchange's
-                 probability, and only a Polymarket-priced pick is tradable
-                 here — none exists by construction (`not_polymarket_priced`).
+  model_prob     the reference exchange's fair probability for the side
+                 (historical column name: nothing here is a model). The EV a
+                 row carries is fair / ask − 1 at the venue's quoted ask,
+                 before fees; the limit price below is what nets the fee out.
   fees           the fee rate comes from the market's own Gamma feeSchedule
                  (live source of truth; falls back to SPORTS_TAKER_FEE_RATE)
                  and is persisted per row so grading survives rate changes.
@@ -45,8 +59,11 @@ Money rules (all enforced per sweep):
                  (today's realized loss), `stop_loss_usd` (lifetime loss),
                  `stop_profit_usd` (lifetime take-profit). A breached stop
                  halts the whole sweep before anything is scanned.
-  dedupe         one live/dry bet per GAME ever; failed attempts
-                 (error / unmatched) may retry up to MAX_ATTEMPTS.
+  dedupe         one live/dry bet per GAME ever, across every venue;
+                 failed attempts (error / unmatched) may retry up to
+                 MAX_ATTEMPTS. An order that was sent and never answered is
+                 recorded `unknown` and holds its game exactly like a placed
+                 one — it may be live on the exchange.
   daily cap      at most `max_bets_per_day` placed+dry rows per UTC day.
   best edge      `best_edge_only` ranks every eligible pick by EDGE (model
                  prob − market-implied prob) before a single order is
@@ -91,11 +108,16 @@ from typing import Any, Optional
 from kryptscout import license
 from kryptscout.autobet import polymarket_api as api
 from kryptscout.autobet import polymarket_auth as auth
+from kryptscout.autobet import venues as venues_mod
 from kryptscout.config import DATA_DIR
+from kryptscout.core import fair as fair_mod
 from kryptscout.core.oddsmath import american_to_decimal, prob_to_american
-from kryptscout.core.schemas import Game, Sport
+from kryptscout.core.schemas import Game, GameCard, Sport, is_in_play
+from kryptscout.jobs import capture as capture_job
 from kryptscout.odds import polymarket
+from kryptscout.sports import base as engines
 from kryptscout.store import db, tracker
+from kryptscout.store.picks import NO_VALUE_SPORTS
 
 logger = logging.getLogger("kryptscout")
 
@@ -150,7 +172,22 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "min_ev": 0.04,         # EV floor per $1 — also sets the limit price
     "min_win_prob": 0.0,    # skip picks the model rates below this (0 = off)
     "min_edge": 0.0,        # skip picks whose model_prob − market_prob < this (0 = off)
-    "tiers": ["STRONG"],    # which pick tiers to tail
+    # Which reference to trust: STRONG = the fair came from Kalshi,
+    # LEAN = from Polymarket (the weaker lead, measured). Both on: with only
+    # STRONG, Kalshi itself can never be bought (nothing to measure it against),
+    # and which reference to trust is the user's call on the AUTO-BET page.
+    "tiers": ["STRONG", "LEAN"],
+    # Exchanges the engine may buy on. Paper mode needs no account on any of
+    # them; live mode skips a venue that is not connected.
+    "venues": ["polymarket", "kalshi", "polymarket_us"],
+    # Kalshi keeps cash per exchange shard and game markets are not on the one
+    # a deposit lands on: let a live order move its own shortfall across.
+    "kalshi_auto_move": True,
+    # Bets asked for by a connected AI agent (autobet/agent.py). Independent of
+    # `enabled` / `dry_run` above: off | paper | live, with its own caps.
+    "agent_mode": "off",
+    "agent_max_usd": 10.0,
+    "agent_max_bets_per_day": 3,
     "sports": [],           # sport allowlist; empty = every sport
     "best_edge_only": False,  # rank the slate by edge; only the best get bet
     "max_bets_per_day": 5,  # placed+dry rows per UTC day
@@ -245,6 +282,11 @@ def _sanitize(raw: dict, base: Optional[dict] = None) -> dict[str, Any]:
     _num("daily_stop_profit_usd", 0.0, 1_000_000.0)
     _num("stop_loss_usd", 0.0, 1_000_000.0)
     _num("stop_profit_usd", 0.0, 1_000_000.0)
+    _num("agent_max_usd", 1.0, 1000.0)
+    _num("agent_max_bets_per_day", 1, 50)
+    out["agent_max_bets_per_day"] = int(out["agent_max_bets_per_day"])
+    if raw.get("agent_mode") in ("off", "paper", "live"):
+        out["agent_mode"] = raw["agent_mode"]
     out["max_bets_per_day"] = int(out["max_bets_per_day"])
     out["lead_minutes"] = int(out["lead_minutes"])
     out["max_days_ahead"] = int(out["max_days_ahead"])
@@ -258,6 +300,13 @@ def _sanitize(raw: dict, base: Optional[dict] = None) -> dict[str, Any]:
     # this knob can't silently flip it. Present = strict bool.
     if "best_edge_only" in raw:
         out["best_edge_only"] = raw["best_edge_only"] is True
+    if "kalshi_auto_move" in raw:
+        out["kalshi_auto_move"] = raw["kalshi_auto_move"] is not False
+    wanted_venues = raw.get("venues")
+    if isinstance(wanted_venues, list):
+        chosen = [v for v in venues_mod.VENUE_KEYS if v in wanted_venues]
+        if chosen:  # an empty list would mean "bet nowhere": keep what was saved
+            out["venues"] = chosen
     tiers = raw.get("tiers")
     if isinstance(tiers, list):
         wanted = [t for t in ("STRONG", "LEAN") if t in tiers]
@@ -274,9 +323,15 @@ def _sanitize(raw: dict, base: Optional[dict] = None) -> dict[str, Any]:
 
 def load_settings() -> dict[str, Any]:
     try:
-        return _sanitize(json.loads(SETTINGS_FILE.read_text(encoding="utf-8")))
+        raw = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return dict(DEFAULT_SETTINGS)
+    # A file with no "venues" predates the multi-exchange rule. Its "tiers"
+    # were value-pick tiers (a different thing with the same names), so they
+    # are not a choice about references: take the current default instead.
+    if isinstance(raw, dict) and "venues" not in raw:
+        raw = {k: v for k, v in raw.items() if k != "tiers"}
+    return _sanitize(raw)
 
 
 def save_settings(patch: dict) -> dict[str, Any]:
@@ -297,19 +352,11 @@ PROFILES_FILE = DATA_DIR / "autobet_profiles.json"
 # Built-in strategies (read-only). Each is a full STRATEGY_KEYS patch; applying
 # one leaves enabled/dry_run untouched, so a preset tunes rules, never arms.
 PRESETS: dict[str, dict[str, Any]] = {
-    # The one configuration that survived out-of-sample validation on the
-    # backfilled 2024-2026 Polymarket history (2026-07): thin-market WNBA
-    # only, high floors, entries near kickoff, exactly as validated.
-    "Validated WNBA": {
-        "stake_mode": "fixed", "stake_usd": 10.0,
-        "min_ev": 0.08, "min_win_prob": 0.0, "min_edge": 0.08,
-        "tiers": ["STRONG", "LEAN"], "sports": ["wnba"],
-        "best_edge_only": False,
-        "max_bets_per_day": 5, "max_prob": 0.85,
-        "lead_minutes": 15, "max_days_ahead": 1, "max_hours_ahead": 6,
-        "daily_stop_loss_usd": 0.0, "daily_stop_profit_usd": 0.0,
-        "stop_loss_usd": 0.0, "stop_profit_usd": 0.0,
-    },
+    # None of these is a validated strategy: they are starting points for the
+    # floors and caps, and none has a positive measured record. (The old
+    # "Validated WNBA" preset was fitted to the engines' own probabilities,
+    # which this engine no longer reads; it was removed with them.)
+    #
     # Only the sharpest few plays on the board each day. The whole slate is
     # ranked by edge and the tiny cap funds the top of it — the tight hours
     # window keeps every sweep looking at one comparable slate, which is what
@@ -437,12 +484,17 @@ def apply_strategy(name: str) -> dict[str, Any]:
 # -------------------------------------------------------------------- status
 
 
-def _today_counts(conn, day: date) -> dict[str, Any]:
+def _today_counts(conn, day: date, rules_only: bool = False) -> dict[str, Any]:
+    """Today's attempts by status. `rules_only` leaves out bets an AI agent
+    asked for (autobet/agent.py): those have their own daily allowance, so
+    they must not use up the rule engine's."""
     rows = db.rows(
         conn,
-        """
+        f"""
         SELECT status, COUNT(*) AS n, COALESCE(SUM(usd), 0) AS usd
-        FROM auto_bets WHERE date(created_at) = ? GROUP BY status
+        FROM auto_bets WHERE date(created_at) = ?
+        {"AND COALESCE(tier, '') != 'AGENT'" if rules_only else ""}
+        GROUP BY status
         """,
         (day.isoformat(),),
     )
@@ -452,6 +504,7 @@ def _today_counts(conn, day: date) -> dict[str, Any]:
         "dry": by_status.get("dry", 0),
         "unmatched": by_status.get("unmatched", 0),
         "errors": by_status.get("error", 0),
+        "unknown": by_status.get("unknown", 0),
         "spent_usd": sum(
             r["usd"] for r in rows if r["status"] == "placed"
         ),
@@ -477,10 +530,14 @@ def _grade_settled(r: dict) -> tuple[str, float]:
     q = float(r["fill_prob"] if filled else (r["limit_prob"] or 0.5))
     usd = round(shares * q, 2) if filled else r["usd"]
     result = tracker._result_for_side(r)
-    rate = r["fee_rate"] if r["fee_rate"] is not None else (
-        0.05 if r["created_at"][:10] >= "2026-07-10" else 0.03
-    )
-    fee = shares * rate * q * (1.0 - q)
+    venue = venues_mod.get(r.get("venue"))
+    if r["fee_rate"] is not None:
+        rate = r["fee_rate"]
+    elif venue.key != venues_mod.LEGACY_VENUE:
+        rate = venue.fallback_fee_rate
+    else:
+        rate = 0.05 if r["created_at"][:10] >= "2026-07-10" else 0.03
+    fee = venue.fee_usd(shares, q, rate)
     pnl = (shares - usd - fee) if result == "W" else (
         -usd - fee if result == "L" else 0.0
     )
@@ -498,7 +555,7 @@ def realized_pnl(conn) -> dict:
         conn,
         """
         SELECT a.usd, a.shares, a.side, a.created_at, a.limit_prob,
-               a.fill_shares, a.fill_prob, a.fee_rate,
+               a.fill_shares, a.fill_prob, a.fee_rate, a.venue,
                g.sport, g.completed, g.home_score, g.away_score, g.settled_at
         FROM auto_bets a
         JOIN games g ON g.game_id = a.game_id
@@ -557,6 +614,7 @@ def get_status() -> dict:
     return {
         "settings": settings,
         "wallet": wallet,
+        "venues": venues_mod.status(),
         "today": today,
         "pnl": pnl,
         "stopped": _stop_reason(settings, pnl),
@@ -670,6 +728,7 @@ def recent_log(limit: int = 50) -> list[dict]:
     finally:
         conn.close()
     for r in attempts:
+        r["venue"] = r.get("venue") or venues_mod.LEGACY_VENUE
         graded = r["status"] in ("placed", "dry") and r["settled_at"] is not None
         result, pnl = _grade_settled(r) if graded else (None, None)
         r["result"] = result
@@ -801,9 +860,12 @@ def _paper_fill_prob(book: dict, shares: int, limit_prob: float) -> float:
     return ask / 100.0 if isinstance(ask, (int, float)) else limit_prob
 
 
-def _fee_rate_from_meta(meta: Optional[dict]) -> float:
-    """The taker-fee rate to gate EV with, from the market's OWN Gamma
-    feeSchedule (see polymarket_api._fee_schedule_from_gamma).
+def _fee_rate_from_meta(meta: Optional[dict],
+                        fallback: float = SPORTS_TAKER_FEE_RATE) -> float:
+    """The taker-fee rate to gate EV with, from the market's OWN fee schedule
+    (Polymarket: Gamma feeSchedule, see polymarket_api._fee_schedule_from_gamma;
+    Kalshi: the series' fee multiplier; Polymarket US: feeCoefficient).
+    `fallback` is the venue's standing rate.
 
     Only an affirmative schedule is trusted: enabled with exponent 1 → its
     rate; explicitly fee-free → 0. Anything else (missing, unparseable,
@@ -812,7 +874,7 @@ def _fee_rate_from_meta(meta: Optional[dict]) -> float:
     must never silently drop the fee cushion."""
     schedule = (meta or {}).get("fee_schedule")
     if not isinstance(schedule, dict):
-        return SPORTS_TAKER_FEE_RATE
+        return fallback
     if schedule.get("enabled") is False:
         return 0.0
     rate = schedule.get("rate")
@@ -821,16 +883,16 @@ def _fee_rate_from_meta(meta: Optional[dict]) -> float:
         if (schedule.get("enabled") and isinstance(rate, (int, float))
                 and float(exponent) == 1.0 and 0.0 <= float(rate) <= 0.5):
             rate = float(rate)
-            if abs(rate - SPORTS_TAKER_FEE_RATE) > 1e-9:
+            if abs(rate - fallback) > 1e-9:
                 logger.warning(
-                    "live fee schedule rate %.3f differs from the "
-                    "SPORTS_TAKER_FEE_RATE constant %.3f — constant is stale",
-                    rate, SPORTS_TAKER_FEE_RATE,
+                    "live fee schedule rate %.3f differs from the standing "
+                    "rate %.3f — the constant is stale",
+                    rate, fallback,
                 )
             return rate
     except (TypeError, ValueError):
         pass
-    return SPORTS_TAKER_FEE_RATE
+    return fallback
 
 
 def _observe_book(conn, row: dict, ref, book: Optional[dict],
@@ -861,7 +923,7 @@ def _observe_book(conn, row: dict, ref, book: Optional[dict],
 
 
 async def _reconcile_fill(
-    conn, bet_id: int, order_id: str
+    conn, bet_id: int, order_id: str, venue_key: Optional[str] = None
 ) -> Optional[tuple[float, float]]:
     """Read the CLOB trades feed for one placed order and persist the REAL
     fill (total shares + share-weighted avg price). Without this, a partial
@@ -873,21 +935,31 @@ async def _reconcile_fill(
     invents a share of P&L on every partial. SQLite's INTEGER affinity keeps
     a non-integral value as REAL, so no migration is needed."""
     try:
-        fills = await api.get_fills_for_order(order_id)
+        fill = await venues_mod.get(venue_key).fill(order_id)
     except Exception as exc:  # noqa: BLE001 — reconcile is best-effort
         logger.debug("fill reconcile failed for %s: %s", order_id, exc)
         return None
-    total = sum(float(f.get("count_fp") or 0.0) for f in fills)
-    if total <= 0:
+    if fill is None:
         return None
-    avg = sum(
-        float(f.get("count_fp") or 0.0) * float(f.get("yes_price_dollars") or 0.0)
-        for f in fills
-    ) / total
-    shares, prob = round(total, 4), round(avg, 4)
+    if fill[0] <= 0:
+        # The exchange says the order ended with nothing filled: there is no
+        # bet. Release the game instead of grading a position that never was.
+        with conn:
+            conn.execute(
+                "UPDATE auto_bets SET status = 'unmatched', error = ? WHERE id = ?",
+                ("The exchange ended this order with nothing filled.", bet_id),
+            )
+        return None
+    shares, prob = round(fill[0], 4), round(fill[1], 4)
     with conn:
         db.set_auto_bet_fill(conn, bet_id, shares, prob)
     return shares, prob
+
+
+# On a placed row whose exchange accepted the order without saying how it
+# ended. The row holds its game and its slot; MY BETS hears about it only once
+# the fill is confirmed.
+PENDING_NOTE = "awaiting fill confirmation"
 
 
 async def _reconcile_pending_fills(conn, limit: int = 10) -> None:
@@ -898,7 +970,8 @@ async def _reconcile_pending_fills(conn, limit: int = 10) -> None:
     pending = db.rows(
         conn,
         """
-        SELECT id, order_id, created_at FROM auto_bets
+        SELECT id, order_id, created_at, venue, error, game_id, side, limit_prob
+        FROM auto_bets
         WHERE status = 'placed' AND order_id IS NOT NULL
           AND fill_shares IS NULL
         ORDER BY id DESC LIMIT ?
@@ -908,7 +981,14 @@ async def _reconcile_pending_fills(conn, limit: int = 10) -> None:
     for r in pending:
         if r["created_at"] < cutoff:
             continue
-        await _reconcile_fill(conn, r["id"], r["order_id"])
+        if not venues_mod.get(r["venue"]).connected():
+            continue
+        fill = await _reconcile_fill(conn, r["id"], r["order_id"], r["venue"])
+        if fill is not None and r["error"] == PENDING_NOTE:
+            with conn:
+                conn.execute("UPDATE auto_bets SET error = NULL WHERE id = ?", (r["id"],))
+            _log_to_tracker(r, int(round(float(r["limit_prob"]) * 100)),
+                            round(fill[0] * fill[1], 2), load_settings())
 
 
 def _attempts(conn, game_id: str, side: str) -> tuple[int, bool]:
@@ -928,7 +1008,7 @@ def _attempts(conn, game_id: str, side: str) -> tuple[int, bool]:
         "SELECT side, status FROM auto_bets WHERE game_id = ?",
         (game_id,),
     )
-    committed = any(r["status"] in ("placed", "dry") for r in rows)
+    committed = any(r["status"] in ("placed", "dry", "unknown") for r in rows)
     attempts = sum(1 for r in rows if r["side"] == side)
     return attempts, committed
 
@@ -951,6 +1031,8 @@ def _record(conn, row: dict, ref, *, limit_prob: float, shares: int, usd: float,
             best_ask_cents: Optional[int] = None,
             book_depth: Optional[float] = None,
             fee_rate: Optional[float] = None) -> int:
+    venue = (ref.venue if ref is not None and getattr(ref, "venue", None)
+             else row.get("venue") or venues_mod.LEGACY_VENUE)
     with conn:
         return db.insert_auto_bet(
             conn,
@@ -963,12 +1045,167 @@ def _record(conn, row: dict, ref, *, limit_prob: float, shares: int, usd: float,
             limit_prob=limit_prob, shares=shares, usd=usd,
             order_id=order_id, status=status, error=error, created_at=now,
             best_ask_cents=best_ask_cents, book_depth=book_depth,
-            fee_rate=fee_rate,
+            fee_rate=fee_rate, venue=venue, ref_book=row.get("ref_book"),
         )
 
 
+# ----------------------------------------------------------------- candidates
+
+# A captured board younger than this is priced as-is; older, the sweep builds
+# its own. The scheduler captures first and sweeps right behind it.
+CARD_MAX_AGE_S = 240.0
+# Polymarket US is not an odds source on the boards, so pricing it costs one
+# search per game (cached ten minutes). Soonest games first, and no more than
+# this many a sweep: a full Saturday of college games must not turn a sweep
+# into several hundred requests.
+PMUS_MAX_LOOKUPS = 80
+CLOSEST_SHOWN = 6
+
+
+async def _load_cards(sports: list[Sport]) -> list[GameCard]:
+    """The current boards for these sports — the last capture's when fresh."""
+    cards: list[GameCard] = []
+    for sport in sports:
+        board = capture_job.recent_cards(sport, CARD_MAX_AGE_S)
+        if board is None:
+            try:
+                board = await capture_job.build_cards(sport, True)
+            except Exception as exc:  # noqa: BLE001 — one sport must not sink the sweep
+                logger.warning("autobet: could not build the %s board: %s", sport.value, exc)
+                continue
+        cards.extend(board)
+    return cards
+
+
+def _reference(card: GameCard, venue) -> Optional[tuple[str, dict[str, float], bool]]:
+    """(reference exchange, fair probability per side, thin?) for pricing
+    `venue` on this game — never the venue's own quote. None when no OTHER
+    exchange prices the game."""
+    fair = card.fair
+    if fair is None or not fair.sharp:
+        return None
+    if fair.source != venue.book:
+        probs = {"home": fair.home, "away": fair.away}
+        if fair.draw is not None:
+            probs["draw"] = fair.draw
+        return fair.source, probs, bool(fair.thin)
+    if fair.draw is not None:
+        return None  # `sources` carries the home side only; a 3-way needs all three
+    for book in fair_mod.REFERENCE_ORDER:
+        if book in fair_mod.EXCHANGES and book != venue.book and book in fair.sources:
+            home = float(fair.sources[book])
+            quote = next((q for q in card.odds if q.book == book), None)
+            thin = quote is None or fair_mod.is_thin(quote)
+            return book, {"home": home, "away": 1.0 - home}, thin
+    return None
+
+
+def _net_ev(fair_prob: float, ask: float, fee_rate: float) -> float:
+    """Per $1 staked at price `ask`: fair/ask − 1 − fee_rate·(1 − ask)."""
+    return fair_prob / ask - 1.0 - fee_rate * (1.0 - ask)
+
+
+async def _scan(now: datetime, settings: dict, lead: timedelta, horizon: timedelta,
+                skip, summary: dict) -> list[dict]:
+    """Every (game, side, venue) an enabled exchange quotes against another
+    exchange's fair, as rows the eligibility pass reads. No order is priced
+    and nothing is written here."""
+    wanted = [venues_mod.VENUES[key] for key in settings["venues"] if key in venues_mod.VENUES]
+    allow = set(settings["sports"])
+    sports = [
+        engine.sport for engine in engines.all_engines()
+        if engine.sport.value not in NO_VALUE_SPORTS
+        and (not allow or engine.sport.value in allow)
+    ]
+    cards = sorted(await _load_cards(sports), key=lambda c: c.game.start_time)
+    scan = {"games": 0, "with_reference": 0, "quotes": {v.key: 0 for v in wanted}}
+    rows: list[dict] = []
+    lookups = 0
+    for card in cards:
+        game = card.game
+        if getattr(game, "completed", False):
+            continue
+        # Out-of-window games still become rows where the board already
+        # carries the quote (the eligibility pass reports them as
+        # out_of_window); they are never worth a network lookup.
+        in_window = now + lead < game.start_time <= now + horizon
+        if in_window:
+            scan["games"] += 1
+        priced = False
+        for venue in wanted:
+            ref = _reference(card, venue)
+            if ref is None:
+                continue
+            ref_book, probs, thin = ref
+            priced = True
+            tier = "STRONG" if ref_book == "kalshi" else "LEAN"
+            quote = None
+            if venue.book is not None:
+                quote = next(
+                    (q for q in card.odds
+                     if q.book == venue.book and not is_in_play(q, game.start_time)),
+                    None,
+                )
+                if quote is None:
+                    continue
+            elif not in_window:
+                continue
+            elif lookups >= PMUS_MAX_LOOKUPS:
+                skip("lookup_budget")
+                continue
+            for side, fair_prob in probs.items():
+                market = None
+                if quote is not None:
+                    price = getattr(quote, f"{side}_ml")
+                    ask = _implied_prob(price) if price is not None else None
+                else:
+                    if side == "home":
+                        lookups += 1
+                    try:
+                        market = await venue.resolve(game.sport, game, side)
+                    except Exception as exc:  # noqa: BLE001 — discovery is best-effort
+                        logger.debug("autobet: %s lookup failed: %s", venue.key, exc)
+                        market = None
+                    ask = market.prob if market is not None else None
+                    price = prob_to_american(ask) if ask is not None and 0.0 < ask < 1.0 else None
+                if ask is None or price is None or not (0.0 < ask < 1.0):
+                    continue
+                scan["quotes"][venue.key] += 1
+                rows.append({
+                    "game_id": game.id, "sport": game.sport.value,
+                    "league": game.league or "", "kickoff": game.start_time.isoformat(),
+                    "home": game.home, "away": game.away, "side": side,
+                    "team": game.home if side == "home" else game.away if side == "away" else "Draw",
+                    "tier": tier, "model": f"sharp-fair:{ref_book}",
+                    "book": venue.key, "venue": venue.key, "ref_book": ref_book,
+                    "price": int(price), "ask": ask, "fair_prob": float(fair_prob),
+                    "ev": float(fair_prob) / ask - 1.0,
+                    "net_ev": _net_ev(float(fair_prob), ask, venue.fallback_fee_rate),
+                    "thin_reference": thin, "_market": market,
+                })
+        if priced and in_window:
+            scan["with_reference"] += 1
+    # The order the money pass walks when it is not ranking by edge: the
+    # stronger reference first, then the bigger gap.
+    rows.sort(key=lambda r: (r["tier"] != "STRONG", -r["ev"]))
+    summary["scan"] = scan
+    summary["closest"] = [
+        {
+            "game_id": r["game_id"], "sport": r["sport"], "team": r["team"],
+            "venue": r["venue"], "ref_book": r["ref_book"], "tier": r["tier"],
+            "ask": round(r["ask"], 4), "fair_prob": round(r["fair_prob"], 4),
+            "net_ev": round(r["net_ev"], 4), "kickoff": r["kickoff"],
+        }
+        for r in sorted(
+            (r for r in rows if not r["thin_reference"] and r["tier"] in settings["tiers"]),
+            key=lambda r: r["net_ev"], reverse=True,
+        )[:CLOSEST_SHOWN]
+    ]
+    return rows
+
+
 async def sweep(force: bool = False) -> dict:
-    """One pass over the current picks: place (or dry-run) qualifying bets.
+    """One pass over the current boards: place (or dry-run) qualifying bets.
 
     Runs after every capture when `enabled`; `force=True` (the RUN NOW
     button) runs even while disabled but still honors dry_run and every
@@ -985,10 +1222,11 @@ async def sweep(force: bool = False) -> dict:
         skipped = ", ".join(f"{k}×{v}" for k, v in summary.get("skipped", {}).items())
         logger.info(
             "autobet sweep done [%s]: scanned=%s placed=%s dry=%s unmatched=%s "
-            "errors=%s%s",
+            "errors=%s unknown=%s%s",
             mode, summary.get("scanned", 0), summary.get("placed", 0),
             summary.get("dry", 0), summary.get("unmatched", 0),
-            summary.get("errors", 0), f" skipped: {skipped}" if skipped else "",
+            summary.get("errors", 0), summary.get("unknown", 0),
+            f" skipped: {skipped}" if skipped else "",
         )
         return summary
 
@@ -998,7 +1236,8 @@ async def _sweep_locked(force: bool) -> dict:
     settings = load_settings()
     summary: dict[str, Any] = {
         "at": now.isoformat(), "scanned": 0, "placed": 0, "dry": 0,
-        "unmatched": 0, "errors": 0, "skipped": {}, "dry_run": settings["dry_run"],
+        "unmatched": 0, "errors": 0, "unknown": 0, "skipped": {},
+        "dry_run": settings["dry_run"],
     }
 
     def skip(reason: str) -> None:
@@ -1007,10 +1246,14 @@ async def _sweep_locked(force: bool) -> dict:
     if not settings["enabled"] and not force:
         summary["skipped"]["disabled"] = 1
         return summary
-    if not settings["dry_run"] and not auth.credentials_present():
-        logger.warning("autobet sweep skipped: live mode but no wallet configured")
+    live_venues = [
+        key for key in settings["venues"] if venues_mod.get(key).connected()
+    ]
+    if not settings["dry_run"] and not live_venues:
+        logger.warning("autobet sweep skipped: live mode but no exchange account is connected")
         summary["skipped"]["no_wallet"] = 1
         return summary
+    venues_mod.VENUES["kalshi"].auto_move_funds = bool(settings["kalshi_auto_move"])
     # LICENSE GATE — live betting requires an active Krypt Scout license.
     # FUNDS-SAFETY CARVE-OUT: this gates ONLY the placing of new live orders.
     # Dry-run sweeps, the board, MY BETS, and settlement are never gated, so a
@@ -1025,26 +1268,20 @@ async def _sweep_locked(force: bool) -> dict:
         summary["skipped"]["unlicensed"] = 1
         return summary
     logger.info(
-        "autobet sweep start [%s]%s: tiers=%s stake_mode=%s min_ev=%.3f "
+        "autobet sweep start [%s]%s: venues=%s tiers=%s stake_mode=%s min_ev=%.3f "
         "max/day=%s window=%s..%sd",
         "live" if not settings["dry_run"] else "dry-run",
         " (forced RUN NOW)" if force else "",
+        ",".join(settings["venues"]),
         ",".join(settings["tiers"]), settings["stake_mode"], settings["min_ev"],
         settings["max_bets_per_day"], settings["lead_minutes"] / 60.0,
         settings["max_days_ahead"],
     )
 
-    # Scan every UTC slate inside the max_days_ahead window (the +1 covers
-    # evening US games crossing UTC midnight), then gate on actual start
-    # time — boards record day-ahead picks, and users cap how far out the
-    # engine may commit money (odds that far ahead are stale by kickoff).
+    # Users cap how far out the engine may commit money (prices that far
+    # ahead are stale by kickoff); the scan below gates on actual start time.
     today = now.date()
     days_ahead = int(settings["max_days_ahead"])
-    picks: list[dict] = []
-    for offset in range(days_ahead + 2):
-        picks += tracker.list_picks(
-            on=today + timedelta(days=offset), tiers=settings["tiers"]
-        )
     lead = timedelta(minutes=settings["lead_minutes"])
     # max_hours_ahead tightens the window to an hours horizon when set (>0);
     # otherwise the day-granularity max_days_ahead applies.
@@ -1055,7 +1292,7 @@ async def _sweep_locked(force: bool) -> dict:
     try:
         # Reconcile lagging fills FIRST so the stops below grade on the real
         # numbers, not the intended-shares assumption.
-        if auth.credentials_present():
+        if live_venues:
             try:
                 await _reconcile_pending_fills(conn)
             except Exception:  # noqa: BLE001 — advisory, never blocks a sweep
@@ -1083,24 +1320,31 @@ async def _sweep_locked(force: bool) -> dict:
         # stake_pct_max by the pick's model_prob, so the actual $ is
         # resolved per pick inside the loop.
         mode = settings["stake_mode"]
-        cash_usd = 0.0
-        if mode in ("percent", "confidence", "kelly"):
-            try:
-                balance = await api.get_balance()
-                cash_usd = float(balance.get("balance") or 0) / 100.0
-            except Exception as exc:  # noqa: BLE001 — no balance, no sizing
-                if settings["dry_run"]:
-                    cash_usd = PAPER_BANKROLL_USD
-                    logger.info(
-                        "autobet: balance unavailable (%s) — dry run sizing "
-                        "against $%.0f paper bankroll", exc, cash_usd,
-                    )
-                else:
-                    logger.warning("autobet: balance read failed: %s", exc)
-                    summary["skipped"]["no_balance"] = 1
-                    return summary
+        # Cash per venue, read once per sweep and only for a venue an order is
+        # about to be sized on. None = unreadable in live mode.
+        cash: dict[str, Optional[float]] = {}
 
-        def stake_for(model_prob: float, limit_prob: float = 0.5) -> float:
+        async def cash_for(venue) -> Optional[float]:
+            if mode == "fixed":
+                return 0.0
+            if venue.key not in cash:
+                try:
+                    cash[venue.key] = float(await venue.balance_usd())
+                except Exception as exc:  # noqa: BLE001 — no balance, no sizing
+                    if settings["dry_run"]:
+                        cash[venue.key] = PAPER_BANKROLL_USD
+                        logger.info(
+                            "autobet: %s balance unavailable (%s) — dry run sizing "
+                            "against $%.0f paper bankroll",
+                            venue.label, exc, PAPER_BANKROLL_USD,
+                        )
+                    else:
+                        logger.warning("autobet: %s balance read failed: %s", venue.label, exc)
+                        cash[venue.key] = None
+            return cash[venue.key]
+
+        def stake_for(model_prob: float, limit_prob: float = 0.5,
+                      cash_usd: float = PAPER_BANKROLL_USD) -> float:
             if mode == "fixed":
                 return float(settings["stake_usd"])
             if mode == "percent":
@@ -1114,11 +1358,22 @@ async def _sweep_locked(force: bool) -> dict:
             )
             return round(cash_usd * pct / 100.0, 2)
 
-        # A representative stake for the summary (confidence varies per pick).
-        summary["stake_usd"] = stake_for(0.75, 0.65)
+        # A representative stake for the summary (confidence varies per pick):
+        # against the first enabled venue's cash, the paper bankroll if unread.
+        first_cash = None
+        if mode != "fixed" and settings["venues"]:
+            first_cash = await cash_for(venues_mod.get(settings["venues"][0]))
+            if first_cash is None and len(settings["venues"]) == 1:
+                summary["skipped"]["no_balance"] = 1
+                return summary
+        summary["stake_usd"] = stake_for(
+            0.75, 0.65, first_cash if first_cash is not None else PAPER_BANKROLL_USD)
 
-        placed_today = _today_counts(conn, today)
-        budget = settings["max_bets_per_day"] - placed_today["placed"] - placed_today["dry"]
+        placed_today = _today_counts(conn, today, rules_only=True)
+        budget = (settings["max_bets_per_day"] - placed_today["placed"]
+                  - placed_today["dry"] - placed_today["unknown"])
+
+        picks = await _scan(now, settings, lead, horizon, skip, summary)
 
         # Pass 1 — eligibility. Every gate here is local arithmetic, so the
         # whole slate can be scored before a single order is priced; that is
@@ -1132,10 +1387,13 @@ async def _sweep_locked(force: bool) -> dict:
             if settings["sports"] and row["sport"] not in settings["sports"]:
                 skip("sport_filtered")
                 continue
-            # Consensus picks have no model information — their "edge" is
-            # book disagreement; never money-worthy.
-            if row.get("model") == "market-consensus":
-                skip("consensus_pick")
+            if row["tier"] not in settings["tiers"]:
+                skip("tier_filtered")
+                continue
+            # A reference with nobody quoting it (thin touch, wide spread) is
+            # a stale number, and a gap against a stale number is not a price.
+            if row.get("thin_reference"):
+                skip("thin_reference")
                 continue
             if row.get("ev") is None or row.get("price") is None:
                 skip("no_price")
@@ -1145,20 +1403,15 @@ async def _sweep_locked(force: bool) -> dict:
             if float(row["ev"]) > MAX_CLAIMED_EV:
                 skip("ev_implausible")
                 continue
-            if float(row["ev"]) < settings["min_ev"]:
+            if float(row["ev"]) < settings["min_ev"] - 1e-9:
                 skip("below_min_ev")
                 continue
             start = datetime.fromisoformat(row["kickoff"])
             if start <= now + lead or start > now + horizon:
                 skip("out_of_window")
                 continue
-            # Value picks are priced against the exchanges (2026-09-02): a
-            # pick lives at a SPORTSBOOK price that beats the Kalshi fair, so
-            # tailing it on Polymarket buys the reference, not the edge. Only
-            # a Polymarket-priced pick is tradable here, and by construction
-            # there are none — autobet idles until a maker mode exists.
-            if row.get("book") != "polymarket":
-                skip("not_polymarket_priced")
+            if not settings["dry_run"] and not venues_mod.get(row.get("venue")).connected():
+                skip("venue_not_connected")
                 continue
             attempts, committed = _attempts(conn, row["game_id"], row["side"])
             if committed:
@@ -1167,8 +1420,8 @@ async def _sweep_locked(force: bool) -> dict:
             if attempts >= MAX_ATTEMPTS:
                 skip("max_attempts")
                 continue
-            model_prob = _model_prob(row["price"], row["ev"])
-            if model_prob is None:
+            model_prob = row.get("fair_prob") or _model_prob(row["price"], row["ev"])
+            if model_prob is None or not (0.0 < model_prob < 1.0):
                 skip("bad_pick_math")
                 continue
             if settings["min_win_prob"] > 0 and model_prob < settings["min_win_prob"]:
@@ -1227,9 +1480,16 @@ async def _sweep_locked(force: bool) -> dict:
             # Resolve the tradable market BEFORE pricing: the limit price and
             # the depth gate both need the market's own metadata (fee
             # schedule, live book), not just the recorded pick.
-            ref = await polymarket.resolve_market(
-                Sport(row["sport"]), _pick_game(row), row["side"]
-            )
+            venue = venues_mod.get(row.get("venue"))
+            ref = row.get("_market")
+            if ref is None:
+                try:
+                    ref = await venue.resolve(
+                        Sport(row["sport"]), _pick_game(row), row["side"]
+                    )
+                except Exception as exc:  # noqa: BLE001 — discovery is best-effort
+                    logger.debug("autobet: %s resolve failed: %s", venue.key, exc)
+                    ref = None
             if ref is None:
                 skip("no_market")
                 continue
@@ -1244,17 +1504,21 @@ async def _sweep_locked(force: bool) -> dict:
 
             # EV-floor limit price at the market's OWN taker-fee rate.
             try:
-                meta = await api.get_market_meta(ref.condition_id)
+                meta = await venue.meta(ref)
             except Exception:  # noqa: BLE001 — fee falls back to the constant
                 meta = None
-            fee_rate = _fee_rate_from_meta(meta)
+            fee_rate = _fee_rate_from_meta(meta, venue.fallback_fee_rate)
             cents = _limit_cents(model_prob, settings["min_ev"],
                                  settings["max_prob"], fee_rate=fee_rate)
             if cents is None:
                 skip("price_out_of_range")
                 continue
             limit_prob = cents / 100.0
-            stake_usd = stake_for(model_prob, limit_prob)
+            cash_usd = await cash_for(venue)
+            if cash_usd is None:
+                skip("no_balance")
+                continue
+            stake_usd = stake_for(model_prob, limit_prob, cash_usd)
             if stake_usd < 1.0:
                 skip("stake_too_small")
                 continue
@@ -1269,7 +1533,7 @@ async def _sweep_locked(force: bool) -> dict:
             # backtest's fill model); fail-open on a book-fetch hiccup — the
             # FAK price cap remains the real safety mechanism.
             try:
-                book = await api.ask_depth(ref.condition_id, ref.clob_side, cents)
+                book = await venue.ask_depth(ref, cents)
             except Exception:  # noqa: BLE001
                 book = None
             _observe_book(conn, row, ref, book, cents, now)
@@ -1315,30 +1579,51 @@ async def _sweep_locked(force: bool) -> dict:
                 summary["dry"] += 1
                 budget -= 1
                 if mode != "fixed":
-                    cash_usd = max(cash_usd - usd, 0.0)
+                    cash[venue.key] = max(cash_usd - usd, 0.0)
                 continue
 
+            # The regulated venues require a price collar on automated orders,
+            # and the book read is the collar: no book, no order.
+            if book is None and venue.live_needs_book:
+                skip("no_book")
+                continue
             try:
-                result = await api.place_limit_order(
-                    ticker=ref.condition_id,
-                    side=ref.clob_side,
-                    action="buy",
-                    count=shares,
-                    price_cents=cents,
-                    order_type="FAK",
+                result = await venue.buy(ref, shares, cents)
+            except venues_mod.OrderOutcomeUnknown as exc:
+                # Sent, never answered: it may be live on the exchange. Hold
+                # the game and the day's slot exactly like a placed order, and
+                # never send a second one behind it.
+                logger.error(
+                    "autobet: %s order for %s %s got no answer (%s) — check the "
+                    "account; the game is held", venue.label, row["game_id"],
+                    row["side"], exc,
                 )
-            except Exception as exc:  # noqa: BLE001 — record + move on
-                logger.warning("autobet: order failed for %s %s: %s",
-                               row["game_id"], row["side"], exc)
                 _record(conn, row, ref, limit_prob=limit_prob, shares=shares,
                         usd=usd, model_prob=model_prob, order_id=None,
-                        status="error", error=str(exc)[:300], now=now,
+                        status="unknown", error=str(exc)[:300], now=now,
+                        best_ask_cents=best_ask_cents, book_depth=book_depth,
+                        fee_rate=fee_rate)
+                committed_games.add(row["game_id"])
+                summary["unknown"] += 1
+                budget -= 1
+                if mode != "fixed":
+                    cash[venue.key] = max(cash_usd - usd, 0.0)
+                continue
+            except Exception as exc:  # noqa: BLE001 — record + move on
+                logger.warning("autobet: %s order failed for %s %s: %s",
+                               venue.label, row["game_id"], row["side"], exc)
+                _record(conn, row, ref, limit_prob=limit_prob, shares=shares,
+                        usd=usd, model_prob=model_prob, order_id=None,
+                        status="error", error=venue.error_text(exc), now=now,
                         best_ask_cents=best_ask_cents, book_depth=book_depth,
                         fee_rate=fee_rate)
                 summary["errors"] += 1
                 continue
 
-            order_id = ((result or {}).get("order") or {}).get("order_id") or ""
+            if (result or {}).get("note"):
+                logger.info("autobet: %s", result["note"])
+                summary.setdefault("notes", []).append(result["note"])
+            order_id = (result or {}).get("order_id") or ""
             if not order_id:
                 # FAK with zero fill — clean no-trade, retryable next sweep.
                 _record(conn, row, ref, limit_prob=limit_prob, shares=shares,
@@ -1349,14 +1634,24 @@ async def _sweep_locked(force: bool) -> dict:
                 summary["unmatched"] += 1
                 continue
 
+            pending = bool(result.get("pending"))
             bet_id = _record(conn, row, ref, limit_prob=limit_prob, shares=shares,
                              usd=usd, model_prob=model_prob, order_id=order_id,
-                             status="placed", error=None, now=now,
-                             best_ask_cents=best_ask_cents, book_depth=book_depth,
-                             fee_rate=fee_rate)
-            # Pull the REAL fill off the trades feed right away (FAK partials
-            # must not grade as full fills); feed lag is retried next sweep.
-            fill = await _reconcile_fill(conn, bet_id, order_id)
+                             status="placed", error=PENDING_NOTE if pending else None,
+                             now=now, best_ask_cents=best_ask_cents,
+                             book_depth=book_depth, fee_rate=fee_rate)
+            # The REAL fill, right away (partials must not grade as full
+            # fills): the exchange's own answer when it gave one, else its
+            # fills feed; feed lag is retried next sweep.
+            fill = None
+            if pending:
+                pass  # the venue just asked and could not tell: next sweep
+            elif result.get("filled") and result.get("avg_prob"):
+                fill = (round(float(result["filled"]), 4), round(float(result["avg_prob"]), 4))
+                with conn:
+                    db.set_auto_bet_fill(conn, bet_id, fill[0], fill[1])
+            else:
+                fill = await _reconcile_fill(conn, bet_id, order_id, venue.key)
             committed_games.add(row["game_id"])
             # What actually left the wallet: the reconciled fill when the feed
             # has it, else the (post-depth-shrink) intended spend. NEVER the
@@ -1364,22 +1659,24 @@ async def _sweep_locked(force: bool) -> dict:
             # partially-filled order in MY BETS.
             spent_usd = round(fill[0] * fill[1], 2) if fill else usd
             logger.info(
-                "autobet PLACED %s %s: %s shares @ %s¢ ($%.2f) order=%s",
-                row["game_id"], row["side"], shares, cents, usd, order_id,
+                "autobet PLACED on %s %s %s: %s shares @ %s¢ ($%.2f) order=%s",
+                venue.label, row["game_id"], row["side"], shares, cents, usd, order_id,
             )
             summary["placed"] += 1
             budget -= 1
             if mode != "fixed":
                 # Committed money leaves the sizing base immediately, so one
                 # sweep can never stake more than the balance it started with.
-                cash_usd = max(cash_usd - usd, 0.0)
-            _log_to_tracker(row, cents, spent_usd, settings)
+                cash[venue.key] = max(cash_usd - usd, 0.0)
+            if not pending:
+                _log_to_tracker(row, cents, spent_usd, settings, venue)
         return summary
     finally:
         conn.close()
 
 
-def _log_to_tracker(row: dict, cents: int, spent_usd: float, settings: dict) -> None:
+def _log_to_tracker(row: dict, cents: int, spent_usd: float, settings: dict,
+                    venue=None) -> None:
     """Mirror a PLACED autobet into the user's bet log so it grades into
     MY BETS when the game settles. Best-effort — a logging failure must
     never fail the sweep (the order is already live).
@@ -1387,12 +1684,13 @@ def _log_to_tracker(row: dict, cents: int, spent_usd: float, settings: dict) -> 
     `spent_usd` is what the order ACTUALLY cost (reconciled fill, else the
     post-depth-shrink intended spend) — not the requested stake, which would
     overstate units on every shrunk or partially-filled order."""
+    venue = venue or venues_mod.get(row.get("venue"))
     try:
         stake_units = max(0.1, round(spent_usd / settings["unit_usd"], 2))
         tracker.log_bet(
             row["game_id"], row["side"], prob_to_american(cents / 100.0),
-            book="polymarket", stake_units=stake_units,
-            note="AUTO · polymarket",
+            book=venue.key, stake_units=stake_units,
+            note=f"AUTO · {venue.label.lower()}",
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning("autobet: tracker log failed for %s: %s", row["game_id"], exc)

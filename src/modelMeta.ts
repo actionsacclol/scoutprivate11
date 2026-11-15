@@ -7,7 +7,7 @@
  * RUNTIME OVERRIDE: GET /api/models serves each engine's live `model` name and
  * a `backtest` metrics blob; useModelMeta() merges those over the fallbacks.
  * The table below is only what renders in demo mode / backend-down — when an
- * engine is bumped on the backend (e.g. nhl-elo-v1 → v2), the UI follows
+ * engine is bumped on the backend (e.g. nhl-elo-v1 → nhl-elo-ctx-v3), the UI follows
  * automatically, and the matching ONE line below should be updated to keep the
  * offline fallback honest.
  */
@@ -36,13 +36,13 @@ export type ModelMetaMap = Record<Sport, ResolvedModelMeta>
 // One line per engine — edit here and every surface updates.
 export const FALLBACK_MODEL_META: Record<Sport, ModelMetaEntry> = {
   nba: { model: 'nba-elo-v1', acc: 67.8, note: 'Elo · MOV + rolling scoring' },
-  nhl: { model: 'nhl-elo-v1', acc: 53.6, note: 'Elo + Poisson goals' }, // v2 bump lands on this line
-  nfl: { model: 'nfl-xgb-v3', acc: 67.5, note: 'Elo + QB + XGBoost blend' },
-  ncaaf: { model: 'ncaaf-kalman-v2', acc: 75.9, note: 'Kalman margin filter · blowouts count' },
-  ncaab: { model: 'ncaab-kalman-v2', acc: 72.0, note: 'Kalman margin filter · D1 only' },
+  nhl: { model: 'nhl-elo-ctx-v3', acc: 56.8, note: 'Elo + back-to-backs + shots' },
+  nfl: { model: 'nfl-elo-v2', acc: 67.1, note: 'Elo + QB + rest' },
+  ncaaf: { model: 'ncaaf-kalman-v3', acc: 75.9, note: 'Kalman margin filter · lower-division prior' },
+  ncaab: { model: 'ncaab-kalman-v3', acc: 72.0, note: 'Kalman margin filter · non-D1 prior' },
   mlb: { model: 'mlb-elo-v3', acc: 55.5, note: 'Elo + pitcher EWMA' },
   wnba: { model: 'wnba-elo-v1', acc: 66.3, note: 'Elo · expansion-aware' },
-  soccer: { model: 'soccer-poisson-v2', acc: 48.9, note: 'Dixon-Coles-lite · 3-way' },
+  soccer: { model: 'soccer-poisson-v3', acc: 48.9, note: 'Dixon-Coles-lite · 3-way · market-implied goals' },
   tennis: { model: 'tennis-elo-v1', acc: 63.8, note: 'surface-blended Elo' },
 }
 

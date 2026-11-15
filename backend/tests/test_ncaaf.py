@@ -81,6 +81,20 @@ def test_parse_teams_payload_maps_location_to_display_name():
     assert _parse_teams_payload(payload) == {"Georgia": "Georgia Bulldogs"}
 
 
+def test_a_shared_location_goes_to_the_major_program():
+    # ESPN's directory lists two "Charlotte"s and two "Troy"s; last-entry-wins
+    # filed the FBS programs under a small college's name, so the live board's
+    # "Charlotte 49ers" never matched its rating. Lowest team id wins, in
+    # either order.
+    def payload(teams):
+        return {"sports": [{"leagues": [{"teams": [{"team": t} for t in teams]}]}]}
+
+    fbs = {"id": "2429", "location": "Charlotte", "displayName": "Charlotte 49ers"}
+    small = {"id": "3253", "location": "Charlotte", "displayName": "Charlotte Saints"}
+    assert _parse_teams_payload(payload([fbs, small])) == {"Charlotte": "Charlotte 49ers"}
+    assert _parse_teams_payload(payload([small, fbs])) == {"Charlotte": "Charlotte 49ers"}
+
+
 # -- season bookkeeping --------------------------------------------------------
 
 
@@ -284,7 +298,7 @@ def test_predict_probabilities_and_scores(tmp_path):
     )
     [pred] = asyncio.run(engine.predict([game]))
 
-    assert pred.model == "ncaaf-kalman-v2"
+    assert pred.model == "ncaaf-kalman-v3"
     assert pred.home_win_prob + pred.away_win_prob == pytest.approx(1.0)
     assert pred.home_win_prob > 0.9  # 40-point strength gap plus home field
     # home = (UGA PF 40 + KSU PA 43)/2 + 1.5; away = (KSU PF 15 + UGA PA 12)/2 - 1.5
@@ -375,4 +389,4 @@ def test_load_state_tolerates_corrupt_file(tmp_path):
 def test_build_engine_contract():
     engine = build_engine()
     assert engine.sport is Sport.NCAAF
-    assert engine.model_name == "ncaaf-kalman-v2"
+    assert engine.model_name == "ncaaf-kalman-v3"

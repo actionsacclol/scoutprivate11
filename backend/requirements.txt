@@ -8,14 +8,9 @@ pandas>=2.2
 # usable engine".
 pyarrow>=15
 numpy>=1.26,<3
-# Upper bounds because these two write the model pickles under MODELS_DIR
-# (userData in a packaged build), and those pickles OUTLIVE an app update —
-# a bundled-library bump makes a user's persisted bundle foreign. That is
-# handled safely (core/modelio stamps every bundle and the engines fall back
-# to Elo + retrain on a mismatch), but a surprise MAJOR bump should still be
-# a deliberate upgrade, not something a fresh `pip install` decides.
-scikit-learn>=1.5,<2
-xgboost>=2.0,<4
+# No scikit-learn / xgboost: the trained overlays on the NBA and NFL engines
+# were retired in November 2026 (see sports/nba.py, sports/nfl.py). Every
+# engine is a ratings replay; nothing is fitted and nothing is pickled.
 python-dotenv>=1.0
 pytest>=8.0
 pytest-asyncio>=0.23

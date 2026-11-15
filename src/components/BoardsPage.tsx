@@ -34,6 +34,8 @@ interface Props {
   apiUp: boolean | null
   fetchedAt: Date | null
   loading: boolean
+  /** Sports whose last board request failed, with the reason. */
+  boardErrors: Partial<Record<Sport, string>>
   highlightId: string | null
   onSport: (s: Sport) => void
   onRefresh: () => void
@@ -50,6 +52,7 @@ export default function BoardsPage({
   apiUp,
   fetchedAt,
   loading,
+  boardErrors,
   highlightId,
   onSport,
   onRefresh,
@@ -88,6 +91,8 @@ export default function BoardsPage({
       clearTimeout(t2)
     }
   }, [highlightId, onClearHighlight])
+
+  const loadError = boardErrors[active] ?? null
 
   const openCard: GameCard | null = openId
     ? (cards.find((c) => c.game.id === openId) ?? null)
@@ -130,7 +135,30 @@ export default function BoardsPage({
           </div>
         )}
 
-        {cards.length === 0 ? (
+        {/* A board that failed to load is NOT an empty slate, and must not be
+            dressed as one: "no games scheduled — likely off-season" over a
+            full NBA night is how a fetch failure read for months. */}
+        {loadError && cards.length > 0 && (
+          <div className="mb-3 flex flex-wrap items-center gap-x-3 gap-y-1 rounded-xl border border-amber-400/25 bg-amber-500/[0.07] px-3 py-2 text-[10px] font-semibold uppercase tracking-wider text-amber-300">
+            <span>
+              Couldn’t refresh {SPORT_NAME[active]} — {loadError}. Showing the last slate that loaded.
+            </span>
+            <button
+              onClick={onRefresh}
+              disabled={loading}
+              className="rounded-md border border-amber-400/30 px-2 py-0.5 text-[9px] tracking-widest transition hover:bg-amber-400/10 disabled:opacity-40"
+            >
+              RETRY
+            </button>
+          </div>
+        )}
+
+        {cards.length === 0 && loadError ? (
+          <Empty
+            title={`Couldn’t load the ${SPORT_NAME[active]} board`}
+            message={`The request failed: ${loadError}. This is a loading problem, not an empty slate — the board retries on its own every minute, or press REFRESH.`}
+          />
+        ) : cards.length === 0 ? (
           <Empty
             title={`No ${SPORT_NAME[active]} games scheduled`}
             message="The board populates when the slate resumes — likely off-season. Flip on demo mode to explore the terminal with a bundled slate."

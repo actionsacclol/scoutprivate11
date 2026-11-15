@@ -11,13 +11,11 @@
 #
 # Entry: run_backend.py (programmatic uvicorn runner; also serves --selftest).
 # Output (via --distpath dist-py): dist-py/krypt-scout-backend/krypt-scout-backend[.exe]
-import os
 import sys
 
 from PyInstaller.utils.hooks import (
     collect_all,
     collect_data_files,
-    collect_dynamic_libs,
     collect_submodules,
     copy_metadata,
 )
@@ -47,48 +45,32 @@ hiddenimports += collect_submodules('fastapi')
 hiddenimports += collect_submodules('starlette')
 hiddenimports += collect_submodules('pydantic')
 
-# xgboost loads its native xgboost.dll from <pkg>/lib and its VERSION file as
-# package data at runtime; without these the nba/nfl engines die with "Cannot
-# find XGBoost Library". NOT collect_all — that also pulls xgboost.testing,
-# which needs the (uninstalled) hypothesis package and kills the build.
-binaries += collect_dynamic_libs('xgboost')
-datas += collect_data_files('xgboost')
+# The numeric stack (numpy/pandas) is imported ONLY by kryptscout.sports.* and
+# core/sgp.py — nothing else in the app touches it. Normally PyInstaller sees
+# those imports by parsing the .py source. But `npm run dist:hardened` compiles
+# the sports engines to native .pyd (see scripts/py-harden.mjs + HARDENING.md
+# Layer 3), and a .pyd is opaque to source analysis — so without naming these
+# explicitly, a hardened build would drop the stack and every engine would die
+# at import. Listing the top-level names triggers each library's PyInstaller
+# hook to collect its tree. Harmless on a NON-hardened build (they're already
+# pulled via the .py) — so it stays unconditional, keeping the two build paths
+# identical here.
+hiddenimports += ['numpy', 'pandas']
 
-# The model/feature stack (numpy/pandas/sklearn/scipy/xgboost) is imported ONLY
-# by kryptscout.sports.* — nothing else in the app touches it. Normally
-# PyInstaller sees those imports by parsing the sports .py source. But
-# `npm run dist:hardened` compiles the sports engines to native .pyd (see
-# scripts/py-harden.mjs + HARDENING.md Layer 3), and a .pyd is opaque to source
-# analysis — so without naming these explicitly, a hardened build would drop the
-# entire scientific stack and every engine would die at import. Listing the
-# top-level names triggers each library's PyInstaller hook to collect its tree.
-# Harmless on a NON-hardened build (they're already pulled via the .py) — so it
-# stays unconditional, keeping the two build paths identical here.
-hiddenimports += ['numpy', 'pandas', 'sklearn', 'scipy', 'xgboost']
-
-# macOS only: libxgboost.dylib links against OpenMP, which Apple's toolchain
-# does NOT ship. The PyPI wheel expects a Homebrew `libomp` on the build box
-# (that is the documented `brew install libomp` step), and it lives OUTSIDE the
-# xgboost package, so collect_dynamic_libs above never sees it. Without this
-# the frozen app imports xgboost on a user's Mac and dies with
-# "Library not loaded: @rpath/libomp.dylib" — which takes the nba/nfl engines,
-# and therefore the whole backend, down with it.
-if sys.platform == 'darwin':
-    _omp = []
-    for _root in ('/opt/homebrew/opt/libomp/lib',  # Apple Silicon Homebrew
-                  '/usr/local/opt/libomp/lib'):     # Intel Homebrew
-        _p = os.path.join(_root, 'libomp.dylib')
-        if os.path.exists(_p):
-            _omp.append((_p, '.'))
-            break
-    if _omp:
-        binaries += _omp
-    else:
-        # Loud, not fatal: a mac build without libomp still produces a bundle,
-        # it just cannot run the model engines. Better to see this in the CI
-        # log than to ship it and have users hit it.
-        print('WARNING: libomp.dylib not found — xgboost will fail at runtime. '
-              'Run `brew install libomp` before bundling.')
+# Deliberately NOT bundled, even when the build venv happens to have them:
+#   xgboost / sklearn  the trained NBA/NFL overlays were retired in November
+#                      2026; no engine fits or loads a model any more.
+#   scipy              only ever came along as their dependency. pandas names it
+#                      inside a few optional code paths (interpolation methods,
+#                      sparse matrices) that this app never calls, and that
+#                      mention alone was enough to pull 47 MB into the bundle.
+#   duckdb             dev-side order-book harvest (jobs/bookfill.py), a lazy
+#                      import that already reports a clean "pip install duckdb"
+#                      when it is missing. It was riding along at 36 MB.
+# An exclude makes the bundle the same on every build box instead of a function
+# of what is installed there. If an engine ever needs one of these again, take
+# it off this list AND add it to hiddenimports above.
+EXCLUDED_MODULES = ['xgboost', 'sklearn', 'scipy', 'duckdb']
 
 # ── Polymarket signing: eth_account + its full transitive graph ───────────
 # The ethereum libraries read their own version via importlib.metadata at
@@ -193,7 +175,7 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    excludes=EXCLUDED_MODULES,
     noarchive=False,
     # optimize=2 (-OO): strip asserts AND docstrings from the frozen bytecode.
     # Functionally safe here — no runtime code relies on asserts (verified) or

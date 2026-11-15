@@ -5,6 +5,8 @@ import type {
   SchedulerJob,
   SchedulerRun,
 } from '../../shared/types';
+import { request as httpRequest } from 'node:http';
+import { app } from 'electron';
 import { pythonBackend } from './python-backend';
 import * as store from './settings-store';
 
@@ -13,10 +15,15 @@ import * as store from './settings-store';
 // growing without the user ever configuring Task Scheduler: once the
 // supervised backend reaches "running" we wait for the model engines to
 // warm, run one settle + one capture, then repeat each on its own
-// configurable interval. The refresh job (engine data updates + stale-
-// model retrains) joins the interval rotation only — no warmup fire,
-// because a cold backend start already loads fresh-enough engine state
-// and refresh can take minutes (college season downloads).
+// configurable interval. The refresh job (engine data updates: the results
+// history every rating is built from) also runs at startup, BEFORE the
+// capture, whenever it is due: never run on this install, last run a full
+// interval ago, or last run by a different app version (an update can
+// discard an engine's saved state). When and by which version it last
+// succeeded is persisted, so the daily cadence survives restarts — it used
+// to be a bare 24h timer from launch, which a new install waited a day for
+// and anyone who closes the app each night never reached: their boards
+// showed the home-advantage constant for every game.
 // Runs POST the backend's /api/jobs/* endpoints
 // over 127.0.0.1 using the CURRENT backend port at call time (a crashed
 // backend that respawns on a new port is picked up automatically).
@@ -37,16 +44,22 @@ import * as store from './settings-store';
 const FAST = process.env.KRYPT_SCOUT_SCHED_FAST === '1';
 /** Delay after the backend turns healthy before the first runs. */
 const WARMUP_MS = FAST ? 5_000 : 90_000;
+/** The same delay on an install that has never refreshed: its boards are
+ *  showing untrained numbers, so don't sit on that for a minute and a half.
+ *  The refresh endpoint waits for the engines itself. */
+const FIRST_RUN_WARMUP_MS = FAST ? 5_000 : 10_000;
+/** Soonest a restored refresh timer may fire after the timers arm. */
+const MIN_REARM_MS = 60_000;
 /** What one configured "hour" means on the wall clock. */
 const HOUR_MS = FAST ? 60_000 : 3_600_000;
 /** Hard cap on a single job HTTP call. */
 const RUN_TIMEOUT_MS = 120_000;
 /**
  * Refresh downloads engine data (whole college seasons) and retrains any
- * stale models — far slower than capture/settle, so it gets a 10-minute
+ * stale models — far slower than capture/settle, so it gets a 15-minute
  * cap instead of the standard 120s.
  */
-const REFRESH_TIMEOUT_MS = 600_000;
+const REFRESH_TIMEOUT_MS = 900_000;
 /** Ring size for lastRuns. */
 const RING_MAX = 20;
 
@@ -151,6 +164,22 @@ function summarize(body: string): string {
   return raw ? truncate(raw, 200) : 'ok';
 }
 
+/** True when a refresh response says every engine it touched succeeded.
+ *  An unexpected shape counts as success: the call itself returned 200. */
+function refreshFullyOk(body: string): boolean {
+  try {
+    const data: unknown = JSON.parse(body);
+    const results = (data as { results?: unknown } | null)?.results;
+    if (!results || typeof results !== 'object' || Array.isArray(results)) return true;
+    const entries = Object.values(results as Record<string, unknown>);
+    // No engines at all means the registry was empty — that trained nothing.
+    if (!entries.length) return false;
+    return entries.every((v) => !!v && typeof v === 'object' && (v as { ok?: unknown }).ok === true);
+  } catch {
+    return true;
+  }
+}
+
 type LogCallback = (entry: LogEntry) => void;
 
 class JobScheduler {
@@ -202,7 +231,22 @@ class JobScheduler {
         refresh: this.nextAt.refresh ? new Date(this.nextAt.refresh).toISOString() : null,
       },
       inFlight: this.inFlight,
+      refreshedAt: store.get().schedulerState?.refreshedAt ?? null,
     };
+  }
+
+  /** When the engines' data was last fully refreshed (ms), or null = never. */
+  private refreshedAtMs(): number | null {
+    const at = Date.parse(store.get().schedulerState?.refreshedAt ?? '');
+    return Number.isFinite(at) ? at : null;
+  }
+
+  /** Never refreshed, a full interval ago, or by another app version. */
+  private refreshDue(): boolean {
+    const at = this.refreshedAtMs();
+    if (at === null) return true;
+    if (store.get().schedulerState?.refreshedVersion !== app.getVersion()) return true;
+    return Date.now() - at >= this.intervalMs('refresh');
   }
 
   setConfig(partial: Partial<SchedulerConfig>): SchedulerInfo {
@@ -303,28 +347,31 @@ class JobScheduler {
   }
 
   /**
-   * Wait for the engines to warm, then settle once, capture once, then
-   * intervals. Refresh deliberately gets NO warmup fire: a cold backend
-   * start already loads fresh-enough engine state, and firing a
-   * multi-minute data download right at startup would starve the serial
-   * queue. It simply joins the interval rotation when the timers arm.
+   * Wait for the engines to warm, then settle once, refresh if it is due,
+   * capture once, then intervals. Refresh goes BEFORE the capture on
+   * purpose: a capture taken on missing or day-old ratings records picks
+   * the engines would not make once they have caught up. The cost is that a
+   * brand-new install's first capture waits out the one-time history
+   * download (minutes); an ordinary daily catch-up is a few seconds.
    */
   private scheduleWarmup(): void {
     if (this.stopped || this.warmupTimer) return;
-    const fireAt = Date.now() + WARMUP_MS;
+    const warmup = this.refreshedAtMs() === null ? FIRST_RUN_WARMUP_MS : WARMUP_MS;
+    const fireAt = Date.now() + warmup;
     this.nextAt.settle = fireAt;
     this.nextAt.capture = fireAt;
-    this.log('INFO', `backend running — first settle+capture in ${Math.round(WARMUP_MS / 1000)}s`);
+    this.log('INFO', `backend running — first jobs in ${Math.round(warmup / 1000)}s`);
     this.warmupTimer = setTimeout(() => {
       this.warmupTimer = null;
       if (this.stopped || !this.config.enabled) return;
       this.initialDone = true;
-      // Order matters: settle yesterday's picks first, then capture fresh
-      // history. The serial queue preserves this ordering.
+      // Order matters: settle yesterday's picks first, bring the engines up
+      // to date, then capture fresh history. The serial queue preserves it.
       void this.enqueue('settle', 'startup');
+      if (this.refreshDue()) void this.enqueue('refresh', 'startup');
       void this.enqueue('capture', 'startup');
       for (const job of JOBS) this.armTimer(job);
-    }, WARMUP_MS);
+    }, warmup);
   }
 
   private intervalMs(job: SchedulerJob): number {
@@ -341,7 +388,14 @@ class JobScheduler {
   private armTimer(job: SchedulerJob): void {
     this.clearTimer(job);
     if (this.stopped || !this.config.enabled) return;
-    const ms = this.intervalMs(job);
+    let ms = this.intervalMs(job);
+    // Refresh keeps its cadence across restarts: fire a full interval after
+    // the last success, not after this launch. (One queued right now will
+    // stamp a new success when it lands, so it takes the full interval.)
+    const refreshedAt = job === 'refresh' && !this.pending.has('refresh') ? this.refreshedAtMs() : null;
+    if (refreshedAt !== null) {
+      ms = Math.min(ms, Math.max(MIN_REARM_MS, refreshedAt + ms - Date.now()));
+    }
     this.nextAt[job] = Date.now() + ms;
     this.timers[job] = setTimeout(() => {
       this.timers[job] = undefined;
@@ -401,18 +455,22 @@ class JobScheduler {
     const timer = setTimeout(() => ctl.abort(), timeoutMs);
     try {
       const token = pythonBackend.token();
-      const res = await fetch(url, {
-        method: 'POST',
-        headers: token ? { 'X-Scout-Token': token } : undefined,
-        signal: ctl.signal,
-      });
-      const body = await res.text().catch(() => '');
+      const res = await postLocal(url, token ? { 'X-Scout-Token': token } : {}, ctl.signal);
+      const body = res.body;
       if (res.status === 404) {
         record(false, undefined, 'jobs endpoint not available (404) — this backend build does not ship /api/jobs yet');
       } else if (!res.ok) {
         record(false, undefined, `HTTP ${res.status}: ${truncate(body.trim() || res.statusText, 160)}`);
       } else {
         record(true, summarize(body));
+        // Only a refresh in which every engine succeeded counts as "up to
+        // date"; a partial one is retried at the next launch.
+        if (job === 'refresh' && refreshFullyOk(body)) {
+          store.save({
+            ...store.get(),
+            schedulerState: { refreshedAt: new Date().toISOString(), refreshedVersion: app.getVersion() },
+          });
+        }
       }
     } catch (e: unknown) {
       const msg = ctl.signal.aborted
@@ -425,6 +483,45 @@ class JobScheduler {
       clearTimeout(timer);
     }
   }
+}
+
+/**
+ * POST to the local backend and wait as long as the caller's signal allows.
+ *
+ * Not fetch(): Node's fetch gives up with "fetch failed" when no response
+ * headers have arrived 300 s after the request (undici's headersTimeout), and
+ * a job answers only when it is finished. A new install's first refresh runs
+ * past five minutes, so it was reported as failed ("Setup did not finish")
+ * at exactly 5:00 while the backend carried on, whatever REFRESH_TIMEOUT_MS
+ * said. node:http has no such limit; the AbortSignal is the only timeout.
+ */
+function postLocal(
+  url: string,
+  headers: Record<string, string>,
+  signal: AbortSignal,
+): Promise<{ ok: boolean; status: number; statusText: string; body: string }> {
+  return new Promise((resolve, reject) => {
+    const req = httpRequest(
+      url,
+      { method: 'POST', headers: { ...headers, 'Content-Length': '0' }, signal },
+      (res) => {
+        const chunks: Buffer[] = [];
+        res.on('data', (chunk: Buffer) => chunks.push(chunk));
+        res.on('error', reject);
+        res.on('end', () => {
+          const status = res.statusCode ?? 0;
+          resolve({
+            ok: status >= 200 && status < 300,
+            status,
+            statusText: res.statusMessage ?? '',
+            body: Buffer.concat(chunks).toString('utf8'),
+          });
+        });
+      },
+    );
+    req.on('error', reject);
+    req.end();
+  });
 }
 
 export const scheduler = new JobScheduler();

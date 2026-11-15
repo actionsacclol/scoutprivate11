@@ -16,9 +16,9 @@ Three entry points, all run as modules from the ``backend`` directory:
 
     python -m kryptscout.jobs.refresh [--sports nba,mlb,...] [--force]
         Run every registered engine's refresh_data() sequentially — pull the
-        latest results and retrain/update ratings — printing timing and a
-        state-file summary per sport. ``--force`` deletes the sport's model
-        pickle(s) first so pickle-staleness checks (nfl, nba) retrain. Run
+        latest results and update ratings — printing timing and a
+        state-file summary per sport. ``--force`` deletes any model pickle
+        named after the sport first (no engine writes one today). Run
         once daily, after settle, so the day's boards predict from fresh
         state. The Electron scheduler's daily refresh job hits the equivalent
         POST /api/jobs/refresh instead of shelling out to this CLI.

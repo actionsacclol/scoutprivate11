@@ -1,11 +1,10 @@
 """WNBA engine — Elo baseline (v1).
 
-Model: standard Elo (K=28 — the 44-game WNBA season is far shorter than the
-NBA's so ratings must adapt faster — margin-of-victory scaling, +80 rating
-points of home advantage) replayed over every completed WNBA game since May
+Model: standard Elo (K=16, margin-of-victory scaling, +50 rating points of
+home advantage — retuned November 2026 from K=28 / +80, see ELO_CONFIG) replayed over every completed WNBA game since May
 2024, sourced from ESPN's scoreboard-by-date API. The WNBA is a summer
 league, so the date loop only touches May–October of each year; between
-seasons ratings regress 25% toward the mean (carry=0.75) at the Jan 1
+seasons ratings regress 50% toward the mean (carry=0.5) at the Jan 1
 boundary. Expansion teams (Golden State Valkyries 2025, Toronto Tempo and
 Portland Fire 2026) simply start at the 1500 initial rating on first sight.
 
@@ -24,8 +23,8 @@ the replayed state (ratings, rolling scoring, backtest log, last processed
 date) persists to DATA_DIR/wnba_state.json so refresh_data() is incremental.
 
 v1 is deliberately a baseline: the replay loop records pre-game probabilities
-for every historical game (see backtest_metrics), which doubles as the
-training/evaluation scaffold for a future ML model (wnba-xgb-v2).
+for every historical game (see backtest_metrics), which is the walk-forward
+log anything proposed to replace it has to beat.
 """
 from __future__ import annotations
 
@@ -57,18 +56,31 @@ ROLLING_WINDOW = 10  # games in the rolling points-for/against averages
 LEAGUE_AVG_POINTS = 82.0  # fallback before a team has any scoring history
 CHECKPOINT_EVERY_DAYS = 30  # persist state periodically during long backfills
 
+# Retuned 2026-11 (walk-forward: picked on 2024-25, scored once on 2026,
+# n=353): K 28 -> 16, home advantage 80 -> 50, season carry 0.75 -> 0.5 took
+# log loss from 0.6066 to 0.5979, -0.0088 [-0.0153, -0.0023]. The same shape
+# as the NBA retune of 2026-09-02: a slower K, a smaller home edge (the old
+# 80 points stated 57-58% home wins against 55% played) and a harder reset
+# between seasons. With these knobs the fitted logit scale is 1.03, so the
+# 0.69 temperature is no longer needed.
 ELO_CONFIG = EloConfig(
-    k=28.0,
-    home_advantage=80.0,
+    k=16.0,
+    home_advantage=50.0,
     mov_scaling=True,
-    season_carry=0.75,
+    season_carry=0.5,
 )
 # Calibration audit 2026-09-02 on this engine's walk-forward log (n=869):
 # slope 0.78, favourites overstated by 6.3 points, the 0.8–0.9 bin hitting
 # 77%. Temperature 0.69 on the Elo log-odds fixed it on the held-out slice
 # (+0.0021 log loss). Applied to the served probability and the backtest
 # log alike so the reported metrics describe what ships.
-CALIBRATION_TEMPERATURE = 0.69
+CALIBRATION_TEMPERATURE = 1.0  # was 0.69 under K28/HFA80/carry .75; 1.0 disables
+# The state file had no version, so a file written before the 2026-09-02
+# temperature kept its untempered backtest rows and appended tempered ones
+# behind them: the engine's printed 2026 log loss read 0.6187 when the served
+# numbers scored 0.6066. Any change to the constants above must bump this so
+# ratings AND the log are rebuilt from the cached scoreboards.
+STATE_VERSION = 2
 
 
 def _season_key(day: date) -> int:
@@ -302,6 +314,8 @@ class WnbaEngine(SportEngine):
             state = json.loads(self.state_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             return
+        if state.get("version") != STATE_VERSION:
+            return  # replayed under other constants (or a mixed log) - full replay
         self.elo.ratings = {k: float(v) for k, v in state.get("ratings", {}).items()}
         for attr, key in (
             (self.points_for, "points_for"),
@@ -331,6 +345,7 @@ class WnbaEngine(SportEngine):
 
     def _save_state(self) -> None:
         state = {
+            "version": STATE_VERSION,
             "model": self.model_name,
             "last_processed": (
                 self.last_processed.isoformat() if self.last_processed else None

@@ -15,6 +15,7 @@
  * Keep bonusHeadline/bonusDetail copy accurate to the book's real, current
  * offer — offer accuracy is the distributor's responsibility.
  */
+import { EXCHANGE_SIGNUP } from '@shared/exchange-links'
 import { openExternal } from '../utils/format'
 
 export interface BookConfig {
@@ -240,9 +241,21 @@ export const REFERRALS: BookConfig[] = [
     name: 'Polymarket',
     short: 'POLY',
     homepage: 'https://polymarket.com',
-    referralUrl: 'https://polymarket.com/?r=yuhgo',
+    referralUrl: EXCHANGE_SIGNUP.polymarket, // shared/exchange-links.ts
     bonusHeadline: 'Trade Sports on Polymarket',
     bonusDetail: 'The sharpest vig-free prices in Krypt Scout — trade them directly.',
+    featured: true,
+  },
+  {
+    // The US-regulated Polymarket exchange — a separate account from
+    // polymarket.com. Not quoted on the boards; auto-bet can buy on it.
+    key: 'polymarket_us',
+    name: 'Polymarket US',
+    short: 'PMUS',
+    homepage: 'https://polymarket.us',
+    referralUrl: EXCHANGE_SIGNUP.polymarket_us, // shared/exchange-links.ts
+    bonusHeadline: 'Trade Sports on Polymarket US',
+    bonusDetail: 'The US-regulated Polymarket exchange — sign up through Krypt Scout.',
     featured: true,
   },
   {
@@ -250,8 +263,7 @@ export const REFERRALS: BookConfig[] = [
     name: 'Kalshi',
     short: 'KLSH',
     homepage: 'https://kalshi.com',
-    referralUrl:
-      'https://kalshi.com/sign-up/?referral=b1483a75-2984-48c0-87d4-42a1d4714e78',
+    referralUrl: EXCHANGE_SIGNUP.kalshi, // shared/exchange-links.ts
     bonusHeadline: 'Trade Sports on Kalshi',
     bonusDetail: 'CFTC-regulated prediction market — sign up through Krypt Scout.',
   },

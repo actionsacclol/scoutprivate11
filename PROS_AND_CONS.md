@@ -43,7 +43,7 @@ Says so on the tin, but it's still the core limitation: calibrated Elo/Poisson b
 The backend is portable Python and runs anywhere in dev, but the packaged product is a Windows NSIS installer. No macOS/Linux builds, no mobile, no web version — and betting is a phone-first activity for most of the audience.
 
 **4. Heavyweight for what it does.**
-Electron shell + ~300 MB bundled pandas/sklearn/xgboost backend; a 224 MB installer for what is, to a casual user, an odds screen. Startup depends on a supervised child process with a health window.
+Electron shell + ~190 MB bundled numpy/pandas backend (was ~400 MB before the xgboost stack was removed); still a heavy installer for what is, to a casual user, an odds screen. Startup depends on a supervised child process with a health window.
 
 **5. Odds coverage is thinner than paid aggregators.**
 ESPN lines + two prediction markets is a great free stack, but OddsJam/Unabated scan dozens of books with push-speed updates. Line-shopping breadth and latency both lose. Tennis odds require the optional key at all.

@@ -27,6 +27,32 @@ Totals come from rolling last-10 points for/against (league average total
 re-fetched); replayed state persists to DATA_DIR/ncaab_state.json. Replay
 logs pre-update probabilities for every D1-vs-D1 game — the walk-forward
 backtest printed by `python -m kryptscout.sports.ncaab`.
+
+v3 (2026-11-14) — three live-only faults the backtest could not see, found
+by replaying what the engine SERVED day by day (held out 2024-25 + 2025-26,
+12,592 served games: log loss 0.5595 as served -> 0.4893 fixed):
+
+1. D1 membership was "10+ games this season", computed from the games
+   played so far. In November nobody has ten, so no game of the new season
+   updated a rating until mid-December; on 2026-11-14, 749 completed games
+   had moved zero ratings. Membership is now "carries a conference id in
+   this season's file" (351/351, 358/360, 365/366 agreement with the count
+   rule on finished seasons, and known before the first tip); the count rule
+   remains the fallback for frames without the column.
+2. The season roll-over (carry, added variance) fired only when the first
+   completed game of the new season reached the file, so opening-night
+   boards were served from last April's ratings unshrunk. `_replay` now
+   rolls forward to `through_season` (the calendar season) on its own.
+3. A non-D1 guest was missing from the Kalman book and priced as
+   (0, init_var): an average D1 team. D1 hosts won 97% of those games while
+   the board said 50% (log loss 0.775). The guest is now one generic prior,
+   NON_D1_PRIOR, fitted by moments on 4,060 such games of 2016-24.
+
+Roll-over regresses toward the conference mean (CONF_REGRESS_WEIGHT):
+−0.0056 [−0.0082, −0.0027] on held-out November D1-vs-D1 games, −0.0010
+over the whole season. Recalibration, a full retune of the constants, a
+margin cap, rest days and a wider early-season variance were all tested on
+the same split and changed nothing.
 """
 from __future__ import annotations
 
@@ -43,7 +69,7 @@ import httpx
 import pandas as pd
 
 from kryptscout.config import DATA_DIR, RAW_DIR
-from kryptscout.core.kalman import KalmanBook, KalmanConfig
+from kryptscout.core.kalman import KalmanBook, KalmanConfig, conference_targets
 from kryptscout.core.elo import EloBook, EloConfig
 from kryptscout.core.schemas import Game, Prediction, Sport
 from kryptscout.datasources import espn
@@ -92,6 +118,10 @@ REQUIRED_COLUMNS = [
     "away_score",
     "status_type_completed",
     "neutral_site",
+    # D1 membership + roll-over targets (v3). Present in every hoopR season
+    # file 2003-2027; null for a non-D1 side.
+    "home_conference_id",
+    "away_conference_id",
 ]
 
 
@@ -172,11 +202,72 @@ def _canonical_names(df: pd.DataFrame) -> dict[int, str]:
 # 2026, n=5,319): log loss 0.5288 vs the Elo config's 0.5513, −0.0225
 # [−0.0281, −0.0171], accuracy 72.0%. Non-D1 guests never enter the filter;
 # the Elo book still runs for the score nudge and the flat-1200 handling.
-KALMAN_CONFIG = KalmanConfig(sigma=10.0, q=0.3, hfa=3.0, init_var=100.0, season_var=30.0)
+#
+# v3 (2026-11-14): carry 0.85 -> 0.70 TOGETHER WITH regression toward the
+# conference mean (CONF_REGRESS_WEIGHT = 1.0), picked on 2016-24 from a
+# 9-point grid. Everything else is unchanged: a coordinate search over
+# sigma/q/hfa/init_var/season_var/carry (64 configs) moved held-out log loss
+# by −0.0011 [−0.0026, +0.0003].
+KALMAN_CONFIG = KalmanConfig(
+    sigma=10.0, q=0.3, hfa=3.0, init_var=100.0, season_var=30.0, carry=0.70
+)
+CONF_REGRESS_WEIGHT = 1.0  # 0.0 = regress to zero (pre-v3; then use carry=0.85)
+
+# Generic non-D1 guest as the Kalman filter sees it: (mean, variance) in
+# points relative to the average D1 team, fitted by moments on the 4,060
+# D1-vs-non-D1 games of 2016-24. Used to PRICE the game only: as before,
+# a guarantee game does not update the D1 side's Kalman rating.
+NON_D1_PRIOR: tuple[float, float] = (-35.6, 219.0)
+
+
+def _d1_by_season(
+    df: pd.DataFrame, played: pd.DataFrame, min_d1_games: int
+) -> dict[int, set]:
+    """season -> ids of that season's D1 teams.
+
+    A D1 team carries a conference id on every row of the season's file,
+    scheduled rows included, so membership is known before a game is played.
+    The old rule — `min_d1_games` appearances — is the fallback for a season
+    (or a synthetic test frame) without conference ids; on its own it left
+    the in-progress season with no D1 teams at all until mid-December.
+    """
+    has_conf = "home_conference_id" in df.columns and "away_conference_id" in df.columns
+    out: dict[int, set] = {}
+    for season, chunk in played.groupby("season"):
+        ids: set = set()
+        if has_conf:
+            full = df[df["season"] == season]
+            ids = set(full.loc[full["home_conference_id"].notna(), "home_id"]) | set(
+                full.loc[full["away_conference_id"].notna(), "away_id"]
+            )
+        if not ids:
+            counts = pd.concat([chunk["home_id"], chunk["away_id"]]).value_counts()
+            ids = set(counts[counts >= min_d1_games].index)
+        out[int(season)] = ids
+    return out
+
+
+def _season_conferences(df: pd.DataFrame, canon: dict[int, str]) -> dict[int, dict[str, float]]:
+    """season -> {canonical displayName: conference id} (scheduled rows included)."""
+    out: dict[int, dict[str, float]] = {}
+    if "home_conference_id" not in df.columns or "away_conference_id" not in df.columns:
+        return out
+    for side in ("home", "away"):
+        rows = df[df[f"{side}_conference_id"].notna() & df[f"{side}_id"].notna()]
+        for season, team_id, conf in zip(
+            rows["season"], rows[f"{side}_id"], rows[f"{side}_conference_id"]
+        ):
+            name = canon.get(int(team_id))
+            if name is not None:
+                out.setdefault(int(season), {})[name] = float(conf)
+    return out
 
 
 def _replay(
-    df: pd.DataFrame, min_d1_games: int = MIN_D1_GAMES
+    df: pd.DataFrame,
+    min_d1_games: int = MIN_D1_GAMES,
+    through_season: int | None = None,
+    guest_records: list[dict] | None = None,
 ) -> tuple[EloBook, dict[str, deque], dict, KalmanBook]:
     """Replay completed games chronologically through a fresh EloBook.
 
@@ -184,6 +275,12 @@ def _replay(
     rolling (points_for, points_against) windows, and per-season backtest
     metrics over D1-vs-D1 games. Pure function of the frame so tests can
     drive it with synthetic data.
+
+    `through_season`: roll the books forward to this (calendar) season even
+    if none of its games is in the frame yet — the live engine passes
+    `_current_season()` so opening night is served from rolled-over ratings.
+    `guest_records`, when given, collects a backtest record for every
+    D1-vs-non-D1 game, priced with NON_D1_PRIOR as the board serves it.
     """
     # Own config copy: neutral-site games temporarily zero home advantage,
     # which must never leak into the shared module-level ELO_CONFIG.
@@ -200,18 +297,20 @@ def _replay(
         & df["away_score"].notna()
     ].sort_values(["season", "game_date"], kind="stable")
 
-    # D1 membership is per season: real D1 programs play 28+ games while
-    # non-D1 guests show up a handful of times for guarantee games.
-    d1_by_season: dict[int, set[int]] = {}
-    for season, chunk in played.groupby("season"):
-        counts = pd.concat([chunk["home_id"], chunk["away_id"]]).value_counts()
-        d1_by_season[int(season)] = set(counts[counts >= min_d1_games].index)
+    d1_by_season = _d1_by_season(df, played, min_d1_games)
+    conferences = _season_conferences(df, canon) if CONF_REGRESS_WEIGHT > 0 else {}
+
+    def roll_into(season: int) -> None:
+        # Conference of each team in the season being entered; before that
+        # season's file is published, last season's alignment stands in.
+        conf_of = conferences.get(season) or conferences.get(season - 1) or {}
+        book.new_season()
+        kalman.new_season(conference_targets(kalman.means, conf_of, CONF_REGRESS_WEIGHT))
 
     current_season: int | None = None
     for row in played.itertuples(index=False):
         if current_season is not None and row.season != current_season:
-            book.new_season()
-            kalman.new_season()
+            roll_into(int(row.season))
         current_season = row.season
 
         home_score, away_score = int(row.home_score), int(row.away_score)
@@ -245,6 +344,16 @@ def _replay(
                 records.append(
                     {"season": int(row.season), "p": p_kal, "p_elo": prob, "home_won": home_won}
                 )
+            elif guest_records is not None:
+                # Priced as the board serves it; no Kalman update (unchanged).
+                p_guest = kalman.expected(
+                    home, away, neutral=bool(row.neutral_site),
+                    home_prior=None if home_d1 else NON_D1_PRIOR,
+                    away_prior=None if away_d1 else NON_D1_PRIOR,
+                )
+                guest_records.append(
+                    {"season": int(row.season), "p": p_guest, "p_elo": prob, "home_won": home_won}
+                )
             book.update(home, away, home_won, margin=abs(home_score - away_score))
         finally:
             book.config.home_advantage = hfa
@@ -263,6 +372,12 @@ def _replay(
                 rolling.setdefault(team, deque(maxlen=ROLLING_WINDOW)).append(
                     (pf, pa)
                 )
+
+    # The calendar has moved on but no game of the new season is in the frame
+    # yet (opening night, or the off-season): roll forward anyway.
+    if current_season is not None and through_season is not None:
+        for season in range(int(current_season) + 1, int(through_season) + 1):
+            roll_into(season)
 
     return book, rolling, _compute_metrics(records), kalman
 
@@ -298,12 +413,16 @@ def _compute_metrics(records: list[dict]) -> dict:
 
 class NcaabEngine(SportEngine):
     sport = Sport.NCAAB
-    model_name = "ncaab-kalman-v2"
+    model_name = "ncaab-kalman-v3"
 
     def __init__(self, state_path: Path = STATE_PATH) -> None:
         self.state_path = state_path
         self.book = EloBook(config=replace(ELO_CONFIG))
         self.kalman = KalmanBook(KALMAN_CONFIG)
+        # Canonical names of this season's D1 teams (conference id in the
+        # schedule file). Empty until the first v3 refresh; from then on any
+        # side not in it is priced as the generic non-D1 prior.
+        self.d1_teams: set[str] = set()
         self.rolling: dict[str, deque] = {}
         self.metrics: dict = {}
         self._load_state()
@@ -318,8 +437,10 @@ class NcaabEngine(SportEngine):
             # Neutral sites (March Madness, early-season tournaments) get
             # zero home advantage in both the win prob and the score nudge.
             hfa = 0.0 if game.neutral_site else self.book.config.home_advantage
+            home_key, away_key = self._resolve(game.home), self._resolve(game.away)
             p_home = self.kalman.expected(
-                self._resolve(game.home), self._resolve(game.away), neutral=game.neutral_site
+                home_key, away_key, neutral=game.neutral_site,
+                home_prior=self._prior(home_key), away_prior=self._prior(away_key),
             )
             home_score = (
                 self._avg(game.home, idx=0) + self._avg(game.away, idx=1)
@@ -356,16 +477,42 @@ class NcaabEngine(SportEngine):
     async def refresh_data(self) -> None:
         paths = await _download_schedules(_seasons())
         df = _load_frame(paths)
-        self.book, self.rolling, self.metrics, self.kalman = _replay(df)
+        guest_records: list[dict] = []
+        self.book, self.rolling, self.metrics, self.kalman = _replay(
+            df, through_season=_current_season(), guest_records=guest_records
+        )
+        if guest_records:
+            self.metrics["non_d1_guest"] = {
+                "games": len(guest_records),
+                "accuracy": sum((r["p"] >= 0.5) == r["home_won"] for r in guest_records)
+                / len(guest_records),
+                "log_loss": _log_loss([(r["p"], r["home_won"]) for r in guest_records]),
+            }
+        canon = _canonical_names(df)
+        latest = df[df["season"] == df["season"].max()]
+        ids = set(latest.loc[latest["home_conference_id"].notna(), "home_id"]) | set(
+            latest.loc[latest["away_conference_id"].notna(), "away_id"]
+        )
+        self.d1_teams = {canon[int(i)] for i in ids if int(i) in canon}
         self._save_state()
 
     # -- rating / rolling lookups (alias- and unknown-team-aware) -----------
 
     def _resolve(self, team: str) -> str:
         """Book key for a live ESPN name, following post-data rebrands."""
-        if team in self.book.ratings:
+        if team in self.book.ratings or team in self.d1_teams:
             return team
         return PREDICT_ALIASES.get(team, team)
+
+    def _prior(self, key: str) -> tuple[float, float] | None:
+        """NON_D1_PRIOR for a side that is not a D1 team this season, else None.
+
+        Without a membership list (a state written before v3) every side is
+        looked up in the book as before, so nothing changes until a refresh.
+        """
+        if not self.d1_teams or key in self.d1_teams:
+            return None
+        return NON_D1_PRIOR
 
     def _rating(self, team: str) -> float:
         """Elo rating; unknown teams (non-D1 guests) are flat 1200."""
@@ -393,6 +540,7 @@ class NcaabEngine(SportEngine):
             "model": self.model_name,
             "ratings": self.book.ratings,
             "kalman": self.kalman.to_state(),
+            "d1_teams": sorted(self.d1_teams),
             "rolling": {team: list(w) for team, w in self.rolling.items()},
             "metrics": self.metrics,
         }
@@ -413,6 +561,9 @@ class NcaabEngine(SportEngine):
             ratings={k: float(v) for k, v in state.get("ratings", {}).items()},
         )
         self.kalman = KalmanBook.from_state(KALMAN_CONFIG, state.get("kalman"))
+        self.d1_teams = (
+            set(state.get("d1_teams") or []) if state.get("model") == self.model_name else set()
+        )
         self.rolling = {
             team: deque((tuple(g) for g in window), maxlen=ROLLING_WINDOW)
             for team, window in state.get("rolling", {}).items()

@@ -15,13 +15,15 @@ import sys
 from datetime import date, datetime, timedelta, timezone
 from typing import Literal
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator
 
 from kryptscout import config, license as license_mod, logsetup
 from kryptscout.autobet import engine as autobet_engine
+from kryptscout.autobet import kalshi_trade, pmus_trade
 from kryptscout.autobet import polymarket_auth
+from kryptscout.autobet import venues as autobet_venues
 from kryptscout.core import arb as arb_mod
 from kryptscout.core import fair as fair_mod
 from kryptscout.core import forecast as forecast_mod
@@ -38,9 +40,13 @@ from kryptscout.jobs import backfill as backfill_job
 from kryptscout.jobs import capture as capture_job
 from kryptscout.jobs import refresh as refresh_job
 from kryptscout.jobs import settle as settle_job
+from kryptscout.mcp import http as mcp_http
+from kryptscout.mcp import store as mcp_store
+from kryptscout.odds import compare as compare_mod
 from kryptscout.odds import providers as odds_providers
 from kryptscout.sports import base as engines
 from kryptscout.store import backtest as backtest_store
+from kryptscout.store import cardrecord
 from kryptscout.store import db, roibacktest, tracker
 from kryptscout.store import picks as picks_mod
 
@@ -94,12 +100,21 @@ def _load_engines() -> None:
             logging.getLogger("kryptscout").warning(
                 "engine %s unavailable: %s", name, exc, exc_info=True
             )
+    try:
+        removed = refresh_job.purge_retired_artifacts()
+    except Exception:  # noqa: BLE001 — housekeeping must never cost an engine
+        removed = []
+    if removed:
+        logging.getLogger("kryptscout").info(
+            "removed retired model artifacts: %s", ", ".join(removed)
+        )
 
 
 # Engine registration is the single most expensive thing this process does:
-# importing the sports modules pulls numpy/pandas/sklearn/scipy/xgboost, which
-# on a cold disk takes ~25-35s (measured on macOS arm64, first launch after
-# install). While a uvicorn startup handler is running NOTHING is served — not
+# importing the sports modules pulls numpy/pandas — and, until the trained
+# overlays were retired in November 2026, sklearn/scipy/xgboost, which is the
+# stack the ~25-35s cold-disk figure was measured with (macOS arm64, first
+# launch after install). While a uvicorn startup handler is running NOTHING is served — not
 # even /api/health — so doing this inline made the Electron supervisor's
 # startup health probe time out and SIGKILL a backend that was working fine,
 # restarting into an even colder start. Load on a worker thread instead: the
@@ -144,10 +159,32 @@ async def _await_engines() -> None:
         )
 
 
+def _sync_mcp() -> None:
+    """Bring the MCP bridge in line with the user's switch (kryptscout/mcp).
+
+    With agent access on this writes <userData>/mcp/bridge.json — this
+    launch's port — which is how the stdio relay a client started finds us.
+    Never fatal: the app must come up whether or not an agent can reach it."""
+    try:
+        state = mcp_store.sync()
+        if state["enabled"]:
+            logger.info("mcp: agent access is on (port %s)", state["port"])
+    except Exception:  # noqa: BLE001
+        logger.exception("mcp: could not sync the bridge")
+
+
+def _stop_mcp() -> None:
+    try:
+        mcp_store.clear_bridge()
+    except Exception:  # noqa: BLE001
+        pass
+
+
 app = FastAPI(
     title="Krypt Scout",
     version="0.1.0",
-    on_startup=[_log_startup, _start_engine_load],
+    on_startup=[_log_startup, _start_engine_load, _sync_mcp],
+    on_shutdown=[_stop_mcp],
 )
 
 # App-wide license gate. Krypt Scout is licensed software: without an active
@@ -522,6 +559,49 @@ async def picks(
     )
 
 
+class CardPostedRequest(BaseModel):
+    """POST /api/picks/card/posted body — the card rows a post just sent (as
+    POST /api/picks/card returned them) and the sender's local date."""
+
+    date: date
+    picks: list[dict] = Field(default_factory=list, max_length=cardrecord.MAX_ROWS)
+
+
+@app.post("/api/picks/card/posted")
+def picks_card_posted(body: CardPostedRequest) -> dict:
+    """Write down the picks of a card that went out, so the record can be
+    graded on what was really sent (store/cardrecord.py). A game already
+    recorded is left as it was. {"saved": n}."""
+    return {"saved": cardrecord.save(body.date, body.picks)}
+
+
+@app.get("/api/picks/card/record")
+def picks_card_record(today: date | None = Query(default=None)) -> dict:
+    """How the posted cards have done: {"overall": {wins, losses, pushes,
+    pending, units, since}, "last": {date, wins, losses, ...} | null}. `today`
+    is the caller's local date; `last` is the most recent graded card day
+    before it."""
+    return _json_safe(cardrecord.summary(today))
+
+
+class DailyCardRequest(BaseModel):
+    """POST /api/picks/card body — pick rows as GET /api/picks serves them,
+    and how many to keep."""
+
+    picks: list[dict] = Field(default_factory=list, max_length=compare_mod.MAX_CANDIDATES)
+    limit: int = Field(compare_mod.DEFAULT_CARD, ge=1, le=compare_mod.MAX_CARD)
+
+
+@app.post("/api/picks/card")
+async def picks_card(body: DailyCardRequest) -> dict:
+    """The day's short card from a full list of picks (odds/compare.py): one
+    pick per game, value picks first, then the favourites worth backing — each
+    with its win probability, its price on Polymarket, Kalshi and Polymarket
+    US, and the cheapest of them after fees. {"card": [...], "candidates": n}.
+    Read-only and account-free."""
+    return _json_safe(await compare_mod.daily_card(body.picks, body.limit))
+
+
 class MyBetRequest(BaseModel):
     """POST /api/mybets body — one of the user's own bets to log."""
 
@@ -662,8 +742,9 @@ async def models() -> dict:
     and one tracker.performance() query. Per engine:
       state     file_summary of DATA_DIR/{sport}_state.json ({exists, file,
                 size_kb, updated_at}; exists=False with nulls when missing)
-      pickle    same shape for the sport's MODELS_DIR pickle (nfl_xgb_v3.pkl
-                etc.), or null when the engine keeps no pickle
+      pickle    same shape for a MODELS_DIR pickle named after the sport,
+                or null when there is none — which is every engine today
+                (none of them fits or stores a model)
       live      this sport's settled-game metrics {n, accuracy, log_loss,
                 brier} from tracker.performance(), or null with no history
       backtest  static walk-forward metrics persisted in the state json
@@ -792,8 +873,9 @@ class ModelRefreshRequest(BaseModel):
 async def models_refresh(sport: Sport, body: ModelRefreshRequest | None = None) -> dict:
     """Run one engine's refresh_data() and report what happened.
 
-    force_retrain deletes the sport's MODELS_DIR pickle(s) first so pickle
-    staleness logic (nfl, nba) retrains. Returns {sport, ok, seconds, log
+    force_retrain deletes any MODELS_DIR pickle named after the sport first.
+    No engine writes one today, so it is equivalent to a plain refresh; the
+    flag stays for an engine that does. Returns {sport, ok, seconds, log
     (captured "kryptscout" logging + runner summary lines), state (updated
     state-file summary), summary}. Engine failures are ok=false with the
     traceback tail in log — never a 500; see jobs.refresh.refresh_sport
@@ -814,7 +896,12 @@ async def jobs_refresh() -> dict:
     Same logic as `python -m kryptscout.jobs.refresh`: every registered
     engine's refresh_data(), sequentially, one failure never sinking the
     rest. Returns {"results": {sport: {ok, seconds, summary}}}.
+
+    Waits for the engine registry first: called while the sports modules are
+    still importing it would refresh nothing and report success, and the
+    scheduler takes that success as "the ratings are up to date".
     """
+    await _await_engines()
     results = await refresh_job.refresh_all()
     return _json_safe(
         {
@@ -839,11 +926,12 @@ async def jobs_capture(body: CaptureRequest | None = None) -> dict:
     Same logic as `python -m kryptscout.jobs.capture`: build boards for the
     requested sports (all registered engines when the body is omitted),
     including market odds from every configured provider, and record them.
-    When autobet is enabled, a sweep runs over the freshly recorded picks
+    When autobet is enabled, a sweep runs over the freshly built boards
     right after the capture (its summary rides along; a sweep failure never
     fails the capture). Returns {"results": {sport: counts or {"error":
     message}}, "autobet": sweep summary | None}.
     """
+    await _await_engines()
     sports = body.sports if body is not None else None
     results = await capture_job.capture_all(sports)
     autobet_summary = None
@@ -857,9 +945,10 @@ async def jobs_capture(body: CaptureRequest | None = None) -> dict:
 
 
 # ------------------------------------------------------------------- autobet
-# Polymarket auto-betting (kryptscout/autobet). Real-money surface: the
-# engine defaults to disabled + dry-run; wallet material lives in the
-# encrypted credential store (polymarket_auth), never in these responses.
+# Auto-betting on Polymarket, Kalshi and Polymarket US (kryptscout/autobet).
+# Real-money surface: the engine defaults to disabled + dry-run; wallet and
+# API-key material lives in the encrypted credential store, never in these
+# responses and never in a log line.
 
 
 class AutobetSettingsRequest(BaseModel):
@@ -879,6 +968,11 @@ class AutobetSettingsRequest(BaseModel):
     min_win_prob: float | None = None
     min_edge: float | None = None
     tiers: list[str] | None = None
+    venues: list[str] | None = None
+    kalshi_auto_move: bool | None = None
+    agent_mode: Literal["off", "paper", "live"] | None = None
+    agent_max_usd: float | None = None
+    agent_max_bets_per_day: int | None = None
     sports: list[str] | None = None
     best_edge_only: bool | None = None
     max_bets_per_day: int | None = None
@@ -916,8 +1010,8 @@ async def autobet_settings(body: AutobetSettingsRequest) -> dict:
     saved = autobet_engine.save_settings(patch)
     # The two switches that gate real money deserve an explicit, greppable line.
     logger.info(
-        "autobet now: enabled=%s mode=%s", saved["enabled"],
-        "LIVE" if not saved["dry_run"] else "paper",
+        "autobet now: enabled=%s mode=%s agents=%s", saved["enabled"],
+        "LIVE" if not saved["dry_run"] else "paper", saved["agent_mode"],
     )
     return saved
 
@@ -1007,6 +1101,70 @@ async def autobet_wallet_clear() -> dict:
     polymarket_auth.clear_credentials()
     logger.info("autobet wallet cleared")
     return {"cleared": True}
+
+
+class AutobetVenueKeyRequest(BaseModel):
+    """POST /api/autobet/venues/{venue}/credentials body. Kalshi: the API key
+    ID and the private key file's text (PEM). Polymarket US: the key ID and
+    the base64 secret from its developer page."""
+
+    key_id: str
+    secret: str
+
+
+# Venues connected with an API key pair. Polymarket (the crypto exchange)
+# connects with a wallet through /api/autobet/wallet.
+_KEYED_VENUES = {"kalshi": kalshi_trade, "polymarket_us": pmus_trade}
+
+
+def _keyed_venue(venue: str):
+    module = _KEYED_VENUES.get(venue)
+    if module is None:
+        raise HTTPException(404, f"No API-key venue named {venue!r}")
+    return module
+
+
+async def _venue_check(venue: str) -> dict:
+    try:
+        return await autobet_venues.get(venue).check()
+    except Exception as exc:  # noqa: BLE001 — the key is saved; report the probe
+        logger.warning("autobet %s check failed: %s", venue, type(exc).__name__)
+        return {"ok": False, "error": f"Could not check the account ({type(exc).__name__})."}
+
+
+@app.post("/api/autobet/venues/{venue}/credentials")
+async def autobet_venue_connect(venue: str, body: AutobetVenueKeyRequest) -> dict:
+    """Save an exchange API key (encrypted at rest) and probe it once.
+
+    Returns {"venues": [...], "check": {"ok", "balance_usd"} | {"ok": False,
+    "error"}} — the check needs the network, so its failure still leaves the
+    key saved."""
+    module = _keyed_venue(venue)
+    try:
+        module.save_credentials(body.key_id, body.secret)
+    except ValueError as exc:
+        logger.warning("autobet %s key rejected: %s", venue, exc)
+        raise HTTPException(422, str(exc))
+    logger.info("autobet %s key saved (encrypted); probing the account", venue)
+    return _json_safe({"venues": autobet_venues.status(), "check": await _venue_check(venue)})
+
+
+@app.post("/api/autobet/venues/{venue}/test")
+async def autobet_venue_test(venue: str) -> dict:
+    """One signed read with the saved key: reachable, accepted, and the
+    balance (network)."""
+    module = _keyed_venue(venue)
+    if not module.credentials_present():
+        raise HTTPException(404, "No API key saved for this exchange")
+    return _json_safe(await _venue_check(venue))
+
+
+@app.delete("/api/autobet/venues/{venue}/credentials")
+async def autobet_venue_disconnect(venue: str) -> dict:
+    """Delete a saved exchange API key."""
+    _keyed_venue(venue).clear_credentials()
+    logger.info("autobet %s key cleared", venue)
+    return _json_safe({"cleared": True, "venues": autobet_venues.status()})
 
 
 @app.post("/api/autobet/run")
@@ -1170,3 +1328,56 @@ async def health() -> dict:
         "enginesReady": _engines_ready.is_set(),
         "sports": len(engines.all_engines()),
     }
+
+
+# ----------------------------------------------------------------------- MCP
+# AI agents (Claude, Cursor, Codex, …) reach the app through kryptscout/mcp.
+# Two surfaces, two different callers:
+#
+#   /mcp        the agent's door. Outside the /api prefix on purpose: it is
+#               not the renderer's and does not take the renderer's per-launch
+#               X-Scout-Token. It takes its own persistent bearer token, from
+#               loopback only, and only while the user has agent access on
+#               (mcp/http.py). The license check is made HERE rather than left
+#               to _license_gate, which only looks at /api.
+#   /api/mcp/*  the renderer's controls for that door: the switch, the token,
+#               who has connected. Behind both /api gates like everything else.
+
+
+@app.api_route("/mcp", methods=["GET", "POST", "DELETE"], include_in_schema=False)
+async def mcp_endpoint(request: Request):
+    if not _licensed_now():
+        from starlette.responses import JSONResponse
+        return JSONResponse(
+            {"detail": "License required", "licenseRequired": True}, status_code=402
+        )
+    return await mcp_http.handle(request)
+
+
+class McpSettingsRequest(BaseModel):
+    """POST /api/mcp/settings body."""
+
+    enabled: bool
+
+
+@app.get("/api/mcp")
+async def mcp_status() -> dict:
+    """The AI Agents page: the switch, the tools, who connected, the audit."""
+    return _json_safe(mcp_store.status())
+
+
+@app.post("/api/mcp/settings")
+async def mcp_settings(body: McpSettingsRequest) -> dict:
+    """Turn agent access on or off. On mints the token (first time) and writes
+    the bridge; off removes the bridge and drops every session."""
+    mcp_store.set_enabled(body.enabled)
+    mcp_store.sync()
+    return _json_safe(mcp_store.status())
+
+
+@app.post("/api/mcp/token/rotate")
+async def mcp_rotate_token() -> dict:
+    """Mint a new agent token. Clients launched through the relay pick it up
+    on their next call; anything holding the old token by hand stops working."""
+    mcp_store.rotate_token()
+    return _json_safe(mcp_store.status())

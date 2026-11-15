@@ -22,6 +22,18 @@ pro sport the same filter was within noise of Elo, so it ships only where
 it won, and college is also where the exchanges quote almost nothing — the
 standalone forecast IS the displayed number there.
 
+Lower-division opponents (2026-11-14). A side can be passed as a PRIOR —
+a fixed (mean, variance) that is used for the game and never written back.
+That is how an FCS team (football) or a non-D1 guest (basketball) is priced:
+as one generic lower-division opponent, the Kalman counterpart of the Elo
+book's flat 1250 / 1200. Before this, such a side was simply missing from
+the book and priced as (0, init_var) — an AVERAGE rated team — so the live
+board gave an FBS host about 62% against an FCS visitor it beats 95% of the
+time (held-out 2025-26: log loss 0.514 on those games, 0.155 with the prior).
+
+Season roll-over can regress toward per-team TARGETS (the mean of the
+team's conference) instead of zero; see `conference_targets`.
+
 Tuned constants live in each engine (KALMAN_CONFIG); this module is the
 mechanism only.
 """
@@ -29,6 +41,9 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
+from typing import Hashable, Mapping, Optional
+
+Prior = Optional[tuple[float, float]]  # (mean, variance) of a side that is not in the book
 
 
 @dataclass(frozen=True)
@@ -45,6 +60,31 @@ def _phi(x: float) -> float:
     return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
 
 
+def conference_targets(
+    means: Mapping[str, float], conference_of: Mapping[str, Hashable], weight: float = 1.0
+) -> dict[str, float]:
+    """Roll-over targets: `weight` × the mean strength of each team's conference.
+
+    `conference_of` maps a team to its conference in the NEW season; the mean
+    is taken over the teams already in the book (their end-of-season
+    strengths), so a team that changed conference regresses toward where it
+    is going. Teams without a conference get no entry (they regress to 0).
+    """
+    sums: dict[Hashable, float] = {}
+    counts: dict[Hashable, int] = {}
+    for team, conf in conference_of.items():
+        if conf is None or conf != conf or team not in means:  # None / NaN / unrated
+            continue
+        sums[conf] = sums.get(conf, 0.0) + means[team]
+        counts[conf] = counts.get(conf, 0) + 1
+    conf_mean = {conf: sums[conf] / counts[conf] for conf in sums}
+    return {
+        team: weight * conf_mean[conf]
+        for team, conf in conference_of.items()
+        if conf in conf_mean
+    }
+
+
 @dataclass
 class KalmanBook:
     config: KalmanConfig
@@ -54,41 +94,72 @@ class KalmanBook:
     def get(self, team: str) -> tuple[float, float]:
         return self.means.get(team, 0.0), self.vars.get(team, self.config.init_var)
 
-    def margin(self, home: str, away: str, neutral: bool = False) -> tuple[float, float]:
+    def margin(
+        self,
+        home: str,
+        away: str,
+        neutral: bool = False,
+        home_prior: Prior = None,
+        away_prior: Prior = None,
+    ) -> tuple[float, float]:
         """(mean, sd) of the predictive home-minus-away margin."""
-        mh, vh = self.get(home)
-        ma, va = self.get(away)
+        mh, vh = home_prior if home_prior is not None else self.get(home)
+        ma, va = away_prior if away_prior is not None else self.get(away)
         mu = mh - ma + (0.0 if neutral else self.config.hfa)
         sd = math.sqrt(vh + va + self.config.sigma ** 2)
         return mu, sd
 
-    def expected(self, home: str, away: str, neutral: bool = False) -> float:
+    def expected(
+        self,
+        home: str,
+        away: str,
+        neutral: bool = False,
+        home_prior: Prior = None,
+        away_prior: Prior = None,
+    ) -> float:
         """P(home wins) before the game."""
-        mu, sd = self.margin(home, away, neutral)
+        mu, sd = self.margin(home, away, neutral, home_prior, away_prior)
         return _phi(mu / sd)
 
     def update(
-        self, home: str, away: str, home_score: int, away_score: int, neutral: bool = False
+        self,
+        home: str,
+        away: str,
+        home_score: int,
+        away_score: int,
+        neutral: bool = False,
+        home_prior: Prior = None,
+        away_prior: Prior = None,
     ) -> float:
-        """One result through the filter; returns the pre-game P(home)."""
-        p_home = self.expected(home, away, neutral)
-        mh, vh = self.get(home)
-        ma, va = self.get(away)
+        """One result through the filter; returns the pre-game P(home).
+
+        A side passed as a prior takes part in the update (so the rated side
+        learns from the game) but is never stored.
+        """
+        p_home = self.expected(home, away, neutral, home_prior, away_prior)
+        mh, vh = home_prior if home_prior is not None else self.get(home)
+        ma, va = away_prior if away_prior is not None else self.get(away)
         vh += self.config.q
         va += self.config.q
         mu = mh - ma + (0.0 if neutral else self.config.hfa)
         total = vh + va + self.config.sigma ** 2
         innovation = (home_score - away_score) - mu
-        self.means[home] = mh + vh / total * innovation
-        self.means[away] = ma - va / total * innovation
-        self.vars[home] = vh - vh * vh / total
-        self.vars[away] = va - va * va / total
+        if home_prior is None:
+            self.means[home] = mh + vh / total * innovation
+            self.vars[home] = vh - vh * vh / total
+        if away_prior is None:
+            self.means[away] = ma - va / total * innovation
+            self.vars[away] = va - va * va / total
         return p_home
 
-    def new_season(self) -> None:
+    def new_season(self, targets: Mapping[str, float] | None = None) -> None:
+        """Season boundary: add variance, shrink every strength toward its
+        target (0 when none is given — the original behaviour)."""
+        carry = self.config.carry
         for team in list(self.vars):
             self.vars[team] += self.config.season_var
-            self.means[team] *= self.config.carry
+            target = targets.get(team, 0.0) if targets else 0.0
+            self.means[team] = carry * self.means[team] + (1.0 - carry) * target
 
     # -- persistence ---------------------------------------------------------
 

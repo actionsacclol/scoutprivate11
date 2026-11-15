@@ -244,7 +244,7 @@ def test_predict_probabilities_and_totals(tmp_path):
     [pred] = asyncio.run(
         engine.predict([_game("Duke Blue Devils", "Longwood Lancers")])
     )
-    assert pred.model == "ncaab-kalman-v2"
+    assert pred.model == "ncaab-kalman-v3"
     assert pred.home_win_prob + pred.away_win_prob == pytest.approx(1.0)
     assert pred.home_win_prob > 0.9  # 45-point strength gap plus home court
     # home = (Duke PF 83 + LW PA 79)/2 = 81, away = (LW PF 68 + Duke PA 64)/2 = 66,
@@ -353,7 +353,7 @@ def test_corrupt_state_is_ignored(tmp_path):
 def test_build_engine_contract():
     engine = build_engine()
     assert engine.sport is Sport.NCAAB
-    assert engine.model_name == "ncaab-kalman-v2"
+    assert engine.model_name == "ncaab-kalman-v3"
     assert ELO_CONFIG.k == 30.0
     assert ELO_CONFIG.home_advantage == 90.0
     assert ELO_CONFIG.season_carry == 0.55

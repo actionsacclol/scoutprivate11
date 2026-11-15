@@ -5,6 +5,7 @@ import { existsSync, mkdirSync } from 'node:fs';
 import net from 'node:net';
 import { join } from 'node:path';
 import type { BackendInfo, BackendStatus, LogEntry } from '../../shared/types';
+import type { RelaySpec } from './mcp-clients';
 
 // ──────────────────────────────────────────────────────────────────────
 // Backend lifecycle manager (Zeus pattern, adapted to an HTTP backend).
@@ -249,6 +250,33 @@ class PythonBackend {
     for (const h of this.logHandlers) h(entry);
   }
 
+  /**
+   * How an AI client launches the MCP stdio relay: this app's own backend
+   * binary with `--mcp` (backend/kryptscout/mcp/stdio.py). No port and no
+   * token — the relay finds the running backend through
+   * <userData>/mcp/bridge.json and reads the token from the encrypted store —
+   * so the entry written into a client's config stays valid across launches.
+   *
+   * Null when there is no binary to point at (a dev checkout without the
+   * venv): a system `python` is not something to hard-code into another
+   * program's config file.
+   */
+  relaySpec(): RelaySpec | null {
+    const env = { KRYPT_SCOUT_USERDATA: app.getPath('userData') };
+    if (app.isPackaged) {
+      const base = join(process.resourcesPath, 'python', 'krypt-scout-backend');
+      const exe = join(base, process.platform === 'win32' ? 'krypt-scout-backend.exe' : 'krypt-scout-backend');
+      return existsSync(exe) ? { command: exe, args: ['--mcp'], env } : null;
+    }
+    const backendDir = join(process.cwd(), 'backend');
+    const venvPy = process.platform === 'win32'
+      ? join(backendDir, '.venv', 'Scripts', 'python.exe')
+      : join(backendDir, '.venv', 'bin', 'python');
+    const entry = join(backendDir, 'run_backend.py');
+    if (!existsSync(venvPy) || !existsSync(entry)) return null;
+    return { command: venvPy, args: [entry, '--mcp'], env };
+  }
+
   private resolveBackendBin(port: number): { cmd: string; args: string[]; cwd: string } | null {
     // Production: ship a PyInstaller onedir bundle under
     // resources/python/krypt-scout-backend/ (see scripts/py-bundle.mjs and
@@ -356,6 +384,9 @@ class PythonBackend {
             KRYPT_SCOUT_USERDATA: userData,
             KRYPT_APP_VERSION: app.getVersion(),
             KRYPT_SCOUT_API_TOKEN: this.apiToken,
+            // The MCP bridge file (kryptscout/mcp/store.py) records the port
+            // of THIS launch so an AI client's stdio relay can find it.
+            KRYPT_SCOUT_PORT: String(port),
             PYTHONUNBUFFERED: '1',
             PYTHONIOENCODING: 'utf-8',
           },

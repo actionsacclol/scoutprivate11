@@ -80,6 +80,9 @@ export interface SchedulerInfo {
   nextRuns: Record<SchedulerJob, string | null>;
   /** Job currently executing, if any (runs are serialized, never overlap). */
   inFlight: SchedulerJob | null;
+  /** ISO time the engines' data was last fully refreshed; null = never on
+   *  this install (the first-run history download has not finished). */
+  refreshedAt?: string | null;
 }
 
 // ── Discord picks webhooks ───────────────────────────────────────────
@@ -93,17 +96,58 @@ export interface DiscordWebhook {
   /** User label, e.g. "The Boys server #picks". */
   name: string;
   url: string;
-  /** The Scout avatar has been PATCHed onto this webhook (one-time, best-effort). */
-  avatarSet?: boolean;
 }
 
 export interface DiscordConfig {
   enabled: boolean;
   /** Local HH:MM 24h time for the daily auto-post, e.g. "11:00". */
   sendAt: string;
-  /** Include only these tiers; default ["STRONG", "LEAN"]. */
+  /** Include only these tiers; default all three (STRONG, LEAN, MODEL). */
   tiers: string[];
+  /** The most picks in one post (1-12, default 6): the card is cut to this. */
+  maxPicks: number;
   webhooks: DiscordWebhook[];
+}
+
+/** One exchange's price for a pick's side, as the post shows it. */
+export interface DiscordPreviewQuote {
+  label: string;
+  /** Screen price, e.g. "58¢". */
+  price: string;
+  /** That exchange's sign-up link (never a market page). */
+  url: string;
+  /** The cheapest after fees — bold when there is more than one. */
+  best: boolean;
+}
+
+/** One pick as the post shows it. */
+export interface DiscordPreviewPick {
+  key: string;
+  /** Sport tag, e.g. "NBA". */
+  tag: string;
+  team: string;
+  tier: string;
+  /** The rest of the line, e.g. "ML  ·  vs Miami Heat  ·  68% to win". */
+  detail: string;
+  /** ISO kickoff, or null. */
+  kickoff: string | null;
+  exchanges: DiscordPreviewQuote[];
+}
+
+/** What a send would post right now. */
+export interface DiscordPreview {
+  picks: DiscordPreviewPick[];
+  /** How many games the card was chosen from. */
+  candidates: number;
+  /** The sign-up links that close every post, and the words before them. */
+  signups: { label: string; url: string }[];
+  signupLead: string;
+  /** The embed footer (the legal line). */
+  footer: string;
+  /** The posted cards' graded record, as the line the post carries — plain
+   *  text, "" until a posted pick has been graded. */
+  record: string;
+  error?: string;
 }
 
 export interface DiscordSend {
@@ -164,11 +208,57 @@ export interface SystemConfig {
 export interface AppState {
   windowBounds?: WindowBounds;
   scheduler?: SchedulerConfig;
+  /** Scheduler bookkeeping (not user config): the last full engine refresh. */
+  schedulerState?: { refreshedAt?: string; refreshedVersion?: string };
   discord?: DiscordConfig;
   system?: SystemConfig;
   /** Set automatically after repeated GPU-process crashes: boot with
    *  hardware acceleration off (the macOS/older-GPU black-screen fix). */
   disableGpu?: boolean;
+}
+
+// ── AI agents (MCP) ──────────────────────────────────────────────────
+// The MCP server lives in the Python backend (backend/kryptscout/mcp); its
+// status and switch are plain HTTP (/api/mcp). What needs Electron is writing
+// the launch entry into OTHER programs' config files — see
+// electron/system/mcp-clients.ts.
+
+export type McpClientId =
+  | 'claude-desktop'
+  | 'claude-code'
+  | 'cursor'
+  | 'codex'
+  | 'windsurf'
+  | 'vscode';
+
+/** One AI client the app can be connected to, and where it stands. */
+export interface McpClientSetup {
+  id: McpClientId;
+  label: string;
+  /** The name the server is filed under in that client ("krypt-scout"). */
+  serverName: string;
+  /** The config file the entry goes in (null: paste-only client). */
+  configPath: string | null;
+  /** Every file one click writes (Claude Desktop can have two installs). */
+  configPaths?: string[];
+  /** That client looks installed on this computer. */
+  detected: boolean;
+  /** Our entry is already in its config. */
+  installed: boolean;
+  /** One-click Add is available (false: copy the snippet by hand). */
+  canInstall: boolean;
+  /** What to paste by hand. Never contains a token. */
+  snippet: string;
+  snippetKind: 'json' | 'toml' | 'shell';
+  note: string;
+}
+
+export interface McpInstallResult {
+  ok: boolean;
+  /** A sentence for the user: what happened, and what to do next. */
+  message: string;
+  files: string[];
+  backups: string[];
 }
 
 // ── The preload surface (window.scout) ───────────────────────────────
@@ -205,8 +295,10 @@ export interface ScoutApi {
     setConfig(partial: Partial<DiscordConfig>): Promise<DiscordInfo>;
     /** Post today's picks to every configured webhook right now. */
     sendNow(): Promise<DiscordInfo>;
-    /** Post a short test message to one webhook URL. */
+    /** Post today's real card to one webhook URL. */
     test(url: string): Promise<{ ok: boolean; error?: string }>;
+    /** What a send would post right now (posts nothing). */
+    preview?(): Promise<DiscordPreview>;
   };
   /** Optional while rolling out — always access via window.scout?.updater?. */
   updater?: {
@@ -217,6 +309,17 @@ export interface ScoutApi {
     /** Download the available update, then quit into the installer. */
     downloadAndInstall(): Promise<void>;
     onState(cb: (state: UpdaterState) => void): () => void;
+  };
+  /** Optional while rolling out — always access via window.scout?.mcp?. */
+  mcp?: {
+    /** Every supported AI client: detected, connected, and its paste-in setup. */
+    clients(): Promise<McpClientSetup[]>;
+    /** Write our launch entry into that client's config (backup kept). */
+    install(id: McpClientId): Promise<McpInstallResult>;
+    /** Remove our entry from that client's config; nothing else is touched. */
+    uninstall(id: McpClientId): Promise<McpInstallResult>;
+    /** Show the folder that client reads its config from. False if unknown. */
+    openConfigFolder(id: McpClientId): Promise<boolean>;
   };
   window: {
     minimize(): void;

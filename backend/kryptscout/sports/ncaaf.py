@@ -28,6 +28,22 @@ displayName throughout. Coverage is exact for every FBS school 2021-2025; an
 accent-folded lookup backstops encoding drift, and an unmatched school falls
 back to its own name so it still keeps a coherent rating.
 
+FCS opponents in the Kalman filter (v3, 2026-11-14). The served win
+probability comes from the Kalman book, and until v3 that book had no notion
+of an FCS side at predict time: the replay stored FCS teams under their raw
+school names, the live board asked for them by ESPN displayName, missed, and
+priced every FCS visitor as (0, init_var) — an average FBS team. Held out
+(2025 + 2026, 249 FBS-vs-FCS games) that cost 0.514 log loss on games the
+FBS side wins 95% of the time. v3 prices an FCS side as one generic prior
+(FCS_PRIOR, fitted by moments on 2022-24: mean −29.4 points, variance 58),
+used in the update and never stored — the Kalman counterpart of FCS_RATING.
+Same games: 0.155. All served games 2025-26: 0.5397 -> 0.4834.
+
+Season roll-over regresses toward the conference mean (CONF_REGRESS_WEIGHT)
+rather than zero: −0.004 [−0.009, +0.001] on the same held-out games, all
+of it in weeks 1-4. Set the weight to 0.0 and KALMAN_CONFIG.carry back to
+0.85 to switch it off.
+
 Optional enrichment: when CFBD_API_KEY is set, closing spreads from
 CollegeFootballData.com score the market's straight-up favorite on the
 backtest slice for comparison. Without the key (or on any API failure) the
@@ -50,7 +66,7 @@ import httpx
 import pandas as pd
 
 from kryptscout.config import DATA_DIR, RAW_DIR
-from kryptscout.core.kalman import KalmanBook, KalmanConfig
+from kryptscout.core.kalman import KalmanBook, KalmanConfig, conference_targets
 from kryptscout.core.elo import EloBook, EloConfig
 from kryptscout.core.schemas import Game, Prediction, Sport
 from kryptscout.datasources import espn
@@ -119,15 +135,32 @@ def make_resolver(school_to_display: dict[str, str]) -> Callable[[str], str]:
 
 
 def _parse_teams_payload(payload: dict) -> dict[str, str]:
-    """ESPN teams directory -> {location ("Georgia"): displayName ("Georgia Bulldogs")}."""
+    """ESPN teams directory -> {location ("Georgia"): displayName ("Georgia Bulldogs")}.
+
+    The directory covers every division, and a few locations appear twice:
+    "Charlotte" is the FBS 49ers (id 2429) and a small college's Saints (id
+    3253); "Troy" is the Trojans (2653) and Hudson Valley's Vikings (3237).
+    Last-entry-wins filed both FBS programs under the small school's name, so
+    the live board's "Charlotte 49ers" / "Troy Trojans" never matched their
+    ratings. The directory carries no division, but ESPN numbered the major
+    programs first, so a shared location goes to the lowest team id.
+    """
     mapping: dict[str, str] = {}
+    owner: dict[str, float] = {}
     for sport in payload.get("sports", []):
         for league in sport.get("leagues", []):
             for entry in league.get("teams", []):
                 team = entry.get("team", {})
                 location, display = team.get("location"), team.get("displayName")
-                if location and display:
+                if not (location and display):
+                    continue
+                try:
+                    team_id = float(team.get("id"))
+                except (TypeError, ValueError):
+                    team_id = float("inf")
+                if location not in mapping or team_id < owner[location]:
                     mapping[location] = display
+                    owner[location] = team_id
     return mapping
 
 
@@ -183,7 +216,22 @@ async def _download_season(
 # [−0.0556, −0.0389], accuracy 75.9%. Elo's margin-of-victory multiplier
 # compresses the blowouts that carry most of college football's information.
 # The Elo book still runs: it feeds the score nudge and the FCS handling.
-KALMAN_CONFIG = KalmanConfig(sigma=15.0, q=3.0, hfa=2.5, init_var=150.0, season_var=30.0)
+#
+# v3 (2026-11-14): carry 0.85 -> 0.55 TOGETHER WITH regression toward the
+# conference mean (CONF_REGRESS_WEIGHT = 1.0). The pair was picked on
+# 2022-24 from a 9-point grid; the other constants are unchanged (a full
+# retune of sigma/q/hfa/variances moved held-out log loss by −0.001
+# [−0.004, +0.002] — nothing).
+KALMAN_CONFIG = KalmanConfig(
+    sigma=15.0, q=3.0, hfa=2.5, init_var=150.0, season_var=30.0, carry=0.55
+)
+CONF_REGRESS_WEIGHT = 1.0  # 0.0 = regress to zero (pre-v3; then use carry=0.85)
+
+# Generic FCS opponent as the Kalman filter sees it: (mean, variance) in
+# points relative to the average FBS team. Fitted by moments on the 359
+# FBS-vs-FCS games of 2022-24 (minus the mean innovation; excess innovation
+# variance). Used for the game, never written to the book.
+FCS_PRIOR: tuple[float, float] = (-29.4, 58.0)
 
 
 def _expected_prob(home_rating: float, away_rating: float, hfa: float) -> float:
@@ -228,8 +276,28 @@ def _game_update(
     return p_home
 
 
-def _replay(
+def _season_conferences(
     df: pd.DataFrame, resolve: Callable[[str], str]
+) -> dict[int, dict[str, str]]:
+    """season -> {FBS displayName: conference}, from every row of that season
+    (scheduled games included, so the map exists before week 1)."""
+    out: dict[int, dict[str, str]] = {}
+    if "home_conference" not in df.columns or "away_conference" not in df.columns:
+        return out
+    for side in ("home", "away"):
+        rows = df[df[f"{side}_division"] == "fbs"]
+        for season, team, conf in zip(
+            rows["season"], rows[f"{side}_team"], rows[f"{side}_conference"]
+        ):
+            if isinstance(conf, str) and conf:
+                out.setdefault(int(season), {})[resolve(team)] = conf
+    return out
+
+
+def _replay(
+    df: pd.DataFrame,
+    resolve: Callable[[str], str],
+    fcs_records: list[dict] | None = None,
 ) -> tuple[EloBook, dict[str, deque], list[dict], KalmanBook]:
     """Replay completed games chronologically through a fresh EloBook.
 
@@ -238,9 +306,14 @@ def _replay(
     record per decided FBS-vs-FBS game from BACKTEST_SEASON onward, carrying
     the pre-update probability. Pure function of the frame so tests can drive
     it with synthetic data.
+
+    `fcs_records`, when given, collects the same record for every decided
+    FBS-vs-FCS game of the backtest seasons: the board serves those games
+    too, and until v3 nothing scored them.
     """
     book = EloBook(config=ELO_CONFIG)
     kalman = KalmanBook(KALMAN_CONFIG)
+    conferences = _season_conferences(df, resolve) if CONF_REGRESS_WEIGHT > 0 else {}
     rolling: dict[str, deque] = {}
     records: list[dict] = []
 
@@ -259,7 +332,11 @@ def _replay(
 
         if current_season is not None and row.season != current_season:
             book.new_season()
-            kalman.new_season()
+            kalman.new_season(
+                conference_targets(
+                    kalman.means, conferences.get(int(row.season), {}), CONF_REGRESS_WEIGHT
+                )
+            )
         current_season = row.season
 
         home = resolve(row.home_team) if home_fbs else row.home_team
@@ -273,19 +350,25 @@ def _replay(
             book, home, away, home_won, margin, hfa,
             home_rated=home_fbs, away_rated=away_fbs,
         )
+        # An FCS side is the generic prior: the FBS side learns from the
+        # game, the FCS team itself never enters the Kalman book.
         p_home = kalman.update(
-            home, away, home_score, away_score, neutral=bool(row.neutral_site)
+            home, away, home_score, away_score, neutral=bool(row.neutral_site),
+            home_prior=None if home_fbs else FCS_PRIOR,
+            away_prior=None if away_fbs else FCS_PRIOR,
         )
-        if home_fbs and away_fbs and row.season >= BACKTEST_SEASON and margin > 0:
-            records.append(
-                {
-                    "game_id": int(row.game_id),
-                    "season": int(row.season),
-                    "p": p_home,
-                    "p_elo": p_elo,
-                    "home_won": home_won,
-                }
-            )
+        if row.season >= BACKTEST_SEASON and margin > 0:
+            record = {
+                "game_id": int(row.game_id),
+                "season": int(row.season),
+                "p": p_home,
+                "p_elo": p_elo,
+                "home_won": home_won,
+            }
+            if home_fbs and away_fbs:
+                records.append(record)
+            elif fcs_records is not None:
+                fcs_records.append(record)
 
         for fbs, team, pf, pa in (
             (home_fbs, home, home_score, away_score),
@@ -403,12 +486,16 @@ async def _fetch_cfbd_spreads(
 
 class NcaafEngine(SportEngine):
     sport = Sport.NCAAF
-    model_name = "ncaaf-kalman-v2"
+    model_name = "ncaaf-kalman-v3"
 
     def __init__(self, state_path: Path = STATE_PATH) -> None:
         self.state_path = state_path
         self.book = EloBook(config=ELO_CONFIG)
         self.kalman = KalmanBook(KALMAN_CONFIG)
+        # FBS membership (displayNames) of the current season, from the
+        # schedule file. Empty until the first v3 refresh; from then on any
+        # side not in it is priced as the generic FCS prior.
+        self.fbs_teams: set[str] = set()
         self.rolling: dict[str, deque] = {}
         self.metrics: dict = {}
         self._load_state()
@@ -423,7 +510,10 @@ class NcaafEngine(SportEngine):
             # Neutral-site games (bowls, kickoff classics) carry no home
             # edge: zero Elo HFA and no home-ward points shift.
             points_edge = 0.0 if game.neutral_site else HOME_POINTS_EDGE
-            p_home = self.kalman.expected(game.home, game.away, neutral=game.neutral_site)
+            p_home = self.kalman.expected(
+                game.home, game.away, neutral=game.neutral_site,
+                home_prior=self._prior(game.home), away_prior=self._prior(game.away),
+            )
             home_score = (
                 self._avg(game.home, idx=0) + self._avg(game.away, idx=1)
             ) / 2.0 + points_edge
@@ -462,9 +552,31 @@ class NcaafEngine(SportEngine):
                     frames.append(pd.read_csv(path, low_memory=False))
             spreads = await _fetch_cfbd_spreads(client, BACKTEST_SEASON)
         df = pd.concat(frames, ignore_index=True)
-        self.book, self.rolling, records, self.kalman = _replay(df, resolve)
+        fcs_records: list[dict] = []
+        self.book, self.rolling, records, self.kalman = _replay(df, resolve, fcs_records)
         self.metrics = _compute_metrics(records, spreads)
+        if fcs_records:
+            self.metrics["n_fcs_games"] = len(fcs_records)
+            self.metrics["fcs_log_loss"] = _log_loss(
+                [(r["p"], r["home_won"]) for r in fcs_records]
+            )
+        latest = df[df["season"] == df["season"].max()]
+        self.fbs_teams = {
+            resolve(team)
+            for side in ("home", "away")
+            for team in latest.loc[latest[f"{side}_division"] == "fbs", f"{side}_team"]
+        }
         self._save_state()
+
+    def _prior(self, team: str) -> tuple[float, float] | None:
+        """FCS_PRIOR for a side that is not an FBS team this season, else None.
+
+        Without a membership list (a state written before v3) every side is
+        looked up in the book as before, so nothing changes until a refresh.
+        """
+        if not self.fbs_teams or team in self.fbs_teams:
+            return None
+        return FCS_PRIOR
 
     # -- rolling points helpers -------------------------------------------
 
@@ -483,6 +595,7 @@ class NcaafEngine(SportEngine):
             "model": self.model_name,
             "ratings": self.book.ratings,
             "kalman": self.kalman.to_state(),
+            "fbs_teams": sorted(self.fbs_teams),
             "rolling": {team: list(w) for team, w in self.rolling.items()},
             "metrics": self.metrics,
         }
@@ -503,6 +616,11 @@ class NcaafEngine(SportEngine):
         # A state written before v2 has no filter: fresh means/variances until
         # the next refresh replays the archive (deterministic, seconds).
         self.kalman = KalmanBook.from_state(KALMAN_CONFIG, state.get("kalman"))
+        # A pre-v3 state stored FCS teams in the filter under school names and
+        # has no membership list; both are rebuilt by the next refresh.
+        self.fbs_teams = (
+            set(state.get("fbs_teams") or []) if state.get("model") == self.model_name else set()
+        )
         self.rolling = {
             team: deque((tuple(g) for g in window), maxlen=ROLLING_WINDOW)
             for team, window in state.get("rolling", {}).items()
@@ -523,8 +641,11 @@ if __name__ == "__main__":
           f"backtest {BACKTEST_SEASON} (FBS vs FBS, pre-update probs)")
     print(f"  teams rated:      {len(engine.book.ratings)}")
     print(f"  games scored:     {m['n_games']}")
-    print(f"  Elo accuracy:     {m['elo_accuracy']:.4f}")
-    print(f"  Elo log loss:     {m['elo_log_loss']:.4f}")
+    # (the keys keep their historical "elo_" names; the numbers are the served Kalman p)
+    print(f"  accuracy:         {m['elo_accuracy']:.4f}")
+    print(f"  log loss:         {m['elo_log_loss']:.4f}")
+    if "fcs_log_loss" in m:
+        print(f"  FBS-vs-FCS games: {m['n_fcs_games']}  log loss {m['fcs_log_loss']:.4f}")
     if "market_accuracy" in m:
         print(f"\n  vs closing spread ({m['n_games_with_spread']} priced games):")
         print(f"    Elo accuracy:    {m['elo_accuracy_vs_market']:.4f}")

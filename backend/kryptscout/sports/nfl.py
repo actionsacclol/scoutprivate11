@@ -1,13 +1,15 @@
-"""NFL engine — XGBoost over 538-style Elo, with QB/rest/preseason/weather overlays.
+"""NFL engine — 538-style Elo with QB/rest/preseason/weather overlays (nfl-elo-v2).
 
-The v2 machinery is unchanged underneath: team Elo (K=20, 48 points of home
-advantage, margin-of-victory K scaling, 1/3 regression to the mean between
-seasons — the public fivethirtyeight/nfl-elo-game recipe) plus pre-game
-overlays that shift win probability only; team Elo updates never see them.
+Team Elo (K=20, 48 points of home advantage, margin-of-victory K scaling, 1/3
+regression to the mean between seasons — the public fivethirtyeight/
+nfl-elo-game recipe) plus pre-game overlays that shift win probability only;
+team Elo updates never see them.
 
   * Starting QB: per-QB EWMA of team points scored in his starts (span ~12,
     initialized at the league average so a debutant is fully shrunk to the
     mean). Game adjustment clamp(K_q * (home_qb_value - away_qb_value), ±90).
+    The starter is the one games.csv lists for the upcoming game when it
+    lists one, else the team's most recent starter.
   * Rest differential: REST_ELO_PER_DAY * (home_rest - away_rest) Elo points.
   * Neutral sites (Super Bowl, international): the 48-point home-advantage
     term is zeroed — games.csv's `location` column drives it in the replay,
@@ -17,33 +19,23 @@ overlays that shift win probability only; team Elo updates never see them.
   * Weather totals: outdoor games inside Open-Meteo's horizon get a coarse
     totals multiplier (wind/precip, floor 0.873). Win prob never sees it.
 
-v3 layers a small, regularized XGBoost binary classifier on top. During the
-chronological replay every played game emits a leakage-safe feature row
-computed from strictly pre-game state (exactly where v2 recorded its
-pre-update validation probabilities): the full v2 Elo diff (monotone +1
-constraint), the raw Elo gap, the QB and rest adjustments, both teams'
-rolling points for/against, week, playoff/divisional flags, roof/surface
-dummies, temp/wind (NaN -> sentinel), and season. No market columns — the
-model stays market-independent so the closing-line comparison means
-something. Trained on 2006-2023 (fit 2006-2021, early stopping + Platt
-calibration on the 2022-2023 chronological tail); 2024-2025 is never touched
-during fit or tuning. On that held-out window the 50/50 Elo+XGB blend beats
-both parents on log loss and ties XGB for the best accuracy, so V3_MODE
-ships as "blend" (the module __main__ prints the full table and the tuning
-search; the constants by V3_MODE record the numbers). The trained model +
-calibrator are pickled to
-MODELS_DIR (gitignored; retrained deterministically); refresh_data()
-retrains when the pickle is missing or older than 7 days — seconds on ~4.9k
-rows. Games without a games.csv schedule row (preseason) fall back to the
-damped Elo path exactly as v2 does.
-
 One data file drives everything: Lee Sharpe's games.csv from nflverse
 (MIT/CC-BY) — final scores from 1999, closing moneylines from 2006, starting
 QBs and rest days backfilled to 1999. Replay runs from 2006, the start of
-the closing-moneyline era and full feature coverage. Overlay knobs were
-coarse-tuned on 2020-2023 only; 2024-2025 is the held-out walk-forward
-validation set, scored on its own and head-to-head against the devigged
-closing line (`python -m kryptscout.sports.nfl` prints the increment table).
+the closing-moneyline era. Overlay knobs were coarse-tuned on 2020-2023
+only; 2024 onward is the held-out walk-forward validation set, scored on its
+own and head-to-head against the devigged closing line
+(`python -m kryptscout.sports.nfl` prints the increment table).
+
+There is no trained model here any more. A v3 layer — an XGBoost classifier
+over these same inputs plus schedule/venue features, blended 50/50 with this
+Elo and served as `nfl-xgb-v3` — shipped until November 2026 and was
+retired. On the 2024-25 held-out seasons (569 priced games) the blend moved
+log loss from 0.6226 to 0.6220 and accuracy from 0.6714 to 0.6749; the
+booster alone was worse than Elo on log loss (0.6254). That is a difference
+this sample cannot distinguish from zero, bought with the xgboost and
+scikit-learn runtimes in every installer, a version-stamped pickle under
+MODELS_DIR, and the heaviest import of the cold start.
 """
 from __future__ import annotations
 
@@ -51,20 +43,15 @@ import asyncio
 import json
 import logging
 import math
-import pickle
 import time
 from collections import deque
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import httpx
-import numpy as np
 import pandas as pd
-from sklearn.linear_model import LogisticRegression
-from xgboost import XGBClassifier
 
-from kryptscout.config import DATA_DIR, MODELS_DIR, RAW_DIR
-from kryptscout.core import modelio
+from kryptscout.config import DATA_DIR, RAW_DIR
 from kryptscout.core.elo import EloBook, EloConfig
 from kryptscout.core.calibrate import temper
 from kryptscout.core.oddsmath import remove_vig
@@ -123,64 +110,7 @@ PRECIP_MULT = 0.97
 
 ELO_CONFIG = EloConfig(k=20.0, home_advantage=48.0, mov_scaling=True, season_carry=0.67)
 
-# -- v3 XGBoost layer ---------------------------------------------------------
-#
-# Decision (2024-25 held-out, 569 priced games): elo-v2 acc 0.6714 / log loss
-# 0.6226, xgb alone 0.6749 / 0.6254, 50/50 blend 0.6749 / 0.6220 — the blend
-# wins on both metrics, so V3_MODE ships "blend"; xgb alone loses on log loss
-# and is gated behind the blend. The margin is modest (the features overlap
-# Elo heavily). v2's row moved 0.6208 -> 0.6226 vs the previously published
-# table solely because neutral sites now zero home advantage (15 held-out
-# neutral games; the replay-start change 2010 -> 2006 alone moves nothing at
-# 4 decimals). In a no-neutral-handling ablation the ordering holds: v2
-# 0.6208, xgb 0.6271, blend 0.6219 on log loss; blend acc 0.6784 vs 0.6749.
-V3_MODE = "blend"  # "off" -> pure elo-v2 | "xgb" -> model alone | "blend" -> 50/50
-BLEND_ELO_WEIGHT = 0.5
-
-TRAIN_TO_SEASON = 2023  # feature rows through here may touch the fit
-EARLY_STOP_FROM_SEASON = 2022  # chronological TRAIN tail: early stop + calibration
-MODEL_PATH = MODELS_DIR / "nfl_xgb_v3.pkl"
-MODEL_MAX_AGE_SECONDS = 7 * 24 * 3600
-
-TEMP_SENTINEL = -100.0  # games.csv temp is deg F (observed min -6)
-WIND_SENTINEL = -1.0  # mph (observed min 0)
-ROOF_TYPES = ("outdoors", "dome", "closed", "open")
-
-FEATURE_COLUMNS = (
-    "elo_diff",  # full v2 pre-game diff: Elo + HFA (0 on neutral) + QB + rest
-    "elo_diff_raw",  # team Elo gap alone, no HFA/overlays
-    "qb_adj_diff",  # Elo points from the QB matchup
-    "rest_diff",  # Elo points from the rest differential
-    "home_pf", "home_pa", "away_pf", "away_pa",  # rolling 10-game points
-    "week", "is_playoff", "div_game",
-    "roof_outdoors", "roof_dome", "roof_closed", "roof_open",
-    "surface_grass",
-    "temp", "wind",
-    "season",
-)
-_MONOTONE = "(" + ",".join("1" if c == "elo_diff" else "0" for c in FEATURE_COLUMNS) + ")"
-
-# Small and regularized; the monotone constraint on elo_diff keeps the tree
-# ensemble sane where Elo is the dominant signal.
-XGB_FIXED_PARAMS = dict(
-    objective="binary:logistic",
-    n_estimators=500,
-    subsample=0.9,
-    colsample_bytree=0.8,
-    reg_lambda=2.0,
-    tree_method="hist",
-    eval_metric="logloss",
-    early_stopping_rounds=40,
-    monotone_constraints=_MONOTONE,
-    random_state=0,
-)
-# Coarse grid, scored on the chronological train tail (2022-23) only.
-XGB_GRID = tuple(
-    {"max_depth": depth, "learning_rate": lr, "min_child_weight": mcw}
-    for depth in (3, 4)
-    for lr in (0.03, 0.07)
-    for mcw in (5, 25)
-)
+MODEL_NAME = "nfl-elo-v2"
 
 # games.csv keys teams by abbreviation; the Elo book (and ESPN, and the rest of
 # the terminal) uses full display names. Historical abbreviations map to the
@@ -345,67 +275,6 @@ def _window_avg(window: deque | None, idx: int) -> float:
     return sum(g[idx] for g in window) / len(window)
 
 
-# -- v3 feature rows ----------------------------------------------------------
-
-
-def _feature_row(
-    *,
-    elo_home: float,
-    elo_away: float,
-    hfa: float,
-    qb_adj: float,
-    rest_adj: float,
-    home_pf: float,
-    home_pa: float,
-    away_pf: float,
-    away_pa: float,
-    week,
-    is_playoff,
-    div_game,
-    roof,
-    surface,
-    temp,
-    wind,
-    season,
-) -> dict:
-    """One model-ready feature dict, shared by the replay and predict().
-
-    Missing values degrade the same way in both places: temp/wind to
-    sentinels, roof to all-zero dummies, surface to the non-grass dummy.
-    """
-    roof = str(roof).strip().lower() if _cell(roof) is not None else ""
-    surface = str(surface).strip().lower() if _cell(surface) is not None else ""
-    temp = _cell(temp)
-    wind = _cell(wind)
-    row = {
-        "elo_diff": elo_home + hfa - elo_away + qb_adj + rest_adj,
-        "elo_diff_raw": elo_home - elo_away,
-        "qb_adj_diff": qb_adj,
-        "rest_diff": rest_adj,
-        "home_pf": home_pf,
-        "home_pa": home_pa,
-        "away_pf": away_pf,
-        "away_pa": away_pa,
-        "week": float(week or 0),
-        "is_playoff": 1.0 if is_playoff else 0.0,
-        "div_game": float(div_game or 0),
-        "surface_grass": 1.0 if surface.startswith("grass") or surface == "dessograss" else 0.0,
-        "temp": float(temp) if temp is not None else TEMP_SENTINEL,
-        "wind": float(wind) if wind is not None else WIND_SENTINEL,
-        "season": float(season),
-    }
-    for kind in ROOF_TYPES:
-        row[f"roof_{kind}"] = 1.0 if roof == kind else 0.0
-    return row
-
-
-def _matrix(rows: list[dict], columns=FEATURE_COLUMNS) -> pd.DataFrame:
-    """Feature dicts -> model matrix (DataFrame keeps feature names for xgb)."""
-    return pd.DataFrame(
-        [[float(r[c]) for c in columns] for r in rows], columns=list(columns)
-    )
-
-
 def _replay(
     df: pd.DataFrame,
     k_qb: float | None = None,
@@ -419,8 +288,9 @@ def _replay(
 
     Returns the fitted book, per-team rolling (points_for, points_against)
     windows, per-QB EWMA ratings, each team's most recent starting QB, one
-    leakage-safe feature row per replayed game (everything computed from
-    strictly pre-update state — this is the v3 training set), and
+    pre-game record per replayed game (season, the rating difference and its
+    QB/rest parts, the probability read from it, the result and the closing
+    moneylines — all computed from strictly pre-update state), and
     walk-forward metrics over the validation window. Team Elo updates never
     see the QB/rest overlay, so team ratings match a v1 replay exactly.
     Pure function of the frame so tests can drive it with synthetic data.
@@ -433,7 +303,7 @@ def _replay(
     rolling: dict[str, deque] = {}
     qbs: dict[str, dict] = {}
     team_qb: dict[str, str] = {}
-    feats: list[dict] = []
+    records: list[dict] = []
 
     played = df[
         (df["season"] >= REPLAY_FROM_SEASON)
@@ -464,40 +334,29 @@ def _replay(
             getattr(row, "home_rest", None), getattr(row, "away_rest", None), rest_per_day
         )
 
-        feat = _feature_row(
-            elo_home=book.get(home),
-            elo_away=book.get(away),
-            hfa=0.0 if neutral else book.config.home_advantage,
-            qb_adj=qb_adj,
-            rest_adj=rest_adj,
-            home_pf=_window_avg(rolling.get(home), 0),
-            home_pa=_window_avg(rolling.get(home), 1),
-            away_pf=_window_avg(rolling.get(away), 0),
-            away_pa=_window_avg(rolling.get(away), 1),
-            week=_cell(getattr(row, "week", None)),
-            is_playoff=_cell(getattr(row, "game_type", None)) not in (None, "REG"),
-            div_game=_cell(getattr(row, "div_game", None)),
-            roof=getattr(row, "roof", None),
-            surface=getattr(row, "surface", None),
-            temp=getattr(row, "temp", None),
-            wind=getattr(row, "wind", None),
-            season=int(row.season),
-        )
-        feat.update(
-            p=_prob_from_diff(feat["elo_diff"]),  # the v2 pre-game probability
-            home_won=home_won,
-            tie=tie,
-            home_ml=_to_ml(getattr(row, "home_moneyline", None)),
-            away_ml=_to_ml(getattr(row, "away_moneyline", None)),
-        )
-        feats.append(feat)
+        hfa = 0.0 if neutral else book.config.home_advantage
+        raw_gap = book.get(home) - book.get(away)
+        record = {
+            "season": int(row.season),
+            # The full pre-game difference the probability is read from.
+            "elo_diff": book.get(home) + hfa - book.get(away) + qb_adj + rest_adj,
+            "elo_diff_raw": raw_gap,  # team ratings alone, no HFA or overlays
+            "qb_adj_diff": qb_adj,
+            "rest_diff": rest_adj,
+            "home_won": home_won,
+            "tie": tie,
+            "home_ml": _to_ml(getattr(row, "home_moneyline", None)),
+            "away_ml": _to_ml(getattr(row, "away_moneyline", None)),
+        }
+        record["p"] = _prob_from_diff(record["elo_diff"])
+        records.append(record)
         if log is not None and not tie:
             # 5-field walk-forward row — pre-update prob + team names for the
             # dollar-ROI price join (store/roibacktest.py). Ties are skipped
             # (binary markets void them).
             when = _cell(getattr(row, "gameday", None))
             if when:
-                log.append([str(when), round(feat["p"], 6), int(home_won), home, away])
+                log.append([str(when), round(record["p"], 6), int(home_won), home, away])
 
         margin = abs(home_score - away_score)
         book.update(home, away, home_won, margin=margin or None, draw=tie)
@@ -510,156 +369,21 @@ def _replay(
                 team_qb[team] = str(qb_id)
             rolling.setdefault(team, deque(maxlen=ROLLING_WINDOW)).append((pf, pa))
 
-    records = [
-        f
-        for f in feats
-        if f["season"] >= validate_from
-        and (validate_to is None or f["season"] <= validate_to)
+    validation = [
+        r
+        for r in records
+        if r["season"] >= validate_from
+        and (validate_to is None or r["season"] <= validate_to)
     ]
-    return book, rolling, qbs, team_qb, feats, _compute_metrics(records)
-
-
-# -- v3 training / calibration / persistence -----------------------------------
-
-
-def _train_model(
-    feats: list[dict],
-    train_to: int = TRAIN_TO_SEASON,
-    tail_from: int = EARLY_STOP_FROM_SEASON,
-    grid: tuple[dict, ...] = XGB_GRID,
-) -> dict:
-    """Fit the v3 XGBoost + Platt-calibrator bundle, walk-forward honest.
-
-    Trees fit on seasons < tail_from; the chronological tail (tail_from
-    through train_to) is used only for early stopping, the coarse
-    hyperparameter pick (lowest tail log loss), and calibration. Ties carry
-    no binary outcome and are dropped. Nothing at or past VALIDATE_FROM_SEASON
-    may reach this function's inputs during evaluation.
-    """
-    train = [f for f in feats if f["season"] <= train_to and not f["tie"]]
-    fit = [f for f in train if f["season"] < tail_from]
-    tail = [f for f in train if f["season"] >= tail_from]
-    if not fit or not tail:
-        raise ValueError("need non-empty fit and tail slices to train nfl-xgb-v3")
-
-    x_fit, y_fit = _matrix(fit), np.array([f["home_won"] for f in fit], dtype=int)
-    x_tail, y_tail = _matrix(tail), np.array([f["home_won"] for f in tail], dtype=int)
-
-    search: list[dict] = []
-    best_model = None
-    best_ll = math.inf
-    for params in grid:
-        model = XGBClassifier(**XGB_FIXED_PARAMS, **params)
-        model.fit(x_fit, y_fit, eval_set=[(x_tail, y_tail)], verbose=False)
-        entry = {
-            **params,
-            "best_iteration": int(model.best_iteration),
-            "tail_log_loss": float(model.best_score),
-        }
-        search.append(entry)
-        # lowest tail log loss wins; ties keep the earlier (smaller) config
-        if entry["tail_log_loss"] < best_ll:
-            best_ll = entry["tail_log_loss"]
-            best_model = model
-            best = entry
-
-    # Platt calibration on the tail's raw margins: strictly increasing, so it
-    # preserves the monotone-in-elo_diff property of the constrained trees.
-    # Only the two fitted COEFFICIENTS are persisted, never the estimator
-    # object — see _apply_platt (and sports/nba.py, which has always done it
-    # this way). A pickled sklearn estimator is only guaranteed to behave
-    # correctly under the exact version that wrote it, so shipping one makes
-    # the model artifact silently version-fragile; two floats are forever.
-    raw = np.clip(best_model.predict_proba(x_tail)[:, 1], 1e-6, 1.0 - 1e-6)
-    margins = np.log(raw / (1.0 - raw)).reshape(-1, 1)
-    calibrator = LogisticRegression(C=1e6, max_iter=1000).fit(margins, y_tail)
-
-    return {
-        "model": best_model,
-        "platt": (float(calibrator.coef_[0][0]), float(calibrator.intercept_[0])),
-        "feature_columns": list(FEATURE_COLUMNS),
-        "trained_at": datetime.now(timezone.utc).isoformat(),
-        "n_fit": len(fit),
-        "n_tail": len(tail),
-        "params": best,
-        "search": search,
-    }
-
-
-def _apply_platt(margins: np.ndarray, platt: tuple[float, float]) -> np.ndarray:
-    """Platt scaling from stored coefficients — exactly what a fitted
-    LogisticRegression's predict_proba computes for a single feature:
-    sigmoid(a·margin + b). Mirrors nba._apply_platt.
-
-    float64 is deliberate. The margins arrive as float32 (xgboost's output
-    dtype) and sklearn upcast them internally, so accumulating in float32
-    here would shift every probability by ~5e-8 against the estimator this
-    replaced. Below anything that matters, but free to get exactly right.
-    """
-    a, b = platt
-    z = np.asarray(margins, dtype=np.float64).ravel()
-    return 1.0 / (1.0 + np.exp(-(a * z + b)))
-
-
-def _calibrated_probs(bundle: dict, rows: list[dict]) -> np.ndarray:
-    """Calibrated P(home wins) for feature rows through the pickled bundle."""
-    x = _matrix(rows, bundle["feature_columns"])
-    raw = np.clip(bundle["model"].predict_proba(x)[:, 1], 1e-6, 1.0 - 1e-6)
-    margins = np.log(raw / (1.0 - raw))
-    return _apply_platt(margins, bundle["platt"])
-
-
-def _save_model(bundle: dict, path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(pickle.dumps(modelio.stamp(bundle)))
-
-
-def _load_model(path: Path) -> dict | None:
-    """Unpickle the bundle; None on missing/corrupt/foreign files (Elo fallback).
-
-    A pre-`platt` bundle (which pickled the sklearn calibrator object) is
-    rejected here, so it is retrained into the coefficient form on the next
-    refresh rather than being unpickled across sklearn versions.
-    """
-    if not path.exists():
-        return None
-    try:
-        bundle = pickle.loads(path.read_bytes())
-    except Exception:
-        return None
-    if not isinstance(bundle, dict) or not {"model", "platt", "feature_columns"} <= set(bundle):
-        return None
-    if not modelio.matches(bundle):
-        # Written by a different sklearn/xgboost minor — its predictions are
-        # not guaranteed to reproduce, so fall back to Elo and let
-        # _model_stale trigger a retrain (deterministic, ~seconds).
-        logger.warning(
-            "nfl: model pickle was written by a different library stack "
-            "(%s vs %s) — falling back to Elo until it is retrained",
-            bundle.get(modelio.STAMP_KEY), modelio.library_versions(),
-        )
-        return None
-    return bundle
-
-
-def _model_stale(path: Path) -> bool:
-    """True when the pickle is missing, too old, OR unloadable.
-
-    The unloadable case matters: a version-mismatched pickle can be seconds
-    old, so an mtime-only check would leave the engine on Elo forever without
-    ever retraining the artifact that would fix it.
-    """
-    if not path.exists() or time.time() - path.stat().st_mtime > MODEL_MAX_AGE_SECONDS:
-        return True
-    return _load_model(path) is None
+    return book, rolling, qbs, team_qb, records, _compute_metrics(validation)
 
 
 def _upcoming_schedule(df: pd.DataFrame) -> dict[str, dict]:
-    """Feature context for scheduled (unplayed) games, keyed "gameday|home|away".
+    """Context for scheduled (unplayed) games, keyed "gameday|home|away".
 
-    games.csv publishes the full upcoming regular season with rest, roof,
-    surface, and (closer to kickoff) temp/wind already populated, so
-    predict() can build the exact training features without extra fetches.
+    games.csv publishes the full upcoming regular season with rest days,
+    neutral sites, and venue detail already populated, so predict() can
+    apply the rest overlay and zero home advantage without extra fetches.
     Doubles as the preseason detector: a July/August ESPN game with no key
     here isn't on the league schedule — it's preseason.
     """
@@ -686,6 +410,11 @@ def _upcoming_schedule(df: pd.DataFrame) -> dict[str, dict]:
             "temp": float(temp) if temp is not None else None,
             "wind": float(wind) if wind is not None else None,
             "neutral": _cell(getattr(row, "location", None)) == "Neutral",
+            # nflverse fills the expected starters for the next week or two
+            # of games. None further out, and predict() then falls back to
+            # the team's most recent starter.
+            "home_qb_id": _cell(getattr(row, "home_qb_id", None)),
+            "away_qb_id": _cell(getattr(row, "away_qb_id", None)),
         }
     return schedule
 
@@ -762,20 +491,16 @@ def _compute_metrics(records: list[dict]) -> dict:
 
 class NflEngine(SportEngine):
     sport = Sport.NFL
-    model_name = "nfl-xgb-v3" if V3_MODE != "off" else "nfl-elo-v2"
+    model_name = MODEL_NAME
 
-    def __init__(self, state_path: Path = STATE_PATH, model_path: Path = MODEL_PATH) -> None:
+    def __init__(self, state_path: Path = STATE_PATH) -> None:
         self.state_path = state_path
-        self.model_path = model_path
         self.book = EloBook(config=ELO_CONFIG)
         self.rolling: dict[str, deque] = {}
         self.qbs: dict[str, dict] = {}
         self.team_qb: dict[str, str] = {}
         self.schedule: dict[str, dict] = {}
         self.metrics: dict = {}
-        self.model_bundle: dict | None = (
-            _load_model(model_path) if V3_MODE != "off" else None
-        )
         self._load_state()
 
     async def upcoming_games(self, on: date | None = None) -> list[Game]:
@@ -784,7 +509,11 @@ class NflEngine(SportEngine):
     async def predict(self, games: list[Game]) -> list[Prediction]:
         now = datetime.now(timezone.utc)
         predictions: list[Prediction] = []
-        for game in games:
+        # Every game's kickoff forecast at once. Awaited one per game inside
+        # the loop below, a 14-game slate spent ~2.6s here on a fast line —
+        # nearly half of what the renderer allows a whole board.
+        forecasts = await asyncio.gather(*(self._weather_for(g) for g in games))
+        for game, forecast in zip(games, forecasts):
             entry = self._schedule_entry(game)
             neutral = game.neutral_site or bool(entry and entry.get("neutral"))
             qb_adj, rest_adj = self._qb_rest_adjustments(game, entry)
@@ -796,30 +525,18 @@ class NflEngine(SportEngine):
                 # shrink 60% toward a coin flip, exactly as v2. Confidence is
                 # derived from the damped probability, so it drops equally.
                 p_home = 0.5 + PRESEASON_DAMP * (p_elo - 0.5)
-            elif V3_MODE != "off" and self.model_bundle is not None and entry is not None:
-                row = self._feature_row_for(game, entry, neutral, qb_adj, rest_adj)
-                p_xgb = float(_calibrated_probs(self.model_bundle, [row])[0])
-                p_home = (
-                    BLEND_ELO_WEIGHT * p_elo + (1.0 - BLEND_ELO_WEIGHT) * p_xgb
-                    if V3_MODE == "blend"
-                    else p_xgb
-                )
             else:
-                # No pickle or no schedule row (preseason handled above):
-                # degrade to the pure Elo path.
-                p_home = p_elo
-            if not self._is_preseason(game):
                 # Calibration audit 2026-09-02 (2018-26 log, n=2,230): slope
                 # 0.86, favourites +2.8 pts; logit scale 0.84 on the served
                 # number. Preseason is already damped 60% toward a coin flip.
-                p_home = temper(p_home, CALIBRATION_TEMPERATURE)
+                p_home = temper(p_elo, CALIBRATION_TEMPERATURE)
             home_score = (
                 self._avg(game.home, idx=0) + self._avg(game.away, idx=1)
             ) / 2.0 + HOME_POINTS_EDGE
             away_score = (
                 self._avg(game.away, idx=0) + self._avg(game.home, idx=1)
             ) / 2.0 - HOME_POINTS_EDGE
-            mult = _weather_total_multiplier(await self._weather_for(game))
+            mult = _weather_total_multiplier(forecast)
             home_score *= mult
             away_score *= mult
             # A team with no scoring history would price at the league-average
@@ -846,14 +563,9 @@ class NflEngine(SportEngine):
         path = await _download_games_csv()
         df = pd.read_csv(path, low_memory=False)
         wf_log: list = []
-        self.book, self.rolling, self.qbs, self.team_qb, feats, self.metrics = _replay(df, log=wf_log)
+        self.book, self.rolling, self.qbs, self.team_qb, _, self.metrics = _replay(df, log=wf_log)
         self.backtest_log = wf_log
         self.schedule = _upcoming_schedule(df)
-        if V3_MODE != "off" and _model_stale(self.model_path):
-            # Deterministic and cheap (~seconds on ~4.9k rows); the pickle is
-            # only a cache, never a source of truth.
-            self.model_bundle = _train_model(feats)
-            _save_model(self.model_bundle, self.model_path)
         self._save_state()
 
     # -- pre-game adjustments ------------------------------------------------
@@ -861,42 +573,23 @@ class NflEngine(SportEngine):
     def _qb_rest_adjustments(self, game: Game, entry: dict | None) -> tuple[float, float]:
         """(QB, rest) Elo-point shifts for one game; each piece degrades to 0.
 
-        QBs come from each team's most recent start in the replay — a freshly
-        announced backup won't be priced until he has actually started once.
+        The starter is the one games.csv lists for this game when it lists
+        one (2026-11-14: 8 of 52 listed team-sides named someone other than
+        the team's previous starter, 4 of that week's 11 games), else the
+        team's most recent start in the replay.
         """
         qb_adj = 0.0
         rest_adj = 0.0
         if QB_ADJ_ENABLED:
+            listed = entry or {}
             qb_adj = _qb_diff(
-                self.qbs, self.team_qb.get(game.home), self.team_qb.get(game.away)
+                self.qbs,
+                listed.get("home_qb_id") or self.team_qb.get(game.home),
+                listed.get("away_qb_id") or self.team_qb.get(game.away),
             )
         if REST_ADJ_ENABLED and entry:
             rest_adj = _rest_diff(entry["home_rest"], entry["away_rest"])
         return qb_adj, rest_adj
-
-    def _feature_row_for(
-        self, game: Game, entry: dict, neutral: bool, qb_adj: float, rest_adj: float
-    ) -> dict:
-        """The same features the replay would emit for this game, pre-game."""
-        return _feature_row(
-            elo_home=self.book.get(game.home),
-            elo_away=self.book.get(game.away),
-            hfa=0.0 if neutral else self.book.config.home_advantage,
-            qb_adj=qb_adj,
-            rest_adj=rest_adj,
-            home_pf=self._avg(game.home, 0),
-            home_pa=self._avg(game.home, 1),
-            away_pf=self._avg(game.away, 0),
-            away_pa=self._avg(game.away, 1),
-            week=entry.get("week"),
-            is_playoff=(entry.get("game_type") or "REG") != "REG",
-            div_game=entry.get("div_game"),
-            roof=entry.get("roof"),
-            surface=entry.get("surface"),
-            temp=entry.get("temp"),
-            wind=entry.get("wind"),
-            season=entry.get("season") or game.start_time.year,
-        )
 
     def _schedule_entry(self, game: Game) -> dict | None:
         """games.csv schedule row for an ESPN game, or None.
@@ -997,48 +690,15 @@ async def _main() -> None:
         ("+rest only", 0.0, REST_ELO_PER_DAY),
         ("full v2 (QB + rest)", QB_K, REST_ELO_PER_DAY),
     ]
-    feats: list[dict] = []
     last: dict = {}
     for label, k_qb, rest in variants:
-        *_, feats, last = _replay(df, k_qb=k_qb, rest_per_day=rest)
+        *_, last = _replay(df, k_qb=k_qb, rest_per_day=rest)
         _print_metrics(label, last)
 
-    # v3: features come from the full-v2 replay above (the last variant).
-    bundle = _train_model(feats)
-    val = [
-        f
-        for f in feats
-        if f["season"] >= VALIDATE_FROM_SEASON
-        and not f["tie"]
-        and f["home_ml"] is not None
-        and f["away_ml"] is not None
-    ]
-    won = [f["home_won"] for f in val]
-    p_xgb = list(_calibrated_probs(bundle, val))
-    p_blend = [
-        BLEND_ELO_WEIGHT * f["p"] + (1.0 - BLEND_ELO_WEIGHT) * q
-        for f, q in zip(val, p_xgb)
-    ]
-    for label, probs in (("xgb v3 (calibrated)", p_xgb), ("50/50 blend elo+xgb", p_blend)):
-        pairs = list(zip(probs, won))
-        _print_row(label, sum((p >= 0.5) == w for p, w in pairs) / len(pairs),
-                   _log_loss(pairs))
     print(f"  {'closing line (devigged)':26s} acc {last['market_accuracy']:.4f}   "
           f"log loss {last['market_log_loss']:.4f}")
     print(f"  ({last['n_games_with_moneyline']} priced games of {last['n_games']} "
-          f"decided, {last['n_ties_excluded']} ties excluded; V3_MODE={V3_MODE!r})")
-
-    print(f"\n  xgb tune (tail={bundle['n_tail']} rows, seasons "
-          f"{EARLY_STOP_FROM_SEASON}-{TRAIN_TO_SEASON}; fit={bundle['n_fit']} rows):")
-    for s in sorted(bundle["search"], key=lambda s: s["tail_log_loss"]):
-        print(f"    depth {s['max_depth']}  lr {s['learning_rate']:.2f}  "
-              f"mcw {s['min_child_weight']:2d}  trees {s['best_iteration'] + 1:3d}  "
-              f"tail ll {s['tail_log_loss']:.4f}")
-
-    gains = bundle["model"].get_booster().get_score(importance_type="gain")
-    print("\n  top feature importances (gain):")
-    for name, gain in sorted(gains.items(), key=lambda kv: kv[1], reverse=True)[:8]:
-        print(f"    {gain:8.1f}  {name}")
+          f"decided, {last['n_ties_excluded']} ties excluded)")
 
     engine = build_engine()
     await engine.refresh_data()

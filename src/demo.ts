@@ -176,7 +176,7 @@ const SPECS: DemoSpec[] = [
   {
     n: 1, sport: 'nba', away: 'LAL', home: 'BOS', hoursOut: 2.5,
     homeProb: 0.643, predHome: 116.8, predAway: 109.6, bookTotal: 224.5,
-    overProb: 0.57, confidence: 0.74, model: 'nba-xgb-v1',
+    overProb: 0.57, confidence: 0.74, model: 'nba-elo-v1',
     books: [
       { book: 'Pinnacle', h: 0.006 },
       { book: 'DraftKings', h: -0.052, t: -0.5 }, // home value
@@ -187,12 +187,12 @@ const SPECS: DemoSpec[] = [
   {
     n: 2, sport: 'nba', away: 'GSW', home: 'DEN', hoursOut: 4,
     homeProb: 0.581, predHome: 118.2, predAway: 114.9, bookTotal: 231.5,
-    overProb: 0.53, confidence: 0.68, model: 'nba-xgb-v1', books: FLAT,
+    overProb: 0.53, confidence: 0.68, model: 'nba-elo-v1', books: FLAT,
   },
   {
     n: 3, sport: 'nba', away: 'MIL', home: 'PHX', hoursOut: 4.5,
     homeProb: 0.468, predHome: 111.4, predAway: 113.9, bookTotal: 226.0,
-    overProb: 0.49, confidence: 0.61, model: 'nba-xgb-v1',
+    overProb: 0.49, confidence: 0.61, model: 'nba-elo-v1',
     books: [
       { book: 'Pinnacle', h: 0.005 },
       { book: 'DraftKings', h: 0.011 },
@@ -203,12 +203,12 @@ const SPECS: DemoSpec[] = [
   {
     n: 4, sport: 'nba', away: 'NYK', home: 'MIA', hoursOut: 5,
     homeProb: 0.552, predHome: 108.7, predAway: 106.2, bookTotal: 213.5,
-    overProb: 0.55, confidence: 0.66, model: 'nba-xgb-v1', books: FLAT,
+    overProb: 0.55, confidence: 0.66, model: 'nba-elo-v1', books: FLAT,
   },
   {
     n: 5, sport: 'nba', away: 'DAL', home: 'OKC', hoursOut: 6.5,
     homeProb: 0.712, predHome: 121.3, predAway: 111.8, bookTotal: 233.0,
-    overProb: 0.51, confidence: 0.79, model: 'nba-xgb-v1',
+    overProb: 0.51, confidence: 0.79, model: 'nba-elo-v1',
     books: [
       { book: 'Pinnacle', h: -0.002 },
       { book: 'DraftKings', h: 0.008 },
@@ -219,7 +219,7 @@ const SPECS: DemoSpec[] = [
   {
     n: 6, sport: 'nba', away: 'CLE', home: 'MIN', hoursOut: 7,
     homeProb: 0.517, predHome: 112.1, predAway: 110.9, bookTotal: 222.5,
-    overProb: 0.52, confidence: 0.58, model: 'nba-xgb-v1', books: FLAT,
+    overProb: 0.52, confidence: 0.58, model: 'nba-elo-v1', books: FLAT,
   },
 
   // ---- NHL ------------------------------------------------------------
@@ -487,7 +487,7 @@ const SPECS: DemoSpec[] = [
   {
     n: 1, sport: 'wnba', away: 'NYL', home: 'LVA', hoursOut: 3,
     homeProb: 0.547, predHome: 86.4, predAway: 83.9, bookTotal: 168.5,
-    overProb: 0.55, confidence: 0.68, model: 'wnba-xgb-v1',
+    overProb: 0.55, confidence: 0.68, model: 'wnba-elo-v1',
     books: [
       { book: 'Pinnacle', h: 0.005 },
       { book: 'DraftKings', h: -0.051, t: -0.5 }, // home value
@@ -498,12 +498,12 @@ const SPECS: DemoSpec[] = [
   {
     n: 2, sport: 'wnba', away: 'CON', home: 'MIN', hoursOut: 4,
     homeProb: 0.618, predHome: 84.7, predAway: 79.2, bookTotal: 162.5,
-    overProb: 0.52, confidence: 0.71, model: 'wnba-xgb-v1', books: FLAT,
+    overProb: 0.52, confidence: 0.71, model: 'wnba-elo-v1', books: FLAT,
   },
   {
     n: 3, sport: 'wnba', away: 'IND', home: 'CHI', hoursOut: 4.5,
     homeProb: 0.443, predHome: 81.6, predAway: 84.8, bookTotal: 165.5,
-    overProb: 0.53, confidence: 0.62, model: 'wnba-xgb-v1',
+    overProb: 0.53, confidence: 0.62, model: 'wnba-elo-v1',
     books: [
       { book: 'Pinnacle', h: 0.006 },
       { book: 'DraftKings', h: 0.01 },
@@ -514,12 +514,12 @@ const SPECS: DemoSpec[] = [
   {
     n: 4, sport: 'wnba', away: 'SEA', home: 'PHX', hoursOut: 5.5,
     homeProb: 0.509, predHome: 82.3, predAway: 81.7, bookTotal: 163.0,
-    overProb: 0.5, confidence: 0.58, model: 'wnba-xgb-v1', books: FLAT,
+    overProb: 0.5, confidence: 0.58, model: 'wnba-elo-v1', books: FLAT,
   },
   {
     n: 5, sport: 'wnba', away: 'ATL', home: 'WAS', hoursOut: 6,
     homeProb: 0.471, predHome: 80.9, predAway: 82.6, bookTotal: 161.5,
-    overProb: 0.48, confidence: 0.6, model: 'wnba-xgb-v1',
+    overProb: 0.48, confidence: 0.6, model: 'wnba-elo-v1',
     books: [
       { book: 'Pinnacle', h: -0.003 },
       { book: 'DraftKings', h: -0.044 }, // home value
@@ -530,7 +530,7 @@ const SPECS: DemoSpec[] = [
   {
     n: 6, sport: 'wnba', away: 'DAL', home: 'GSV', hoursOut: 7,
     homeProb: 0.583, predHome: 85.1, predAway: 80.4, bookTotal: 164.5,
-    overProb: 0.51, confidence: 0.65, model: 'wnba-xgb-v1', books: FLAT,
+    overProb: 0.51, confidence: 0.65, model: 'wnba-elo-v1', books: FLAT,
   },
 
   // ---- SOCCER (3-way) --------------------------------------------------

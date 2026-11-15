@@ -100,14 +100,14 @@ export default function BonusesPage() {
   return (
     <Page
       title="Bonuses"
-      subtitle="Sign-up offers from the sportsbooks Scout tracks — claim them straight from here."
+      subtitle="Sign-up offers from the sportsbooks and exchanges Scout tracks — claim them straight from here."
     >
       {/* Support banner */}
       <div className="border-krypt-gradient relative mb-6 flex items-center gap-3 rounded-2xl bg-krypt-panel/80 px-4 py-3 shadow-krypt-card">
         <Heart size={15} className="shrink-0 text-scout-red-bright" />
         <p className="text-sm text-white/90">
           These are referral links — <span className="font-semibold">Krypt Scout</span> may earn a
-          commission when you sign up through them. That&apos;s what keeps it free forever, no ads.
+          commission when you sign up through them. It costs you nothing extra.
         </p>
       </div>
 

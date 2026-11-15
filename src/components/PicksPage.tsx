@@ -1,5 +1,5 @@
 import { useMemo, useState, type MouseEvent } from 'react'
-import { Check, FlaskConical, Pin, Plus, RefreshCw, Share2, Target, Wallet, X } from 'lucide-react'
+import { Check, FlaskConical, Pin, Play, Plus, RefreshCw, Share2, Target, Wallet, X } from 'lucide-react'
 import type { BoardMap, GameCard, Sport } from '../types'
 import { SPORTS, SPORT_TAG } from '../types'
 import { bookAbbrev, fmtAmerican, fmtPct } from '../oddsmath'
@@ -317,10 +317,16 @@ function PickCard({ pick, demo, onOpen }: { pick: Pick; demo: boolean; onOpen: (
 
       {/* Eyebrow row: TAKE + tier + risk + league + kickoff. */}
       <div data-tour="pick-tier" className="flex items-center gap-2 pl-1.5">
-        <span className="flex items-center gap-1 text-[9px] font-bold uppercase tracking-[0.25em] text-scout-red-bright">
-          <Target size={10} />
-          TAKE
-        </span>
+        {/* Only a price that beats the fair is a call to act. A favorite with
+            no such price is information, not a bet — it must not say TAKE. */}
+        {value ? (
+          <span className="flex items-center gap-1 text-[9px] font-bold uppercase tracking-[0.25em] text-scout-red-bright">
+            <Target size={10} />
+            TAKE
+          </span>
+        ) : (
+          <span className="text-[9px] font-bold uppercase tracking-[0.25em] text-krypt-muted/70">NO BET</span>
+        )}
         <TierBadge tier={pick.tier} />
         <RiskBadge prob={pick.prob} />
         <span className="ml-auto rounded border border-white/10 bg-white/5 px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-widest text-krypt-muted">
@@ -475,6 +481,32 @@ export default function PicksPage({
   const share = useShareCard()
   const roi = useRoi(demo)
 
+  // RUN PICKS: the capture job on demand — pull every board's prices now and
+  // record today's picks (what the tracker grades and Discord posts), instead
+  // of waiting for the scheduler's next turn. Desktop app only.
+  const schedApi = window.scout?.scheduler
+  const [run, setRun] = useState<{ status: 'idle' | 'working' | 'done' | 'error'; note: string }>({
+    status: 'idle',
+    note: '',
+  })
+  const runPicks = async () => {
+    if (!schedApi || run.status === 'working') return
+    setRun({ status: 'working', note: 'Running…' })
+    try {
+      const info = await schedApi.runNow('capture')
+      const last = info.lastRuns.find((r) => r.job === 'capture')
+      if (last && !last.ok) {
+        setRun({ status: 'error', note: last.error || 'Run failed' })
+      } else {
+        const at = new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })
+        setRun({ status: 'done', note: `Picks updated ${at}` })
+        onRefresh()
+      }
+    } catch {
+      setRun({ status: 'error', note: 'Run failed' })
+    }
+  }
+
   const setScope = (s: PickScope) => {
     setScopeState(s)
     try {
@@ -518,6 +550,11 @@ export default function PicksPage({
       ),
     [scoped, sportFilter, tiers],
   )
+
+  // A price that beats the fair is a bet; a favorite without one is not.
+  // They were one undifferentiated grid headed "Recommended bets".
+  const shownValue = useMemo(() => shown.filter((p) => p.kind === 'value'), [shown])
+  const shownFavorites = useMemo(() => shown.filter((p) => p.kind !== 'value'), [shown])
 
   const toggleTier = (t: PickTier) =>
     setTiers((prev) => {
@@ -661,6 +698,31 @@ export default function PicksPage({
             <Share2 size={11} />
             SHARE PICKS
           </StripBtn>
+          {run.status !== 'idle' && (
+            <span
+              className={cls(
+                'max-w-[260px] animate-fade-in truncate font-mono text-[9px] font-semibold uppercase tracking-wider',
+                run.status === 'error'
+                  ? 'text-rose-400'
+                  : run.status === 'working'
+                    ? 'text-krypt-muted'
+                    : 'text-emerald-300',
+              )}
+              title={run.note}
+            >
+              {run.note}
+            </span>
+          )}
+          {schedApi && !demo && (
+            <StripBtn
+              onClick={() => void runPicks()}
+              disabled={run.status === 'working'}
+              title="Run the picks job now: pull fresh prices for every sport and record today's picks, without waiting for the next scheduled run"
+            >
+              <Play size={11} className={run.status === 'working' ? 'animate-pulse' : undefined} />
+              RUN PICKS
+            </StripBtn>
+          )}
           <StripBtn onClick={onRefresh} disabled={loading} title="Refresh all boards">
             <RefreshCw size={11} className={loading ? 'animate-spin' : undefined} />
             REFRESH
@@ -675,9 +737,9 @@ export default function PicksPage({
       {/* Pick grid */}
       <main className="min-h-0 flex-1 overflow-y-auto px-4 pb-3 pt-3">
         <Eyebrow
-          sub={`${shown.length} of ${scoped.length} ${scope === 'today' ? "today's" : 'tracked'} picks · one call per game · best price across every book`}
+          sub={`${shownValue.length} with a price worth taking · best price across every book`}
         >
-          Recommended bets
+          Bets worth taking
         </Eyebrow>
 
         {apiUp === false && !demo && (
@@ -700,7 +762,7 @@ export default function PicksPage({
           ) : boardsEmpty || allPicks.length === 0 ? (
             <Empty
               title="No picks right now"
-              message="Picks appear when games with model output are on the boards. Value picks (with a book price and an EV number) also need live odds — set ODDS_API_KEY under SETTINGS; without it you'll only see FAVORITE picks. Turn on demo mode to explore example picks."
+              message="Picks appear when games are on the boards. A bet worth taking also needs a sportsbook price that beats the exchange fair, which is rare — most days have one or two, some have none. Turn on demo mode to explore example picks."
             />
           ) : (
             <Empty
@@ -709,11 +771,32 @@ export default function PicksPage({
             />
           )
         ) : (
-          <div className="grid animate-fade-in gap-4 [grid-template-columns:repeat(auto-fill,minmax(400px,1fr))]">
-            {shown.map((p) => (
-              <PickCard key={p.gameId} pick={p} demo={demo} onOpen={() => setOpenId(p.gameId)} />
-            ))}
-          </div>
+          <>
+            {shownValue.length > 0 ? (
+              <div className="grid animate-fade-in gap-4 [grid-template-columns:repeat(auto-fill,minmax(400px,1fr))]">
+                {shownValue.map((p) => (
+                  <PickCard key={p.gameId} pick={p} demo={demo} onOpen={() => setOpenId(p.gameId)} />
+                ))}
+              </div>
+            ) : (
+              <p className="rounded-xl border border-white/10 bg-white/[0.02] px-3 py-2.5 text-xs leading-relaxed text-krypt-muted">
+                Nothing right now. No sportsbook is paying more than the exchange fair on these games — that is
+                the normal state, and skipping a slate costs you nothing.
+              </p>
+            )}
+            {shownFavorites.length > 0 && (
+              <div className="mt-5">
+                <Eyebrow sub={`${shownFavorites.length} games · who is likely to win · no bet on offer`}>
+                  Favorites
+                </Eyebrow>
+                <div className="grid animate-fade-in gap-4 [grid-template-columns:repeat(auto-fill,minmax(400px,1fr))]">
+                  {shownFavorites.map((p) => (
+                    <PickCard key={p.gameId} pick={p} demo={demo} onOpen={() => setOpenId(p.gameId)} />
+                  ))}
+                </div>
+              </div>
+            )}
+          </>
         )}
       </main>
 

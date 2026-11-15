@@ -2,17 +2,24 @@ import { randomUUID } from 'node:crypto';
 import type {
   DiscordConfig,
   DiscordInfo,
+  DiscordPreview,
+  DiscordPreviewPick,
+  DiscordPreviewQuote,
   DiscordSend,
   DiscordWebhook,
   LogEntry,
 } from '../../shared/types';
+import { EXCHANGE_SIGNUP } from '../../shared/exchange-links';
 import { pythonBackend } from './python-backend';
+import { scheduler } from './scheduler';
 import * as store from './settings-store';
 
 // ──────────────────────────────────────────────────────────────────────
-// Discord picks sender. Posts the day's recorded picks (GET /api/picks on
-// the supervised backend) to user-configured Discord webhooks from the
-// main process (the renderer CSP blocks discord.com; main has no such
+// Discord picks sender. Posts the day's card — a short list chosen from the
+// recorded picks (GET /api/picks, then POST /api/picks/card on the supervised
+// backend), each with its price on the exchanges, every exchange name a
+// sign-up link —
+// to user-configured Discord webhooks from the main process (the renderer CSP blocks discord.com; main has no such
 // limit). One embed payload is built per send and POSTed to every
 // configured webhook sequentially.
 //
@@ -37,41 +44,10 @@ const WEBHOOK_TIMEOUT_MS = 10_000;
 const RETRY_AFTER_CAP_MS = 15_000;
 /** Ring size for lastSends. */
 const RING_MAX = 20;
-/** Max pick lines in one embed description. */
-const MAX_LINES = 12;
 const EMBED_COLOR = 0xe11d48;
-/** Where readers can get the terminal — the embed title links here and the
- *  description closes with it. Footers can't carry links on Discord. */
+/** Where readers can get the terminal — the embed title links here. */
 const TOOL_URL = 'https://krypt.cc/tools/scout';
 
-/** The Scout mark (red circle, white ◈ — resources/scout-webhook-avatar.png)
- *  embedded as base64: webhook avatars are set by PATCHing the webhook with a
- *  data-URI image, and nothing hosts this file publicly. One-time per webhook,
- *  best-effort (see ensureWebhookAvatar). */
-const AVATAR_DATA_URI =
-  'data:image/png;base64,' +
-  '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';
-
-/** PATCH a webhook's default name + avatar to the Scout identity. One-time
- *  per webhook (callers gate on avatarSet), best-effort: a failure just means
- *  Discord shows the webhook's original avatar. Never throws. */
-async function ensureWebhookAvatar(url: string): Promise<boolean> {
-  const ctl = new AbortController();
-  const timer = setTimeout(() => ctl.abort(), WEBHOOK_TIMEOUT_MS);
-  try {
-    const res = await fetch(url, {
-      method: 'PATCH',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ name: 'Krypt Scout', avatar: AVATAR_DATA_URI }),
-      signal: ctl.signal,
-    });
-    return res.ok;
-  } catch {
-    return false;
-  } finally {
-    clearTimeout(timer);
-  }
-}
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 
 const WEBHOOK_URL_PREFIXES = [
@@ -81,8 +57,40 @@ const WEBHOOK_URL_PREFIXES = [
 
 type SendReason = 'manual' | 'auto';
 
-/** One pick as served by GET /api/picks (fields defensively optional). */
+/** Hard cap on building the card. Longer than the picks fetch: it can rebuild
+ *  a board and makes one Polymarket US lookup per pick it keeps. */
+const CARD_TIMEOUT_MS = 45_000;
+/** Picks per post: the default, and the most the setting allows. */
+const DEFAULT_MAX_PICKS = 6;
+const MAX_PICKS_CAP = 12;
+/** Discord's limit on an embed description (4096), with room to spare. */
+const DESCRIPTION_MAX = 4000;
+/** The record lookup and the posted-card write are local and tiny. */
+const RECORD_TIMEOUT_MS = 10_000;
+
+/** The exchanges listed under each pick, in the order they are shown, each
+ *  with the sign-up link its name carries in the post. These are the
+ *  publisher's referral links (shared/exchange-links.ts, the same ones the
+ *  app's own buttons use); the post never links a market page. */
+const EXCHANGES: [key: string, label: string, signup: string][] = [
+  ['polymarket', 'Polymarket', EXCHANGE_SIGNUP.polymarket],
+  ['kalshi', 'Kalshi', EXCHANGE_SIGNUP.kalshi],
+  ['polymarket_us', 'Polymarket US', EXCHANGE_SIGNUP.polymarket_us],
+];
+const SIGNUPS = EXCHANGES.map(([, label, url]) => ({ label, url }));
+/** Leads the sign-up line that closes every post. */
+const SIGNUP_LEAD = 'Free bonus when you sign up:';
+/** The embed footer: the legal line and nothing else — no branding. It also
+ *  discloses that the sign-up links are referral links. */
+const LEGAL_FOOTER =
+  'Not financial or betting advice · 18+ (21+ where required), only where legal · ' +
+  'Sign-up links are referral links · Gambling problem? Call 1-800-GAMBLER';
+
+/** One pick: the GET /api/picks row, plus what POST /api/picks/card adds —
+ *  `prob` (win probability, 0-1), `exchanges` ({venue: {price, cost}})
+ *  and `best` (the cheapest venue after fees). All defensively optional. */
 interface ApiPick {
+  game_id?: unknown;
   team?: unknown;
   side?: unknown;
   price?: unknown;
@@ -94,10 +102,26 @@ interface ApiPick {
   league?: unknown;
   sport?: unknown;
   kickoff?: unknown;
+  prob?: unknown;
+  fair_prob?: unknown;
+  model_prob?: unknown;
+  exchanges?: unknown;
+  best?: unknown;
 }
 
 function defaults(): DiscordConfig {
-  return { enabled: false, sendAt: '11:00', tiers: ['STRONG', 'LEAN'], webhooks: [] };
+  return {
+    enabled: false,
+    sendAt: '11:00',
+    tiers: ['STRONG', 'LEAN', 'MODEL'],
+    maxPicks: DEFAULT_MAX_PICKS,
+    webhooks: [],
+  };
+}
+
+function sanitizeMaxPicks(v: unknown, base: number): number {
+  const n = Math.round(Number(v));
+  return Number.isFinite(n) && n >= 1 ? Math.min(n, MAX_PICKS_CAP) : base;
 }
 
 function isValidWebhookUrl(url: unknown): url is string {
@@ -145,7 +169,6 @@ function sanitizeWebhooks(v: unknown, base: DiscordWebhook[]): DiscordWebhook[] 
       id: typeof w.id === 'string' && w.id ? w.id : randomUUID(),
       name: typeof w.name === 'string' ? w.name : '',
       url: w.url,
-      avatarSet: w.avatarSet === true,
     });
   }
   return out;
@@ -162,6 +185,7 @@ function sanitize(partial: Partial<DiscordConfig> | undefined, base: DiscordConf
     enabled: typeof p.enabled === 'boolean' ? p.enabled : base.enabled,
     sendAt,
     tiers: p.tiers !== undefined ? sanitizeTiers(p.tiers, base.tiers) : [...base.tiers],
+    maxPicks: sanitizeMaxPicks(p.maxPicks, sanitizeMaxPicks(base.maxPicks, DEFAULT_MAX_PICKS)),
     webhooks: sanitizeWebhooks(p.webhooks, base.webhooks.map((w) => ({ ...w }))),
   };
 }
@@ -204,56 +228,220 @@ function sportTag(v: unknown): string {
   return SPORT_TAGS[s] ?? (s ? s.toUpperCase().slice(0, 4) : '?');
 }
 
-/** Model win probability recovered from the pick itself: EV = p·d − 1 for
- *  decimal price d, so p = (1+EV)/d. A MODEL pick's fair price is its EV=0
- *  price, so p is just that price's implied probability. Shown instead of
- *  the tier label — a +EV pick can still be a 6%-to-win longshot, and
- *  readers should see that before they tail it. */
+function text(v: unknown): string {
+  return typeof v === 'string' ? v.trim() : '';
+}
+
+/** "68% to win", or "" when the pick carries no probability. The card serves
+ *  `prob` (the exchange fair, else the model's). Without it — an older
+ *  backend — a value pick's is recovered from its own numbers: EV = p·d − 1
+ *  for decimal price d, so p = (1+EV)/d. Nothing is printed rather than a
+ *  placeholder: "?% to win" tells a reader nothing. */
 function winChance(p: ApiPick): string {
+  const prob = pickProb(p);
+  return prob === null ? '' : `${Math.round(prob * 100)}% to win`;
+}
+
+/** The pick's win probability (0-1), or null when nothing gives one: the
+ *  card's `prob`, else the exchange fair, else the model's, else recovered
+ *  from a value pick's price and EV. */
+function pickProb(p: ApiPick): number | null {
+  for (const raw of [p.prob, p.fair_prob, p.model_prob]) {
+    const prob = typeof raw === 'number' ? raw : NaN;
+    if (prob > 0 && prob < 1) return prob;
+  }
   const price = Number(p.price);
-  if (!Number.isFinite(price) || Math.abs(price) < 100) return '?%';
-  const decimal = price > 0 ? 1 + price / 100 : 1 + 100 / Math.abs(price);
   const ev = Number(p.ev);
-  const prob = (Number.isFinite(ev) ? 1 + ev : 1) / decimal;
-  if (!(prob > 0 && prob < 1)) return '?%';
-  return `${Math.round(prob * 100)}%`;
+  if (!Number.isFinite(price) || Math.abs(price) < 100 || !Number.isFinite(ev)) return null;
+  const decimal = price > 0 ? 1 + price / 100 : 1 + 100 / Math.abs(price);
+  const prob = (1 + ev) / decimal;
+  return prob > 0 && prob < 1 ? prob : null;
 }
 
-/** One description line per pick. No emoji, per suite convention. */
-function pickLine(p: ApiPick): string {
-  const tag = sportTag(p.sport);
-  const team = (typeof p.team === 'string' && p.team.trim() ? p.team.trim() : 'UNKNOWN').toUpperCase();
-  const tier = typeof p.tier === 'string' ? p.tier.trim().toUpperCase() : '';
-  const price = formatPrice(p.price);
+/** Only picks between 50% and 85% are ever posted — the backend's card rule
+ *  (odds/compare.py CARD_PROB_MIN / CARD_PROB_MAX), repeated here so the
+ *  fallback path cannot send a 95% lock or a pick with no number at all. */
+const CARD_PROB_MIN = 0.5;
+const CARD_PROB_MAX = 0.85;
+function inBand(p: ApiPick): boolean {
+  const prob = pickProb(p);
+  return prob !== null && prob >= CARD_PROB_MIN && prob <= CARD_PROB_MAX;
+}
+
+/** A share price (0-1) in cents: "58¢", or "57.5¢" when it is not whole. */
+function cents(prob: number): string {
+  const c = Math.round(prob * 1000) / 10;
+  return `${Number.isInteger(c) ? c : c.toFixed(1)}¢`;
+}
+
+/** What each exchange charges for the pick's side, in listing order. `best`
+ *  marks the cheapest AFTER its fee — the three charge different fees, so the
+ *  lowest sticker is not always the lowest cost. Screen prices are shown (what
+ *  the reader will see when they open the exchange). Each carries that
+ *  exchange's sign-up link, never a market page. */
+function exchangeQuotes(p: ApiPick): DiscordPreviewQuote[] {
+  const quotes =
+    p.exchanges && typeof p.exchanges === 'object' ? (p.exchanges as Record<string, unknown>) : {};
+  const listed: { key: string; label: string; price: number; cost: number; url: string }[] = [];
+  for (const [key, label, url] of EXCHANGES) {
+    const q = (quotes[key] ?? {}) as Record<string, unknown>;
+    const price = Number(q.price);
+    if (!(price > 0 && price < 1)) continue;
+    const cost = Number(q.cost);
+    listed.push({ key, label, price, cost: Number.isFinite(cost) && cost >= price ? cost : price, url });
+  }
+  if (listed.length === 0) return [];
+  const best = listed.reduce((a, b) => (b.cost < a.cost ? b : a)).key;
+  return listed.map((q) => ({ label: q.label, price: cents(q.price), url: q.url, best: q.key === best }));
+}
+
+/** One pick as the post shows it — the single source for both the Discord
+ *  markdown (buildPayload) and the in-app preview, so they cannot drift. */
+export function describePick(p: ApiPick): DiscordPreviewPick {
+  const tier = text(p.tier).toUpperCase();
+  const side = text(p.side);
+  const opponent = side === 'home' ? text(p.away) : side === 'away' ? text(p.home) : '';
+  const parts: string[] = [];
   if (tier === 'MODEL') {
-    return `\`${tag}\` **${team}** ML (fair ${price})  ·  model pick  ·  ${winChance(p)} to win`;
+    parts.push('ML');
+    if (opponent) parts.push(`vs ${opponent}`);
+  } else {
+    parts.push(`ML ${formatPrice(p.price)} @ ${text(p.book) || '—'}`);
+    parts.push(`EV ${formatEv(p.ev)}%`);
   }
-  const book = typeof p.book === 'string' && p.book.trim() ? p.book.trim() : '—';
-  return `\`${tag}\` **${team}** ML ${price} @ ${book}  ·  EV ${formatEv(p.ev)}%  ·  ${winChance(p)} to win`;
+  const chance = winChance(p);
+  if (chance) parts.push(chance);
+  const kick = typeof p.kickoff === 'string' ? Date.parse(p.kickoff) : NaN;
+  return {
+    key: `${text(p.game_id)}|${side}`,
+    tag: sportTag(p.sport),
+    team: text(p.team) || 'Unknown',
+    tier,
+    detail: parts.join('  ·  '),
+    kickoff: Number.isFinite(kick) ? new Date(kick).toISOString() : null,
+    exchanges: exchangeQuotes(p),
+  };
 }
 
-/** Build the single Discord webhook JSON payload for a set of picks.
- *  Footer: "Krypt Scout · N picks · krypt.cc"; the title links to
- *  krypt.cc/tools/scout and the description closes with the same link so
- *  readers can grab the terminal themselves. */
-export function buildPayload(picks: ApiPick[], now = new Date()): Record<string, unknown> {
-  const lines = picks.slice(0, MAX_LINES).map(pickLine);
-  if (picks.length > MAX_LINES) {
-    lines.push(`*…and ${picks.length - MAX_LINES} more in the terminal*`);
+/** The markdown lines for one pick. No emoji, per suite convention. The
+ *  kickoff is a Discord timestamp, so every reader sees their own local time.
+ *  Every exchange's price is its sign-up link; the cheapest is bold when
+ *  there is more than one to compare. */
+function pickLines(d: DiscordPreviewPick, links: boolean): { lines: string[]; bold: boolean } {
+  const when = d.kickoff ? `  ·  <t:${Math.floor(Date.parse(d.kickoff) / 1000)}:t>` : '';
+  const lines = [`\`${d.tag}\` **${d.team.toUpperCase()}** ${d.detail}${when}`];
+  let bold = false;
+  if (d.exchanges.length > 0) {
+    const compared = d.exchanges.length > 1;
+    const parts = d.exchanges.map((q) => {
+      let label = `${q.label} ${q.price}`;
+      if (links) label = `[${label}](${q.url})`;
+      if (q.best && compared) {
+        label = `**${label}**`;
+        bold = true;
+      }
+      return label;
+    });
+    lines.push(`> ${parts.join('  ·  ')}`);
   }
-  const body = lines.length ? lines.join('\n') : 'No qualifying picks today.';
-  const getIt = `[Get the free terminal — krypt.cc/tools/scout](${TOOL_URL}) · flat 1u · not betting advice`;
+  return { lines, bold };
+}
+
+/** The sign-up line every post carries, picks or not. */
+/** GET /api/picks/card/record — how the posted cards have done. */
+export interface CardRecord {
+  overall?: { wins?: number; losses?: number; pushes?: number; units?: number; since?: string | null };
+  last?: { date?: string; wins?: number; losses?: number; pushes?: number } | null;
+}
+
+/** "Nov 14" from "2026-11-14"; "" when it is not a date. */
+function shortDate(iso: unknown): string {
+  const m = typeof iso === 'string' ? /^(\d{4})-(\d{2})-(\d{2})$/.exec(iso) : null;
+  const month = m ? MONTHS[Number(m[2]) - 1] : undefined;
+  return m && month ? `${month} ${Number(m[3])}` : '';
+}
+
+function winLoss(t: { wins?: number; losses?: number; pushes?: number }): string {
+  const base = `${t.wins ?? 0}–${t.losses ?? 0}`;
+  return (t.pushes ?? 0) > 0 ? `${base}–${t.pushes}` : base;
+}
+
+/**
+ * The record line a post carries, as plain text (the post bolds its label):
+ * "Record 12–6 (67%) · +1.4u since Nov 14 · last card (Nov 14) 4–2". Every
+ * posted pick counts, one unit each at the cheapest exchange price after
+ * fees — the losing days print too. "" until a posted pick has been graded.
+ */
+export function recordLine(record: CardRecord | null | undefined): string {
+  const o = record?.overall;
+  const wins = o?.wins ?? 0;
+  const losses = o?.losses ?? 0;
+  if (!o || wins + losses === 0) return '';
+  const parts = [`Record ${winLoss(o)} (${Math.round((wins / (wins + losses)) * 100)}%)`];
+  const units = Number(o.units);
+  if (Number.isFinite(units)) {
+    const since = shortDate(o.since);
+    parts.push(`${units >= 0 ? '+' : '−'}${Math.abs(units).toFixed(1)}u${since ? ` since ${since}` : ''}`);
+  }
+  const last = record?.last;
+  if (last && (last.wins ?? 0) + (last.losses ?? 0) + (last.pushes ?? 0) > 0) {
+    const day = shortDate(last.date);
+    parts.push(`last card${day ? ` (${day})` : ''} ${winLoss(last)}`);
+  }
+  return parts.join(' · ');
+}
+
+function signupLine(): string {
+  return `${SIGNUP_LEAD} ${EXCHANGES.map(([, label, url]) => `[${label}](${url})`).join('  ·  ')}`;
+}
+
+function describeBody(picks: DiscordPreviewPick[], candidates: number, links: boolean): string {
+  const lines: string[] = [];
+  let bold = false;
+  for (const d of picks) {
+    const one = pickLines(d, links);
+    lines.push(...one.lines);
+    bold = bold || one.bold;
+  }
+  if (lines.length === 0) return 'No qualifying picks today.';
+  const notes: string[] = [];
+  if (picks.some((d) => d.exchanges.length > 0)) {
+    notes.push('Prices to buy that side on each exchange.' + (bold ? ' Bold = cheapest after fees.' : ''));
+  }
+  if (candidates > picks.length) {
+    notes.push(`${picks.length} of ${candidates} games today — the full board is in Krypt Scout.`);
+  }
+  return notes.length ? `${lines.join('\n')}\n\n*${notes.join(' ')}*` : lines.join('\n');
+}
+
+/** Build the single Discord webhook JSON payload for a card of picks. The
+ *  title links to krypt.cc/tools/scout; the description closes with the
+ *  exchanges' sign-up links; the footer is the legal line and nothing else.
+ *  No `username` or avatar is sent: the post appears under whatever name and
+ *  picture the server's owner gave the webhook. `candidates` is how many
+ *  games the card was chosen from. */
+export function buildPayload(
+  picks: ApiPick[],
+  now = new Date(),
+  candidates = picks.length,
+  record = '',
+): Record<string, unknown> {
+  const shown = picks.slice(0, MAX_PICKS_CAP).map(describePick);
+  const links = signupLine();
+  // The record sits between the picks and the links, its label in bold:
+  // "**Record:** 12–6 (67%) · …".
+  const tail = record ? `${record.replace(/^Record /, '**Record:** ')}\n\n${links}` : links;
+  let body = describeBody(shown, candidates, true);
+  // A post that would not fit keeps the sign-up line and unlinks the prices.
+  if (body.length + tail.length + 2 > DESCRIPTION_MAX) body = describeBody(shown, candidates, false);
   return {
-    username: 'Krypt Scout',
     embeds: [
       {
         title: `TODAY'S PICKS — ${MONTHS[now.getMonth()]} ${now.getDate()}`,
         url: TOOL_URL,
         color: EMBED_COLOR,
-        description: `${body}\n\n${getIt}`,
-        footer: {
-          text: `Krypt Scout · ${picks.length} pick${picks.length === 1 ? '' : 's'} · krypt.cc`,
-        },
+        description: `${body}\n\n${tail}`,
+        footer: { text: LEGAL_FOOTER },
         timestamp: now.toISOString(),
       },
     ],
@@ -383,7 +571,8 @@ class DiscordPicks {
 
   /**
    * Manual trigger. Queues a send (unless one is already queued/running)
-   * and resolves with fresh info once that send has finished.
+   * and resolves with fresh info once that send has finished. A send runs
+   * the picks job first (see execute), so this is run-and-send in one.
    */
   async sendNow(): Promise<DiscordInfo> {
     await this.enqueue('manual');
@@ -402,11 +591,28 @@ class DiscordPicks {
     }
     const fetched = await this.fetchTodaysPicks();
     if ('error' in fetched) return { ok: false, error: fetched.error };
-    // Best-effort: give the webhook the Scout identity (name + red-diamond
-    // avatar) before its first visible post. The URL may not be saved yet,
-    // so no avatarSet bookkeeping here — the PATCH is idempotent.
-    await ensureWebhookAvatar(url);
-    return postToWebhook(url, buildPayload(fetched.picks));
+    const { card, candidates } = await this.fetchCard(fetched.picks);
+    // A test shows the record line but is not a send: nothing is recorded.
+    return postToWebhook(url, buildPayload(card, new Date(), candidates, await this.fetchRecord()));
+  }
+
+  /** Exactly what a send would post right now, as data: the page's preview
+   *  is drawn from this, so it is the real card and not a facsimile. Posts
+   *  nothing. Never throws. */
+  async preview(): Promise<DiscordPreview> {
+    const fetched = await this.fetchTodaysPicks();
+    if ('error' in fetched) {
+      return { picks: [], candidates: 0, signups: SIGNUPS, signupLead: SIGNUP_LEAD, footer: LEGAL_FOOTER, record: '', error: fetched.error };
+    }
+    const { card, candidates } = await this.fetchCard(fetched.picks);
+    return {
+      picks: card.slice(0, MAX_PICKS_CAP).map(describePick),
+      candidates,
+      signups: SIGNUPS,
+      signupLead: SIGNUP_LEAD,
+      footer: LEGAL_FOOTER,
+      record: await this.fetchRecord(),
+    };
   }
 
   /** Clear the daily timer. Called from main.ts on before-quit. */
@@ -426,7 +632,8 @@ class DiscordPicks {
 
   /**
    * Today's UPCOMING picks (local calendar date, configured tiers) from the
-   * local backend. Shared by real sends AND the TEST button — a test posts
+   * local backend — every one recorded, before the card is cut (fetchCard).
+   * Shared by real sends, the preview AND the TEST button — a test posts
    * the exact payload subscribers get, never a placeholder message.
    *
    * The backend buckets picks by the UTC date of kickoff, but "today's
@@ -497,6 +704,104 @@ class DiscordPicks {
       return localDateStr(new Date(kick)) === today;
     });
     return { picks };
+  }
+
+  /** One short JSON call to the local backend; null on any failure. */
+  private async backendJson(path: string, body?: unknown): Promise<unknown> {
+    const backend = pythonBackend.info();
+    if (backend.status !== 'running' || backend.port === null) return null;
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), RECORD_TIMEOUT_MS);
+    try {
+      const token = pythonBackend.token();
+      const res = await fetch(`http://127.0.0.1:${backend.port}${path}`, {
+        method: body === undefined ? 'GET' : 'POST',
+        headers: {
+          ...(body === undefined ? {} : { 'content-type': 'application/json' }),
+          ...(token ? { 'X-Scout-Token': token } : {}),
+        },
+        body: body === undefined ? undefined : JSON.stringify(body),
+        signal: ctl.signal,
+      });
+      return res.ok ? await res.json() : null;
+    } catch {
+      return null;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  /** The record line for today's post; "" when there is none yet or the
+   *  backend cannot say (the post goes out without it). */
+  private async fetchRecord(): Promise<string> {
+    const data = await this.backendJson(`/api/picks/card/record?today=${localDateStr()}`);
+    return recordLine(data as CardRecord | null);
+  }
+
+  /** Write down the card that was just posted, so it can be graded. */
+  private async saveCard(picks: ApiPick[]): Promise<void> {
+    if (picks.length === 0) return;
+    const saved = await this.backendJson('/api/picks/card/posted', { date: localDateStr(), picks });
+    if (saved === null) this.log('WARN', 'posted card was not recorded — it will be missing from the record');
+  }
+
+  /**
+   * The day's card: the short list actually posted, chosen and priced by the
+   * backend (POST /api/picks/card) from every pick recorded for today — one
+   * per game, value picks first, then the favourites worth backing, each with
+   * its price on the three exchanges.
+   *
+   * If the backend cannot build it (an older build without the endpoint, a
+   * timeout) the post still goes out: one pick per game between 50% and
+   * 85%, the first `maxPicks`, no exchange prices. Never throws.
+   */
+  private async fetchCard(picks: ApiPick[]): Promise<{ card: ApiPick[]; candidates: number }> {
+    const limit = this.config.maxPicks;
+    const seen = new Set<string>();
+    const unique = picks.filter((p) => {
+      const id = text(p.game_id);
+      if (!id || seen.has(id) || !inBand(p)) return false;
+      seen.add(id);
+      return true;
+    });
+    const fallback = { card: unique.slice(0, limit), candidates: unique.length };
+    const backend = pythonBackend.info();
+    if (picks.length === 0 || backend.status !== 'running' || backend.port === null) return fallback;
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), CARD_TIMEOUT_MS);
+    try {
+      const token = pythonBackend.token();
+      const res = await fetch(`http://127.0.0.1:${backend.port}/api/picks/card`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          ...(token ? { 'X-Scout-Token': token } : {}),
+        },
+        body: JSON.stringify({ picks, limit }),
+        signal: ctl.signal,
+      });
+      if (!res.ok) {
+        this.log('WARN', `daily card unavailable (HTTP ${res.status}) — posting the first ${limit} picks`);
+        return fallback;
+      }
+      const data = (await res.json()) as Record<string, unknown> | null;
+      const card = data && Array.isArray(data.card) ? (data.card as ApiPick[]) : null;
+      if (!card) return fallback;
+      const candidates = Number(data?.candidates);
+      // The backend's card is not re-filtered: it may keep a pick one
+      // exchange has just over 85% because another sells it at 85¢ or under.
+      return { card, candidates: Number.isFinite(candidates) ? candidates : card.length };
+    } catch (e: unknown) {
+      const why = ctl.signal.aborted
+        ? `timed out after ${CARD_TIMEOUT_MS / 1000}s`
+        : e instanceof Error
+          ? e.message
+          : String(e);
+      this.log('WARN', `daily card unavailable (${why}) — posting the first ${limit} picks`);
+      return fallback;
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   private log(level: string, msg: string): void {
@@ -587,12 +892,22 @@ class DiscordPicks {
       return;
     }
 
+    // One click (or the daily timer) is "get today's picks, then send them":
+    // the picks job runs first, so the card is chosen from prices pulled this
+    // minute and not from a capture up to four hours old. If it fails the
+    // post still goes out on the picks already recorded.
+    const jobs = await scheduler.runNow('capture');
+    const capture = jobs.lastRuns.find((r) => r.job === 'capture');
+    if (!capture || !capture.ok) {
+      this.log('WARN', `picks refresh before the send failed (${capture?.error ?? 'no run'}) — sending the picks on record`);
+    }
+
     const fetched = await this.fetchTodaysPicks();
     if ('error' in fetched) {
       record(false, undefined, fetched.error);
       return;
     }
-    const picks = fetched.picks;
+    const { card: picks, candidates } = await this.fetchCard(fetched.picks);
 
     // The AUTO post skips silently on an empty board; a manual send still
     // posts the "No qualifying picks today." embed.
@@ -601,31 +916,18 @@ class DiscordPicks {
       return;
     }
 
-    const payload = buildPayload(picks);
+    const payload = buildPayload(picks, new Date(), candidates, await this.fetchRecord());
 
-    // POST the one payload to each webhook, sequentially. New webhooks get
-    // the Scout identity (name + red-diamond avatar) PATCHed on first —
-    // one-time, remembered via avatarSet, and never a reason to fail a send.
+    // POST the one payload to each webhook, sequentially. The webhook's own
+    // name and picture are left alone.
     const failures: string[] = [];
     for (const w of webhooks) {
-      if (!w.avatarSet && (await ensureWebhookAvatar(w.url))) {
-        w.avatarSet = true;
-        const cfgHook = this.config.webhooks.find((c) => c.id === w.id);
-        if (cfgHook) {
-          cfgHook.avatarSet = true;
-          store.save({
-            ...store.get(),
-            discord: {
-              ...this.config,
-              tiers: [...this.config.tiers],
-              webhooks: this.config.webhooks.map((c) => ({ ...c })),
-            },
-          });
-        }
-      }
       const result = await postToWebhook(w.url, payload);
       if (!result.ok) failures.push(`${w.name || w.id}: ${result.error ?? 'failed'}`);
     }
+
+    // The card counts toward the record once anyone has actually seen it.
+    if (failures.length < webhooks.length) await this.saveCard(picks);
 
     const summary = `${webhooks.length - failures.length}/${webhooks.length} webhooks · ${picks.length} picks`;
     if (failures.length === 0) {

@@ -200,15 +200,6 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libfuse2 libarchive-tools
 
-      # xgboost's macOS wheel links against OpenMP, which Apple's toolchain does
-      # not ship. Without libomp, `import xgboost` raises "Library not loaded:
-      # @rpath/libomp.dylib" — that kills the nba/nfl engines, so pytest and the
-      # frozen bundle's --selftest both fail before anything gets packaged.
-      # The .spec copies this dylib INTO the bundle so users don't need Homebrew.
-      - name: Install libomp (xgboost/OpenMP)
-        if: runner.os == 'macOS'
-        run: brew install libomp
-
       # `npm install`, not `npm ci`: npm's optional platform-specific binaries
       # (rollup/esbuild) are a recurring source of lockfile-vs-platform `ci`
       # failures across a four-OS matrix. Reproducibility matters less here than

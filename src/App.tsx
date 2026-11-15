@@ -1,10 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import type { BackendInfo } from '@shared/types'
 import type { BoardMap, Sport } from './types'
-import { SPORTS } from './types'
-import { checkHealth, fetchAllBoards, fetchBoard, fetchLicense, heartbeatLicense, type LicenseStatus } from './api'
+import { checkHealth, describeBoardError, fetchAllBoards, fetchBoard, fetchLicense, heartbeatLicense, type LicenseStatus } from './api'
 import LicenseGate from './components/LicenseGate'
 import StartupSplash from './components/StartupSplash'
+import SetupBanner from './components/SetupBanner'
 import { DEMO_BOARDS } from './demo'
 import TitleBar from './components/TitleBar'
 import Sidebar, { type PageId } from './components/Sidebar'
@@ -25,6 +25,7 @@ import BacktestPage from './components/BacktestPage'
 import ModelsPage from './components/ModelsPage'
 import IntelPage from './components/IntelPage'
 import AutobetPage from './components/AutobetPage'
+import AgentsPage from './components/AgentsPage'
 import SettingsPage from './components/SettingsPage'
 import AboutPage from './components/AboutPage'
 import { UiModeContext, loadUiMode, saveUiMode, type UiMode } from './uiMode'
@@ -45,6 +46,10 @@ export default function App() {
   const [apiUp, setApiUp] = useState<boolean | null>(null)
   const [fetchedAt, setFetchedAt] = useState<Date | null>(null)
   const [sportFetchedAt, setSportFetchedAt] = useState<Partial<Record<Sport, Date>>>({})
+  // Sports whose last board request FAILED, with why. A failed sport keeps the
+  // slate it last loaded; this is what lets the UI say "couldn't load" instead
+  // of "no games scheduled".
+  const [boardErrors, setBoardErrors] = useState<Partial<Record<Sport, string>>>({})
   const [loading, setLoading] = useState(false)
   // null = auto (demo follows API health); true/false = user override
   const [demoOverride, setDemoOverride] = useState<boolean | null>(null)
@@ -54,6 +59,20 @@ export default function App() {
   const inFlight = useRef(false)
 
   const demo = demoOverride ?? apiUp === false
+
+  const boardLoaded = useCallback((sport: Sport, cards: BoardMap[Sport]) => {
+    setBoards((prev) => ({ ...prev, [sport]: cards }))
+    setSportFetchedAt((prev) => ({ ...prev, [sport]: new Date() }))
+    setBoardErrors((prev) => {
+      if (!(sport in prev)) return prev
+      const next = { ...prev }
+      delete next[sport]
+      return next
+    })
+  }, [])
+  const boardFailed = useCallback((sport: Sport, reason: string) => {
+    setBoardErrors((prev) => ({ ...prev, [sport]: reason }))
+  }, [])
 
   const setUiMode = useCallback((m: UiMode) => {
     setUiModeState(m)
@@ -70,28 +89,27 @@ export default function App() {
       const healthy = await checkHealth()
       setApiUp(healthy)
       if (healthy) {
-        // Poll every sport's board so the cross-sport value board stays complete.
-        setBoards(await fetchAllBoards())
-        const now = new Date()
-        setSportFetchedAt(Object.fromEntries(SPORTS.map((s) => [s, now])))
+        // Poll every sport's board so the cross-sport value board stays
+        // complete. Each board paints as it lands; a sport that fails keeps
+        // the slate it had and is flagged in boardErrors.
+        await fetchAllBoards(boardLoaded, boardFailed)
       }
       setFetchedAt(new Date())
     } finally {
       inFlight.current = false
       setLoading(false)
     }
-  }, [])
+  }, [boardLoaded, boardFailed])
 
   /** Force-refetch a single sport's board (SETTINGS → DATA). */
   const refreshSport = useCallback(async (sport: Sport) => {
     try {
-      const cards = await fetchBoard(sport)
-      setBoards((prev) => ({ ...prev, [sport]: cards }))
-      setSportFetchedAt((prev) => ({ ...prev, [sport]: new Date() }))
-    } catch {
-      /* board endpoint down — keep the stale slate */
+      boardLoaded(sport, await fetchBoard(sport))
+    } catch (err) {
+      // Keep the stale slate, and say why the refetch failed.
+      boardFailed(sport, describeBoardError(err))
     }
-  }, [])
+  }, [boardLoaded, boardFailed])
 
   useEffect(() => {
     void refresh()
@@ -206,6 +224,7 @@ export default function App() {
         <>
       <Onboarding />
       <TourGuide onNav={setPage} />
+      <SetupBanner onReady={refresh} />
       <div className="flex min-h-0 flex-1">
         <Sidebar page={page} onNav={setPage} />
         <div className="flex min-w-0 flex-1 flex-col bg-krypt-radial">
@@ -231,6 +250,7 @@ export default function App() {
               apiUp={apiUp}
               fetchedAt={fetchedAt}
               loading={loading}
+              boardErrors={demo ? {} : boardErrors}
               highlightId={highlightId}
               onSport={(s) => {
                 setActive(s)
@@ -265,6 +285,7 @@ export default function App() {
           {page === 'backtest' && <BacktestPage demo={demo} apiUp={apiUp} />}
           {page === 'models' && <ModelsPage boards={data} demo={demo} apiUp={apiUp} />}
           {page === 'intel' && <IntelPage boards={data} demo={demo} apiUp={apiUp} />}
+          {page === 'agents' && <AgentsPage demo={demo} apiUp={apiUp} />}
           {page === 'settings' && (
             <SettingsPage
               boards={data}
@@ -272,6 +293,7 @@ export default function App() {
               apiUp={apiUp}
               backend={backend}
               sportFetchedAt={sportFetchedAt}
+              boardErrors={demo ? {} : boardErrors}
               onToggleDemo={() => setDemoOverride(!demo)}
               onRefreshSport={refreshSport}
               mode={uiMode}

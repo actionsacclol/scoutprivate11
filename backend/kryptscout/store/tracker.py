@@ -2152,8 +2152,9 @@ def list_picks(
 
     Optional filters: `sport`, and `tiers` (matched case-insensitively,
     e.g. ["STRONG", "LEAN"]). Ordering: value picks first — STRONG then
-    LEAN, each by ev descending — then MODEL picks by start_time ascending
-    (the picks table stores no model_prob to rank them by).
+    LEAN, each by ev descending — then MODEL picks by start_time ascending.
+    A game can have several rows (one per model that rated it); callers that
+    want one per game, or a ranked shortlist, use odds/compare.select_card.
 
     Each row carries every picks column (minus the surrogate id) plus the
     game's home/away/league/start_time and `kickoff`, the start_time as an
@@ -2175,8 +2176,8 @@ def list_picks(
             conn,
             f"""
             SELECT k.game_id, k.sport, k.model, k.side, k.team, k.book,
-                   k.price, k.ev, k.kelly, k.tier, k.created_at, k.locked_at,
-                   k.result, k.units, k.graded_at,
+                   k.price, k.ev, k.kelly, k.model_prob, k.fair_prob, k.tier,
+                   k.created_at, k.locked_at, k.result, k.units, k.graded_at,
                    g.home, g.away, g.league, g.start_time,
                    g.start_time AS kickoff
             FROM picks k
