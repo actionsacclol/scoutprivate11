@@ -31,14 +31,18 @@ exports.default = async function afterPack(context) {
   const appName = packager.appInfo.productFilename;
 
   // The Electron binary whose fuses we flip — inside the .app bundle on macOS,
-  // the top-level exe on Windows/Linux.
-  const target =
-    electronPlatformName === 'darwin'
-      ? path.join(appOutDir, `${appName}.app`, 'Contents', 'MacOS', appName)
-      : path.join(
-          appOutDir,
-          electronPlatformName === 'win32' ? `${appName}.exe` : appName,
-        );
+  // the top-level exe on Windows/Linux. On Linux electron-builder does NOT
+  // name the binary after productName: it uses `executableName`, which
+  // defaults to the lowercased package name ("krypt-scout"). Asking for
+  // "Krypt Scout" there failed the v0.3.3 Linux build with ENOENT.
+  let target;
+  if (electronPlatformName === 'darwin') {
+    target = path.join(appOutDir, `${appName}.app`, 'Contents', 'MacOS', appName);
+  } else if (electronPlatformName === 'win32') {
+    target = path.join(appOutDir, `${appName}.exe`);
+  } else {
+    target = path.join(appOutDir, packager.executableName || appName);
+  }
 
   const wantIntegrity = process.env.SCOUT_ASAR_INTEGRITY === '1';
 

@@ -52,6 +52,19 @@ export function tryCmd(cmd, args) {
 let _systemPy = null;
 export function findSystemPython() {
   if (_systemPy) return _systemPy;
+  // On GitHub Actions, actions/setup-python exports `pythonLocation` for the
+  // version the workflow asked for. Use exactly that one: on the Windows
+  // runner `py -3` picks the NEWEST Python on the image instead, and a
+  // just-released Python has no wheels for half the requirements, so the
+  // install fails there while Linux and macOS (which use PATH) are fine.
+  const pinned = process.env.pythonLocation;
+  if (pinned) {
+    const exe = isWin ? join(pinned, 'python.exe') : join(pinned, 'bin', 'python');
+    if (existsSync(exe) && tryCmd(exe, ['--version'])) {
+      _systemPy = exe;
+      return _systemPy;
+    }
+  }
   // Order: py launcher (Windows), python, python3.
   const candidates = isWin
     ? [

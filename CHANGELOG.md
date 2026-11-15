@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- **Release build: Linux and Windows runners** (FIX): the first v0.3.3 run
+  failed on both. Linux: the packaging hook that flips the Electron fuses
+  looked for a binary called "Krypt Scout", but electron-builder names the
+  Linux binary `krypt-scout`; the hook now asks the packager for the name
+  (checked by packaging the Linux folder locally). Windows: the tests died
+  with "No module named pytest" because the dependency install before them
+  had failed and `py:setup` reported success anyway. In CI a failed install
+  now fails that step, and the build uses the Python that
+  `actions/setup-python` installed (3.11) instead of `py -3`, which picks
+  the newest Python on the runner image.
 - **"Setup did not finish … (fetch failed)" on a new install** (FIX): the
   scheduler asked the backend for the first results download with `fetch`,
   which gives up when no answer has arrived after 300 seconds, whatever
